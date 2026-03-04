@@ -1,5 +1,6 @@
 vendor/
 composer.lock
-bin/
+bin/*
+!bin/.gitkeep
 .phpunit.cache/
 .phpunit.result.cache

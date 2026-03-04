@@ -162,7 +162,7 @@ class GoldLapel
     {
         $envPath = getenv('GOLDLAPEL_BINARY');
         if ($envPath !== false && $envPath !== '') {
-            if (!file_exists($envPath)) {
+            if (!is_file($envPath)) {
                 throw new RuntimeException(
                     "GOLDLAPEL_BINARY points to {$envPath} but file not found"
                 );
@@ -184,7 +184,7 @@ class GoldLapel
 
         $binaryName = "goldlapel-{$os}-{$arch}";
         $bundled = __DIR__ . '/../bin/' . $binaryName;
-        if (file_exists($bundled)) {
+        if (is_file($bundled)) {
             return realpath($bundled);
         }
 

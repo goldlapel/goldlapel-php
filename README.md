@@ -18,10 +18,8 @@ use GoldLapel\GoldLapel;
 // Start the proxy — returns a connection string pointing at Gold Lapel
 $url = GoldLapel::start('postgresql://user:pass@localhost:5432/mydb');
 
-// Use the URL with any Postgres driver
-$pdo = new PDO($url);
-
-// Or Laravel, Doctrine, Eloquent — anything that speaks Postgres
+// Use with any Postgres driver or ORM
+// Laravel, Doctrine, Eloquent — anything that accepts a connection URL
 ```
 
 Gold Lapel is driver-agnostic. `start()` returns a connection string (`postgresql://...@localhost:7932/...`) that works with any Postgres driver or ORM.
@@ -75,10 +73,19 @@ Or set environment variables (`GOLDLAPEL_PORT`, `GOLDLAPEL_UPSTREAM`, etc.) — 
 
 ### PDO
 
+PDO doesn't accept `postgresql://` URLs directly — it needs a DSN string. Parse the proxy URL or build the DSN yourself:
+
 ```php
 $url = GoldLapel::start('postgresql://user:pass@localhost:5432/mydb');
-$pdo = new PDO($url);
+
+// Parse the proxy URL into a PDO DSN
+$parts = parse_url($url);
+$dsn = sprintf('pgsql:host=%s;port=%d;dbname=%s',
+    $parts['host'], $parts['port'], ltrim($parts['path'], '/'));
+$pdo = new PDO($dsn, $parts['user'], $parts['pass']);
 ```
+
+> **Note:** Laravel, Doctrine, and most ORMs accept `postgresql://` URLs natively — no parsing needed.
 
 ### Laravel
 
