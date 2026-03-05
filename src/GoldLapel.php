@@ -125,6 +125,12 @@ class GoldLapel
     public static function start(string $upstream, ?int $port = null, array $extraArgs = []): string
     {
         if (self::$instance !== null && self::$instance->isRunning()) {
+            if (self::$instance->upstream !== $upstream) {
+                throw new RuntimeException(
+                    'Gold Lapel is already running for a different upstream. ' .
+                    'Call GoldLapel::stop() before starting with a new upstream.'
+                );
+            }
             return self::$instance->url;
         }
 
