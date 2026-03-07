@@ -39,9 +39,10 @@ class GoldLapel
             $this->extraArgs
         );
 
+        $nullDevice = PHP_OS_FAMILY === 'Windows' ? 'NUL' : '/dev/null';
         $descriptors = [
-            0 => ['file', '/dev/null', 'r'],
-            1 => ['file', '/dev/null', 'w'],
+            0 => ['file', $nullDevice, 'r'],
+            1 => ['file', $nullDevice, 'w'],
             2 => ['pipe', 'w'],
         ];
 
@@ -179,6 +180,7 @@ class GoldLapel
         $os = match (PHP_OS_FAMILY) {
             'Darwin' => 'darwin',
             'Linux' => 'linux',
+            'Windows' => 'windows',
             default => PHP_OS_FAMILY,
         };
 
@@ -189,6 +191,9 @@ class GoldLapel
         };
 
         $binaryName = "goldlapel-{$os}-{$arch}";
+        if ($os === 'windows') {
+            $binaryName .= '.exe';
+        }
         $bundled = __DIR__ . '/../bin/' . $binaryName;
         if (is_file($bundled)) {
             return realpath($bundled);
@@ -275,11 +280,16 @@ class GoldLapel
             return null;
         }
 
+        $pathext = getenv('PATHEXT');
+        $extensions = $pathext ? explode(';', $pathext) : [''];
+
         $dirs = explode(PATH_SEPARATOR, $path);
         foreach ($dirs as $dir) {
-            $file = $dir . DIRECTORY_SEPARATOR . $name;
-            if (is_file($file) && is_executable($file)) {
-                return $file;
+            foreach ($extensions as $ext) {
+                $file = $dir . DIRECTORY_SEPARATOR . $name . $ext;
+                if (is_file($file) && is_executable($file)) {
+                    return $file;
+                }
             }
         }
 
