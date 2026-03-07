@@ -191,6 +191,9 @@ class GoldLapel
         };
 
         $binaryName = "goldlapel-{$os}-{$arch}";
+        if ($os === 'linux' && self::isMusl($arch)) {
+            $binaryName .= '-musl';
+        }
         if ($os === 'windows') {
             $binaryName .= '.exe';
         }
@@ -271,6 +274,11 @@ class GoldLapel
 
         proc_close($this->process);
         $this->process = null;
+    }
+
+    private static function isMusl(string $arch): bool
+    {
+        return file_exists("/lib/ld-musl-{$arch}.so.1");
     }
 
     private static function which(string $name): ?string
