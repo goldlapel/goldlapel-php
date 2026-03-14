@@ -337,6 +337,39 @@ class GoldLapelTest extends TestCase
         $this->assertFalse($gl->isRunning());
     }
 
+    // -- Dashboard URL (5 tests) --
+
+    public function testDefaultDashboardPort(): void
+    {
+        $gl = new GoldLapel('postgresql://host:5432/db');
+        $this->assertSame(7933, $gl->getDashboardPort());
+    }
+
+    public function testCustomDashboardPort(): void
+    {
+        $gl = new GoldLapel('postgresql://host:5432/db', null, ['dashboard_port' => 8080]);
+        $this->assertSame(8080, $gl->getDashboardPort());
+    }
+
+    public function testDashboardPortDisabledWithZero(): void
+    {
+        $gl = new GoldLapel('postgresql://host:5432/db', null, ['dashboard_port' => 0]);
+        $this->assertSame(0, $gl->getDashboardPort());
+        $this->assertNull($gl->getDashboardUrl());
+    }
+
+    public function testDashboardUrlNullWhenNotRunning(): void
+    {
+        $gl = new GoldLapel('postgresql://host:5432/db');
+        $this->assertNull($gl->getDashboardUrl());
+    }
+
+    public function testStaticDashboardUrlNullWhenNotStarted(): void
+    {
+        GoldLapel::stop();
+        $this->assertNull(GoldLapel::dashboardUrl());
+    }
+
     // -- configKeys (3 tests) --
 
     public function testConfigKeysReturnsArray(): void

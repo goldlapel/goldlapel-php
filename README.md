@@ -43,6 +43,10 @@ Stops the proxy. Also called automatically via `register_shutdown_function`.
 
 Returns the current proxy URL, or `null` if not running.
 
+### `GoldLapel::dashboardUrl()`
+
+Returns the dashboard URL (e.g. `http://127.0.0.1:7933`), or `null` if not running. The dashboard port defaults to 7933 and can be changed via `config: ['dashboard_port' => 8080]` or disabled with `0`.
+
 ### `new GoldLapel(upstream, port?, config?, extraArgs?)`
 
 Instance API for managing multiple proxies:

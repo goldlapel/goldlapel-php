@@ -7,6 +7,7 @@ use RuntimeException;
 class GoldLapel
 {
     const DEFAULT_PORT = 7932;
+    const DEFAULT_DASHBOARD_PORT = 7933;
     const STARTUP_TIMEOUT = 10.0;
     const STARTUP_POLL_INTERVAL = 0.05;
 
@@ -41,6 +42,7 @@ class GoldLapel
 
     private string $upstream;
     private int $port;
+    private int $dashboardPort;
     private array $config;
     private array $extraArgs;
     /** @var resource|null */
@@ -54,6 +56,7 @@ class GoldLapel
     {
         $this->upstream = $upstream;
         $this->port = $port ?? self::DEFAULT_PORT;
+        $this->dashboardPort = isset($config['dashboard_port']) ? (int) $config['dashboard_port'] : self::DEFAULT_DASHBOARD_PORT;
         $this->config = $config;
         $this->extraArgs = $extraArgs;
     }
@@ -156,6 +159,13 @@ class GoldLapel
             if (self::waitForPort('127.0.0.1', $this->port, 0.5)) {
                 fclose($stderr);
                 $this->url = self::makeProxyUrl($this->upstream, $this->port);
+
+                if ($this->dashboardPort > 0) {
+                    echo "goldlapel → :{$this->port} (proxy) | http://127.0.0.1:{$this->dashboardPort} (dashboard)\n";
+                } else {
+                    echo "goldlapel → :{$this->port} (proxy)\n";
+                }
+
                 return $this->url;
             }
         }
@@ -192,6 +202,19 @@ class GoldLapel
     public function getPort(): int
     {
         return $this->port;
+    }
+
+    public function getDashboardPort(): int
+    {
+        return $this->dashboardPort;
+    }
+
+    public function getDashboardUrl(): ?string
+    {
+        if ($this->dashboardPort > 0 && $this->isRunning()) {
+            return "http://127.0.0.1:{$this->dashboardPort}";
+        }
+        return null;
     }
 
     public function isRunning(): bool
@@ -239,6 +262,11 @@ class GoldLapel
     public static function proxyUrl(): ?string
     {
         return self::$instance?->url;
+    }
+
+    public static function dashboardUrl(): ?string
+    {
+        return self::$instance?->getDashboardUrl();
     }
 
     public static function cleanup(): void
