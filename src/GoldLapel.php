@@ -10,8 +10,38 @@ class GoldLapel
     const STARTUP_TIMEOUT = 10.0;
     const STARTUP_POLL_INTERVAL = 0.05;
 
+    private const VALID_CONFIG_KEYS = [
+        'mode', 'min_pattern_count', 'refresh_interval_secs', 'pattern_ttl_secs',
+        'max_tables_per_view', 'max_columns_per_view', 'deep_pagination_threshold',
+        'report_interval_secs', 'result_cache_size', 'batch_cache_size',
+        'batch_cache_ttl_secs', 'redis_url', 'pool_size', 'pool_timeout_secs',
+        'pool_mode', 'mgmt_idle_timeout', 'fallback', 'read_after_write_secs',
+        'n1_threshold', 'n1_window_ms', 'n1_cross_threshold',
+        'tls_cert', 'tls_key', 'tls_client_ca', 'config', 'dashboard_port',
+        'disable_matviews', 'disable_consolidation', 'disable_btree_indexes',
+        'disable_trigram_indexes', 'disable_expression_indexes',
+        'disable_partial_indexes', 'disable_rewrite', 'disable_prepared_cache',
+        'disable_result_cache', 'disable_redis_cache', 'disable_pool',
+        'disable_n1', 'disable_n1_cross_connection', 'disable_shadow_mode',
+        'enable_coalescing', 'replica', 'exclude_tables',
+    ];
+
+    private const BOOLEAN_KEYS = [
+        'disable_matviews', 'disable_consolidation', 'disable_btree_indexes',
+        'disable_trigram_indexes', 'disable_expression_indexes',
+        'disable_partial_indexes', 'disable_rewrite', 'disable_prepared_cache',
+        'disable_result_cache', 'disable_redis_cache', 'disable_pool',
+        'disable_n1', 'disable_n1_cross_connection', 'disable_shadow_mode',
+        'enable_coalescing',
+    ];
+
+    private const LIST_KEYS = [
+        'replica', 'exclude_tables',
+    ];
+
     private string $upstream;
     private int $port;
+    private array $config;
     private array $extraArgs;
     /** @var resource|null */
     private $process = null;
@@ -20,11 +50,58 @@ class GoldLapel
     private static ?self $instance = null;
     private static bool $cleanupRegistered = false;
 
-    public function __construct(string $upstream, ?int $port = null, array $extraArgs = [])
+    public function __construct(string $upstream, ?int $port = null, array $config = [], array $extraArgs = [])
     {
         $this->upstream = $upstream;
         $this->port = $port ?? self::DEFAULT_PORT;
+        $this->config = $config;
         $this->extraArgs = $extraArgs;
+    }
+
+    public static function configToArgs(array $config): array
+    {
+        if (empty($config)) {
+            return [];
+        }
+
+        $validKeys = array_flip(self::VALID_CONFIG_KEYS);
+        $booleanKeys = array_flip(self::BOOLEAN_KEYS);
+        $listKeys = array_flip(self::LIST_KEYS);
+        $args = [];
+
+        foreach ($config as $key => $value) {
+            if (!isset($validKeys[$key])) {
+                throw new \InvalidArgumentException("Unknown config key: {$key}");
+            }
+
+            $flag = '--' . str_replace('_', '-', $key);
+
+            if (isset($booleanKeys[$key])) {
+                if (!is_bool($value)) {
+                    throw new \TypeError("Config key '{$key}' must be a boolean, got " . gettype($value));
+                }
+                if ($value) {
+                    $args[] = $flag;
+                }
+                continue;
+            }
+
+            if (isset($listKeys[$key])) {
+                if (!is_array($value)) {
+                    throw new \TypeError("Config key '{$key}' must be an array, got " . gettype($value));
+                }
+                foreach ($value as $item) {
+                    $args[] = $flag;
+                    $args[] = (string) $item;
+                }
+                continue;
+            }
+
+            $args[] = $flag;
+            $args[] = (string) $value;
+        }
+
+        return $args;
     }
 
     public function startProxy(): string
@@ -36,6 +113,7 @@ class GoldLapel
         $binary = self::findBinary();
         $cmd = array_merge(
             [$binary, '--upstream', $this->upstream, '--port', (string) $this->port],
+            self::configToArgs($this->config),
             $this->extraArgs
         );
 
@@ -123,7 +201,7 @@ class GoldLapel
 
     // -- Static singleton --
 
-    public static function start(string $upstream, ?int $port = null, array $extraArgs = []): string
+    public static function start(string $upstream, ?int $port = null, array $config = [], array $extraArgs = []): string
     {
         if (self::$instance !== null && self::$instance->isRunning()) {
             if (self::$instance->upstream !== $upstream) {
@@ -135,7 +213,7 @@ class GoldLapel
             return self::$instance->url;
         }
 
-        self::$instance = new self($upstream, $port, $extraArgs);
+        self::$instance = new self($upstream, $port, $config, $extraArgs);
 
         if (!self::$cleanupRegistered) {
             register_shutdown_function([self::class, 'cleanup']);

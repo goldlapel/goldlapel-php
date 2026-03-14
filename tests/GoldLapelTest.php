@@ -237,4 +237,103 @@ class GoldLapelTest extends TestCase
         GoldLapel::stop();
         $this->assertNull(GoldLapel::proxyUrl());
     }
+
+    // -- configToArgs (12 tests) --
+
+    public function testConfigStringValue(): void
+    {
+        $this->assertSame(
+            ['--mode', 'butler'],
+            GoldLapel::configToArgs(['mode' => 'butler'])
+        );
+    }
+
+    public function testConfigNumericValue(): void
+    {
+        $this->assertSame(
+            ['--min-pattern-count', '5'],
+            GoldLapel::configToArgs(['min_pattern_count' => 5])
+        );
+    }
+
+    public function testConfigBooleanTrue(): void
+    {
+        $this->assertSame(
+            ['--disable-matviews'],
+            GoldLapel::configToArgs(['disable_matviews' => true])
+        );
+    }
+
+    public function testConfigBooleanFalse(): void
+    {
+        $this->assertSame(
+            [],
+            GoldLapel::configToArgs(['disable_matviews' => false])
+        );
+    }
+
+    public function testConfigListValue(): void
+    {
+        $this->assertSame(
+            ['--replica', 'host1:5432', '--replica', 'host2:5432'],
+            GoldLapel::configToArgs(['replica' => ['host1:5432', 'host2:5432']])
+        );
+    }
+
+    public function testConfigUnknownKeyThrows(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('Unknown config key: not_a_key');
+        GoldLapel::configToArgs(['not_a_key' => 'value']);
+    }
+
+    public function testConfigMultipleKeys(): void
+    {
+        $result = GoldLapel::configToArgs([
+            'mode' => 'butler',
+            'pool_size' => 10,
+            'disable_rewrite' => true,
+        ]);
+        $this->assertSame(
+            ['--mode', 'butler', '--pool-size', '10', '--disable-rewrite'],
+            $result
+        );
+    }
+
+    public function testConfigEmpty(): void
+    {
+        $this->assertSame([], GoldLapel::configToArgs([]));
+    }
+
+    public function testConfigNullValue(): void
+    {
+        $this->assertSame(
+            ['--redis-url', ''],
+            GoldLapel::configToArgs(['redis_url' => null])
+        );
+    }
+
+    public function testConfigBooleanKeyNonBoolThrows(): void
+    {
+        $this->expectException(\TypeError::class);
+        $this->expectExceptionMessage("Config key 'disable_pool' must be a boolean");
+        GoldLapel::configToArgs(['disable_pool' => 'yes']);
+    }
+
+    public function testConfigListKeyNonArrayThrows(): void
+    {
+        $this->expectException(\TypeError::class);
+        $this->expectExceptionMessage("Config key 'replica' must be an array");
+        GoldLapel::configToArgs(['replica' => 'host:5432']);
+    }
+
+    public function testConfigConstructorIntegration(): void
+    {
+        $gl = new GoldLapel('postgresql://host:5432/db', null, [
+            'mode' => 'butler',
+            'disable_matviews' => true,
+        ]);
+        $this->assertSame(7932, $gl->getPort());
+        $this->assertFalse($gl->isRunning());
+    }
 }
