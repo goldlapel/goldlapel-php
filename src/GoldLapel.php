@@ -104,6 +104,11 @@ class GoldLapel
         return $args;
     }
 
+    public static function configKeys(): array
+    {
+        return self::VALID_CONFIG_KEYS;
+    }
+
     public function startProxy(): string
     {
         if ($this->process !== null && $this->isRunning()) {

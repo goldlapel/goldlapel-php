@@ -26,12 +26,13 @@ Gold Lapel is driver-agnostic. `start()` returns a connection string (`postgresq
 
 ## API
 
-### `GoldLapel::start(upstream, port?, extraArgs?)`
+### `GoldLapel::start(upstream, port?, config?, extraArgs?)`
 
 Starts the Gold Lapel proxy and returns the proxy connection string.
 
 - `upstream` — your Postgres connection string (e.g. `postgresql://user:pass@localhost:5432/mydb`)
 - `port` — proxy port (default: 7932)
+- `config` — associative array of configuration keys (see [Configuration](#configuration))
 - `extraArgs` — additional CLI flags passed to the binary (e.g. `['--threshold-impact', '5000']`)
 
 ### `GoldLapel::stop()`
@@ -42,7 +43,7 @@ Stops the proxy. Also called automatically via `register_shutdown_function`.
 
 Returns the current proxy URL, or `null` if not running.
 
-### `new GoldLapel(upstream, port?, extraArgs?)`
+### `new GoldLapel(upstream, port?, config?, extraArgs?)`
 
 Instance API for managing multiple proxies:
 
@@ -57,17 +58,30 @@ $proxy->stopProxy();
 
 ## Configuration
 
-The proxy binary accepts all standard Gold Lapel flags. Pass them via `extraArgs`:
+Pass a config array to configure the proxy:
 
 ```php
-$url = GoldLapel::start(
-    'postgresql://user:pass@localhost:5432/mydb',
-    null,
-    ['--threshold-duration-ms', '200', '--refresh-interval-secs', '30']
-);
+use GoldLapel\GoldLapel;
+
+$url = GoldLapel::start('postgresql://user:pass@localhost/mydb', config: [
+    'mode' => 'butler',
+    'pool_size' => 50,
+    'disable_matviews' => true,
+    'replica' => ['postgresql://user:pass@replica1/mydb'],
+]);
 ```
 
-Or set environment variables (`GOLDLAPEL_PORT`, `GOLDLAPEL_UPSTREAM`, etc.) — the binary reads them automatically.
+Keys use `snake_case` and map to CLI flags (`pool_size` → `--pool-size`). Boolean keys are flags — `true` enables them. Array keys produce repeated flags.
+
+Unknown keys throw `InvalidArgumentException`. To see all valid keys:
+
+```php
+GoldLapel::configKeys()
+```
+
+For the full configuration reference, see the [main documentation](https://github.com/goldlapel/goldlapel#setting-reference).
+
+You can also set environment variables (`GOLDLAPEL_PORT`, `GOLDLAPEL_UPSTREAM`, etc.) — the binary reads them automatically.
 
 ## Driver Examples
 

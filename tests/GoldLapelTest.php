@@ -336,4 +336,27 @@ class GoldLapelTest extends TestCase
         $this->assertSame(7932, $gl->getPort());
         $this->assertFalse($gl->isRunning());
     }
+
+    // -- configKeys (3 tests) --
+
+    public function testConfigKeysReturnsArray(): void
+    {
+        $keys = GoldLapel::configKeys();
+        $this->assertIsArray($keys);
+    }
+
+    public function testConfigKeysContainsKnownKeys(): void
+    {
+        $keys = GoldLapel::configKeys();
+        $this->assertContains('mode', $keys);
+        $this->assertContains('pool_size', $keys);
+        $this->assertContains('disable_matviews', $keys);
+        $this->assertContains('replica', $keys);
+    }
+
+    public function testConfigKeysCount(): void
+    {
+        $keys = GoldLapel::configKeys();
+        $this->assertCount(43, $keys);
+    }
 }
