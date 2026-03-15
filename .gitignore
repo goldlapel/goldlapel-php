@@ -2,5 +2,6 @@ vendor/
 composer.lock
 bin/*
 !bin/.gitkeep
+!bin/goldlapel
 .phpunit.cache/
 .phpunit.result.cache

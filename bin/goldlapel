@@ -1,0 +1,28 @@
+#!/usr/bin/env php
+<?php
+
+require __DIR__ . '/../vendor/autoload.php';
+
+try {
+    $binary = GoldLapel\GoldLapel::findBinary();
+} catch (RuntimeException $e) {
+    fwrite(STDERR, "Error: " . $e->getMessage() . "\n");
+    exit(1);
+}
+
+$args = array_slice($argv, 1);
+
+if (function_exists('pcntl_exec')) {
+    pcntl_exec($binary, $args);
+    // pcntl_exec only returns on failure
+    fwrite(STDERR, "Error: failed to exec $binary\n");
+    exit(1);
+}
+
+// Fallback: passthru preserves stdio and returns exit code
+$cmd = escapeshellarg($binary);
+foreach ($args as $arg) {
+    $cmd .= ' ' . escapeshellarg($arg);
+}
+passthru($cmd, $exitCode);
+exit($exitCode);

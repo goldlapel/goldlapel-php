@@ -19,5 +19,6 @@
       "GoldLapel\\Tests\\": "tests/"
     }
   },
+  "bin": ["bin/goldlapel"],
   "version": "0.0.1-rc1"
 }
