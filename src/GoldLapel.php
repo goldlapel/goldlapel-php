@@ -133,8 +133,13 @@ class GoldLapel
             2 => ['pipe', 'w'],
         ];
 
+        $env = getenv();
+        if (!isset($env['GOLDLAPEL_CLIENT'])) {
+            $env['GOLDLAPEL_CLIENT'] = 'php';
+        }
+
         $pipes = [];
-        $this->process = proc_open($cmd, $descriptors, $pipes);
+        $this->process = proc_open($cmd, $descriptors, $pipes, null, $env);
 
         if (!is_resource($this->process)) {
             throw new RuntimeException("Failed to start Gold Lapel process");
