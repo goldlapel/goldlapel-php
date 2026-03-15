@@ -1,7 +1,22 @@
 #!/usr/bin/env php
 <?php
 
-require __DIR__ . '/../vendor/autoload.php';
+$candidates = [
+    __DIR__ . '/../vendor/autoload.php',       // root project
+    __DIR__ . '/../../../autoload.php',         // installed as dependency (vendor/goldlapel/goldlapel/bin/)
+];
+$autoloaded = false;
+foreach ($candidates as $file) {
+    if (file_exists($file)) {
+        require $file;
+        $autoloaded = true;
+        break;
+    }
+}
+if (!$autoloaded) {
+    fwrite(STDERR, "Error: could not find Composer autoloader. Run 'composer install'.\n");
+    exit(1);
+}
 
 try {
     $binary = GoldLapel\GoldLapel::findBinary();
