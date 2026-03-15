@@ -49,7 +49,8 @@ class GoldLapel
     private $process = null;
     private ?string $url = null;
 
-    private static ?self $instance = null;
+    /** @var array<string, self> */
+    private static array $instances = [];
     private static bool $cleanupRegistered = false;
 
     public function __construct(string $upstream, ?int $port = null, array $config = [], array $extraArgs = [])
@@ -227,46 +228,65 @@ class GoldLapel
         return $status['running'];
     }
 
-    // -- Static singleton --
+    // -- Static instance management --
 
     public static function start(string $upstream, ?int $port = null, array $config = [], array $extraArgs = []): string
     {
-        if (self::$instance !== null && self::$instance->isRunning()) {
-            if (self::$instance->upstream !== $upstream) {
-                throw new RuntimeException(
-                    'Gold Lapel is already running for a different upstream. ' .
-                    'Call GoldLapel::stop() before starting with a new upstream.'
-                );
-            }
-            return self::$instance->url;
+        if (isset(self::$instances[$upstream]) && self::$instances[$upstream]->isRunning()) {
+            return self::$instances[$upstream]->url;
         }
 
-        self::$instance = new self($upstream, $port, $config, $extraArgs);
+        $instance = new self($upstream, $port, $config, $extraArgs);
+        self::$instances[$upstream] = $instance;
 
         if (!self::$cleanupRegistered) {
             register_shutdown_function([self::class, 'cleanup']);
             self::$cleanupRegistered = true;
         }
 
-        return self::$instance->startProxy();
+        return $instance->startProxy();
     }
 
-    public static function stop(): void
+    public static function stop(?string $upstream = null): void
     {
-        if (self::$instance !== null) {
-            self::$instance->stopProxy();
-            self::$instance = null;
+        if ($upstream !== null) {
+            if (isset(self::$instances[$upstream])) {
+                self::$instances[$upstream]->stopProxy();
+                unset(self::$instances[$upstream]);
+            }
+            return;
         }
+
+        foreach (self::$instances as $instance) {
+            $instance->stopProxy();
+        }
+        self::$instances = [];
     }
 
-    public static function proxyUrl(): ?string
+    public static function proxyUrl(?string $upstream = null): ?string
     {
-        return self::$instance?->url;
+        if ($upstream !== null) {
+            return (self::$instances[$upstream] ?? null)?->url;
+        }
+
+        if (empty(self::$instances)) {
+            return null;
+        }
+
+        return array_values(self::$instances)[0]->url;
     }
 
-    public static function dashboardUrl(): ?string
+    public static function dashboardUrl(?string $upstream = null): ?string
     {
-        return self::$instance?->getDashboardUrl();
+        if ($upstream !== null) {
+            return (self::$instances[$upstream] ?? null)?->getDashboardUrl();
+        }
+
+        if (empty(self::$instances)) {
+            return null;
+        }
+
+        return array_values(self::$instances)[0]->getDashboardUrl();
     }
 
     public static function cleanup(): void
