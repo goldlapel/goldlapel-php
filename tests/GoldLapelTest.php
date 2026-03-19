@@ -369,8 +369,8 @@ class GoldLapelTest extends TestCase
     public function testConfigNullValue(): void
     {
         $this->assertSame(
-            ['--redis-url', ''],
-            GoldLapel::configToArgs(['redis_url' => null])
+            ['--fallback', ''],
+            GoldLapel::configToArgs(['fallback' => null])
         );
     }
 
