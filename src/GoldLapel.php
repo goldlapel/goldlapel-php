@@ -25,6 +25,7 @@ class GoldLapel
         'disable_result_cache', 'disable_pool',
         'disable_n1', 'disable_n1_cross_connection', 'disable_shadow_mode',
         'enable_coalescing', 'replica', 'exclude_tables',
+        'invalidation_port',
     ];
 
     private const BOOLEAN_KEYS = [
@@ -297,6 +298,30 @@ class GoldLapel
     public static function cleanup(): void
     {
         self::stop();
+    }
+
+    public static function wrapPDO(\PDO $pdo, ?int $invalidationPort = null): CachedPDO
+    {
+        if ($invalidationPort === null) {
+            // Auto-detect from the most recently started instance
+            $port = self::DEFAULT_PORT;
+            if (!empty(self::$instances)) {
+                $inst = array_values(self::$instances)[0];
+                $port = $inst->port;
+                $invalidationPort = isset($inst->config['invalidation_port'])
+                    ? (int) $inst->config['invalidation_port']
+                    : $port + 2;
+            } else {
+                $invalidationPort = $port + 2;
+            }
+        }
+
+        $cache = NativeCache::getInstance();
+        if (!$cache->isConnected()) {
+            $cache->connectInvalidation($invalidationPort);
+        }
+
+        return new CachedPDO($pdo, $cache);
     }
 
     // -- Static helpers --

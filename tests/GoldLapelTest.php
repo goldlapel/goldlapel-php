@@ -446,11 +446,12 @@ class GoldLapelTest extends TestCase
         $this->assertContains('pool_size', $keys);
         $this->assertContains('disable_matviews', $keys);
         $this->assertContains('replica', $keys);
+        $this->assertContains('invalidation_port', $keys);
     }
 
     public function testConfigKeysCount(): void
     {
         $keys = GoldLapel::configKeys();
-        $this->assertCount(43, $keys);
+        $this->assertCount(42, $keys);
     }
 }
