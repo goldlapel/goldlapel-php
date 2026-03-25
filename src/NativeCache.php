@@ -282,7 +282,39 @@ class NativeCache
             case 'CREATE':
             case 'ALTER':
             case 'DROP':
+            case 'REFRESH':
+            case 'DO':
+            case 'CALL':
                 return self::DDL_SENTINEL;
+            case 'MERGE':
+                if (count($tokens) < 3 || strtoupper($tokens[1]) !== 'INTO') {
+                    return null;
+                }
+                return self::bareTable($tokens[2]);
+            case 'SELECT':
+                $sawInto = false;
+                $intoTarget = null;
+                for ($i = 1; $i < count($tokens); $i++) {
+                    $upper = strtoupper($tokens[$i]);
+                    if ($upper === 'INTO' && !$sawInto) {
+                        $sawInto = true;
+                        continue;
+                    }
+                    if ($sawInto && $intoTarget === null) {
+                        if (in_array($upper, ['TEMPORARY', 'TEMP', 'UNLOGGED'], true)) {
+                            continue;
+                        }
+                        $intoTarget = $tokens[$i];
+                        continue;
+                    }
+                    if ($sawInto && $intoTarget !== null && $upper === 'FROM') {
+                        return self::DDL_SENTINEL;
+                    }
+                    if ($upper === 'FROM') {
+                        return null;
+                    }
+                }
+                return null;
             case 'COPY':
                 if (count($tokens) < 2) {
                     return null;
