@@ -83,7 +83,7 @@ class CachedPDO
     public function prepare(string $sql, array $options = []): CachedPDOStatement
     {
         $realStmt = $this->pdo->prepare($sql, $options);
-        return new CachedPDOStatement($realStmt, $this->cache, $sql, null, $this->inTransaction);
+        return new CachedPDOStatement($realStmt, $this->cache, $sql, null, fn() => $this->inTransaction);
     }
 
     public function exec(string $sql): int|false
@@ -173,7 +173,7 @@ class CachedPDOStatement implements \IteratorAggregate
     private NativeCache $cache;
     private string $sql;
     private ?array $params;
-    private bool $inTransaction;
+    private \Closure $inTransaction;
 
     private ?array $cachedRows = null;
     private ?array $cachedColumns = null;
@@ -185,13 +185,18 @@ class CachedPDOStatement implements \IteratorAggregate
         NativeCache $cache,
         string $sql,
         ?array $params = null,
-        bool $inTransaction = false,
+        bool|\Closure $inTransaction = false,
     ) {
         $this->realStmt = $realStmt;
         $this->cache = $cache;
         $this->sql = $sql;
         $this->params = $params;
-        $this->inTransaction = $inTransaction;
+        if ($inTransaction instanceof \Closure) {
+            $this->inTransaction = $inTransaction;
+        } else {
+            $val = $inTransaction;
+            $this->inTransaction = static function () use ($val) { return $val; };
+        }
     }
 
     public static function fromCache(array $entry, NativeCache $cache, string $sql): self
@@ -214,11 +219,9 @@ class CachedPDOStatement implements \IteratorAggregate
 
         // Transaction tracking
         if (NativeCache::isTxStart($this->sql)) {
-            $this->inTransaction = true;
             return $this->realStmt->execute($params);
         }
         if (NativeCache::isTxEnd($this->sql)) {
-            $this->inTransaction = false;
             return $this->realStmt->execute($params);
         }
 
@@ -234,7 +237,7 @@ class CachedPDOStatement implements \IteratorAggregate
         }
 
         // Inside transaction: bypass cache
-        if ($this->inTransaction) {
+        if (($this->inTransaction)()) {
             return $this->realStmt->execute($params);
         }
 
@@ -366,6 +369,10 @@ class CachedPDOStatement implements \IteratorAggregate
         int $maxLength = 0,
         mixed $driverOptions = null,
     ): bool {
+        if ($this->params === null) {
+            $this->params = [];
+        }
+        $this->params[$param] = $var;
         return $this->realStmt?->bindParam($param, $var, $type, $maxLength, $driverOptions) ?? false;
     }
 

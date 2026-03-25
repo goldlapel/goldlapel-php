@@ -174,6 +174,7 @@ class NativeCache
             $this->drainSignals($sock);
             fclose($sock);
         } catch (\Throwable $e) {
+            $this->invalidationConnected = false;
             if ($sock && is_resource($sock)) {
                 fclose($sock);
             }
