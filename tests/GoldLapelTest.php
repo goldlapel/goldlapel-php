@@ -277,6 +277,36 @@ class GoldLapelTest extends TestCase
         $this->assertNull(GoldLapel::dashboardUrl());
     }
 
+    public function testStopResetsNativeCache(): void
+    {
+        $cacheBefore = \GoldLapel\NativeCache::getInstance();
+        $cacheBefore->setConnected(true);
+        $cacheBefore->put('SELECT * FROM users', null, [['id' => '1']], ['id']);
+
+        GoldLapel::stop();
+
+        // After stop, NativeCache singleton should be reset
+        $cacheAfter = \GoldLapel\NativeCache::getInstance();
+        $this->assertNotSame($cacheBefore, $cacheAfter);
+        $this->assertFalse($cacheAfter->isConnected());
+        $this->assertSame(0, $cacheAfter->size());
+    }
+
+    public function testStopSpecificResetsNativeCacheWhenLastInstance(): void
+    {
+        $cache = \GoldLapel\NativeCache::getInstance();
+        $cache->setConnected(true);
+        $cache->put('SELECT * FROM users', null, [['id' => '1']], ['id']);
+
+        // Stop with a specific upstream that doesn't exist — cache should NOT reset
+        // because there might be other instances still running
+        GoldLapel::stop('postgresql://nonexistent:5432/db');
+
+        $cacheSame = \GoldLapel\NativeCache::getInstance();
+        // With no instances, the stop call resets anyway
+        $this->assertNotSame($cache, $cacheSame);
+    }
+
     public function testStartDoesNotThrowForDifferentUpstream(): void
     {
         // The old singleton would throw if called with a different upstream.

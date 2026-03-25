@@ -26,6 +26,9 @@ class NativeCache
     private bool $enabled;
     private bool $invalidationConnected = false;
     private int $invalidationPort = 0;
+    /** @var resource|null */
+    private $socket = null;
+    private bool $stopped = false;
 
     public int $statsHits = 0;
     public int $statsMisses = 0;
@@ -50,6 +53,9 @@ class NativeCache
 
     public static function reset(): void
     {
+        if (self::$instance !== null) {
+            self::$instance->disconnect();
+        }
         self::$instance = null;
     }
 
@@ -153,6 +159,7 @@ class NativeCache
     public function connectInvalidation(int $port): void
     {
         $this->invalidationPort = $port;
+        $this->stopped = false;
         $sockPath = "/tmp/goldlapel-{$port}.sock";
 
         $sock = null;
@@ -168,16 +175,17 @@ class NativeCache
             }
 
             stream_set_blocking($sock, false);
+            $this->socket = $sock;
             $this->invalidationConnected = true;
 
             // Non-blocking read of any pending signals
             $this->drainSignals($sock);
-            fclose($sock);
         } catch (\Throwable $e) {
             $this->invalidationConnected = false;
             if ($sock && is_resource($sock)) {
                 fclose($sock);
             }
+            $this->socket = null;
         }
     }
 
@@ -185,6 +193,7 @@ class NativeCache
     {
         $this->invalidationPort = $port;
         $this->invalidationConnected = false;
+        $this->stopped = false;
         $sockPath = "/tmp/goldlapel-{$port}.sock";
 
         $sock = null;
@@ -200,6 +209,7 @@ class NativeCache
             }
 
             stream_set_blocking($sock, false);
+            $this->socket = $sock;
             $this->invalidationConnected = true;
 
             // For long-running processes: read signals using stream_select
@@ -210,10 +220,27 @@ class NativeCache
                 $this->invalidateAll();
             }
         } finally {
-            if ($sock && is_resource($sock)) {
-                fclose($sock);
-            }
+            // Clean up — close the current socket (which may have been
+            // reconnected, so use $this->socket rather than the original $sock)
+            $this->disconnect();
         }
+    }
+
+    public function pollSignals(): void
+    {
+        if ($this->socket !== null && is_resource($this->socket)) {
+            $this->drainSignals($this->socket);
+        }
+    }
+
+    public function disconnect(): void
+    {
+        $this->stopped = true;
+        $this->invalidationConnected = false;
+        if ($this->socket !== null && is_resource($this->socket)) {
+            fclose($this->socket);
+        }
+        $this->socket = null;
     }
 
     public function setConnected(bool $connected): void
@@ -431,20 +458,40 @@ class NativeCache
     private function readSignalsLoop($sock): void
     {
         $buf = '';
-        while ($this->invalidationConnected) {
+        while ($this->invalidationConnected && !$this->stopped) {
             $read = [$sock];
             $write = null;
             $except = null;
             $ready = @stream_select($read, $write, $except, 30);
             if ($ready === false) {
-                break;
+                // stream_select error — try to reconnect
+                if (!$this->reconnect($sock)) {
+                    break;
+                }
+                $sock = $this->socket;
+                $buf = '';
+                continue;
             }
             if ($ready === 0) {
-                break; // timeout
+                // Timeout — check if socket is still alive with a zero-timeout peek
+                if (!is_resource($sock) || feof($sock)) {
+                    if (!$this->reconnect($sock)) {
+                        break;
+                    }
+                    $sock = $this->socket;
+                    $buf = '';
+                }
+                continue;
             }
             $data = @fread($sock, 4096);
             if ($data === false || $data === '') {
-                break;
+                // Connection lost — try to reconnect
+                if (!$this->reconnect($sock)) {
+                    break;
+                }
+                $sock = $this->socket;
+                $buf = '';
+                continue;
             }
             $buf .= $data;
             while (($pos = strpos($buf, "\n")) !== false) {
@@ -453,5 +500,52 @@ class NativeCache
                 $this->processSignal($line);
             }
         }
+    }
+
+    private function reconnect($oldSock): bool
+    {
+        if ($this->stopped) {
+            return false;
+        }
+
+        if ($oldSock && is_resource($oldSock)) {
+            @fclose($oldSock);
+        }
+        $this->socket = null;
+        $this->invalidationConnected = false;
+        $this->invalidateAll();
+
+        $port = $this->invalidationPort;
+        $sockPath = "/tmp/goldlapel-{$port}.sock";
+        $maxAttempts = 10;
+
+        for ($attempt = 0; $attempt < $maxAttempts && !$this->stopped; $attempt++) {
+            usleep(min(100000 * (1 << $attempt), 5000000)); // exponential backoff, max 5s
+
+            $sock = null;
+            try {
+                if (PHP_OS_FAMILY !== 'Windows' && file_exists($sockPath)) {
+                    $sock = @stream_socket_client("unix://{$sockPath}", $errno, $errstr, 1);
+                } else {
+                    $sock = @stream_socket_client("tcp://127.0.0.1:{$port}", $errno, $errstr, 1);
+                }
+
+                if ($sock === false) {
+                    continue;
+                }
+
+                stream_set_blocking($sock, false);
+                $this->socket = $sock;
+                $this->invalidationConnected = true;
+                return true;
+            } catch (\Throwable $e) {
+                if ($sock && is_resource($sock)) {
+                    @fclose($sock);
+                }
+                continue;
+            }
+        }
+
+        return false;
     }
 }

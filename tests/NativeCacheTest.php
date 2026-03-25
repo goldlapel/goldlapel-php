@@ -435,6 +435,121 @@ class NativeCacheTest extends TestCase
         $this->assertNull($cache->get('SELECT * FROM orders', null));
     }
 
+    // --- Socket kept alive after connectInvalidation ---
+
+    public function testConnectInvalidationKeepsSocketOpen(): void
+    {
+        $cache = new NativeCache();
+
+        $server = stream_socket_server('tcp://127.0.0.1:0', $errno, $errstr);
+        $this->assertNotFalse($server);
+        $name = stream_socket_get_name($server, false);
+        $port = (int) explode(':', $name)[1];
+
+        // Fork: child accepts connection, waits, then sends a signal
+        $pid = pcntl_fork();
+        if ($pid === 0) {
+            $conn = stream_socket_accept($server, 2);
+            if ($conn) {
+                // Wait for parent to connect, then send a signal
+                usleep(300000);
+                fwrite($conn, "I:orders\n");
+                fflush($conn);
+                usleep(500000);
+                fclose($conn);
+            }
+            fclose($server);
+            exit(0);
+        }
+
+        fclose($server);
+        usleep(100000);
+
+        // Connect — socket should remain open
+        $cache->connectInvalidation($port);
+        $this->assertTrue($cache->isConnected());
+
+        // Prime cache
+        $cache->setConnected(true);
+        $cache->put('SELECT * FROM orders', null, [['id' => '1']], ['id']);
+        $this->assertNotNull($cache->get('SELECT * FROM orders', null));
+
+        // Wait for the child to send the signal, then poll
+        usleep(400000);
+        $cache->pollSignals();
+
+        pcntl_waitpid($pid, $status);
+
+        // The signal should have invalidated the cache entry
+        $this->assertNull($cache->get('SELECT * FROM orders', null));
+    }
+
+    // --- disconnect ---
+
+    public function testDisconnectClosesSocket(): void
+    {
+        $cache = new NativeCache();
+
+        $server = stream_socket_server('tcp://127.0.0.1:0', $errno, $errstr);
+        $this->assertNotFalse($server);
+        $name = stream_socket_get_name($server, false);
+        $port = (int) explode(':', $name)[1];
+        stream_set_blocking($server, false);
+
+        $cache->connectInvalidation($port);
+        fclose($server);
+
+        $this->assertTrue($cache->isConnected());
+
+        $cache->disconnect();
+
+        $this->assertFalse($cache->isConnected());
+    }
+
+    public function testDisconnectIdempotent(): void
+    {
+        $cache = new NativeCache();
+        // Disconnect without ever connecting should not throw
+        $cache->disconnect();
+        $cache->disconnect();
+        $this->assertFalse($cache->isConnected());
+    }
+
+    // --- pollSignals ---
+
+    public function testPollSignalsNoOpWhenNotConnected(): void
+    {
+        $cache = new NativeCache();
+        // Should not throw when there's no socket
+        $cache->pollSignals();
+        $this->assertFalse($cache->isConnected());
+    }
+
+    // --- reset disconnects ---
+
+    public function testResetDisconnectsSocket(): void
+    {
+        $server = stream_socket_server('tcp://127.0.0.1:0', $errno, $errstr);
+        $this->assertNotFalse($server);
+        $name = stream_socket_get_name($server, false);
+        $port = (int) explode(':', $name)[1];
+        stream_set_blocking($server, false);
+
+        $cache = NativeCache::getInstance();
+        $cache->connectInvalidation($port);
+        fclose($server);
+        $this->assertTrue($cache->isConnected());
+
+        NativeCache::reset();
+
+        // After reset, the old instance should be disconnected
+        $this->assertFalse($cache->isConnected());
+        // And getInstance should return a fresh instance
+        $newCache = NativeCache::getInstance();
+        $this->assertNotSame($cache, $newCache);
+        $this->assertFalse($newCache->isConnected());
+    }
+
     // --- makeKey ---
 
     public function testMakeKeyNullParams(): void

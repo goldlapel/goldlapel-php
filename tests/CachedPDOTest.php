@@ -378,7 +378,7 @@ class CachedPDOTest extends TestCase
         $this->assertSame(0, $this->cache->statsHits);
     }
 
-    // --- getWrappedPDO / getCache ---
+    // --- getWrappedPDO / getCache / unwrap ---
 
     public function testGetWrappedPDO(): void
     {
@@ -387,11 +387,68 @@ class CachedPDOTest extends TestCase
         $this->assertSame($pdo, $cached->getWrappedPDO());
     }
 
+    public function testUnwrapReturnsSameAsPDO(): void
+    {
+        $pdo = $this->makeMockPDO();
+        $cached = new CachedPDO($pdo, $this->cache);
+        $this->assertSame($pdo, $cached->unwrap());
+        $this->assertSame($cached->getWrappedPDO(), $cached->unwrap());
+    }
+
     public function testGetCache(): void
     {
         $pdo = $this->makeMockPDO();
         $cached = new CachedPDO($pdo, $this->cache);
         $this->assertSame($this->cache, $cached->getCache());
+    }
+
+    // --- instanceof checks ---
+
+    public function testCachedPDOInstanceOfPDO(): void
+    {
+        $pdo = $this->makeMockPDO();
+        $cached = new CachedPDO($pdo, $this->cache);
+        $this->assertInstanceOf(\PDO::class, $cached);
+    }
+
+    public function testCachedPDOStatementInstanceOfPDOStatement(): void
+    {
+        $rows = [['id' => 1]];
+        $pdo = $this->makeMockPDO();
+        $realStmt = $this->makeMockStmt($rows, 1);
+        $pdo->method('query')->willReturn($realStmt);
+
+        $cached = new CachedPDO($pdo, $this->cache);
+        $stmt = $cached->query('SELECT * FROM users');
+        $this->assertInstanceOf(\PDOStatement::class, $stmt);
+    }
+
+    public function testCachedStatementFromCacheInstanceOfPDOStatement(): void
+    {
+        $rows = [['id' => 1]];
+        $pdo = $this->makeMockPDO();
+        $realStmt = $this->makeMockStmt($rows, 1);
+        $pdo->expects($this->once())->method('query')->willReturn($realStmt);
+
+        $cached = new CachedPDO($pdo, $this->cache);
+
+        // Prime cache
+        $cached->query('SELECT * FROM users');
+
+        // Second call returns from cache
+        $stmt = $cached->query('SELECT * FROM users');
+        $this->assertInstanceOf(\PDOStatement::class, $stmt);
+        $this->assertInstanceOf(CachedPDOStatement::class, $stmt);
+    }
+
+    public function testCachedPDOAcceptedByPDOTypeHint(): void
+    {
+        $pdo = $this->makeMockPDO();
+        $cached = new CachedPDO($pdo, $this->cache);
+
+        // This function has a PDO type hint — should accept CachedPDO
+        $fn = function (\PDO $db): bool { return true; };
+        $this->assertTrue($fn($cached));
     }
 
     // --- PDO passthrough ---

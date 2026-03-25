@@ -2,19 +2,28 @@
 
 namespace GoldLapel;
 
-class CachedPDO
+class CachedPDO extends \PDO
 {
     private \PDO $pdo;
     private NativeCache $cache;
     private bool $inTransaction = false;
 
+    // Extends PDO so instanceof checks and type hints work.
+    // We intentionally skip parent::__construct() to avoid opening a
+    // second connection — all calls delegate to the wrapped $pdo.
     public function __construct(\PDO $pdo, NativeCache $cache)
     {
+        // Do NOT call parent::__construct() — we delegate to $pdo instead.
         $this->pdo = $pdo;
         $this->cache = $cache;
     }
 
     public function getWrappedPDO(): \PDO
+    {
+        return $this->pdo;
+    }
+
+    public function unwrap(): \PDO
     {
         return $this->pdo;
     }
@@ -167,7 +176,7 @@ class CachedPDO
     }
 }
 
-class CachedPDOStatement implements \IteratorAggregate
+class CachedPDOStatement extends \PDOStatement
 {
     private ?\PDOStatement $realStmt;
     private NativeCache $cache;
@@ -376,12 +385,15 @@ class CachedPDOStatement implements \IteratorAggregate
         return $this->realStmt?->bindParam($param, $var, $type, $maxLength, $driverOptions) ?? false;
     }
 
-    public function getIterator(): \Traversable
+    public function getIterator(): \Iterator
     {
         if ($this->cachedRows !== null) {
             return new \ArrayIterator(array_slice($this->cachedRows, $this->fetchIndex));
         }
-        return $this->realStmt ?? new \ArrayIterator([]);
+        if ($this->realStmt !== null) {
+            return new \ArrayIterator($this->realStmt->fetchAll(\PDO::FETCH_ASSOC));
+        }
+        return new \ArrayIterator([]);
     }
 
     public function __call(string $method, array $args): mixed

@@ -260,6 +260,9 @@ class GoldLapel
                 self::$instances[$upstream]->stopProxy();
                 unset(self::$instances[$upstream]);
             }
+            if (empty(self::$instances)) {
+                NativeCache::reset();
+            }
             return;
         }
 
@@ -267,6 +270,7 @@ class GoldLapel
             $instance->stopProxy();
         }
         self::$instances = [];
+        NativeCache::reset();
     }
 
     public static function proxyUrl(?string $upstream = null): ?string
