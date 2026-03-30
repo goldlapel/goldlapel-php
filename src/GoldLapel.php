@@ -236,7 +236,54 @@ class GoldLapel
 
     // -- Static instance management --
 
-    public static function start(string $upstream, ?int $port = null, array $config = [], array $extraArgs = []): string
+    /**
+     * Start the proxy and return a CachedPDO connection.
+     *
+     * Requires the pdo_pgsql extension. Use proxyUrl() if you only need the
+     * connection string.
+     *
+     * @return CachedPDO
+     */
+    public static function start(string $upstream, ?int $port = null, array $config = [], array $extraArgs = []): CachedPDO
+    {
+        if (isset(self::$instances[$upstream]) && self::$instances[$upstream]->isRunning()) {
+            $inst = self::$instances[$upstream];
+            $url = $inst->url;
+        } else {
+            $instance = new self($upstream, $port, $config, $extraArgs);
+            self::$instances[$upstream] = $instance;
+
+            if (!self::$cleanupRegistered) {
+                register_shutdown_function([self::class, 'cleanup']);
+                self::$cleanupRegistered = true;
+            }
+
+            $url = $instance->startProxy();
+            $inst = $instance;
+        }
+
+        if (!extension_loaded('pdo_pgsql')) {
+            throw new RuntimeException(
+                'No supported database driver found. ' .
+                'Enable the pdo_pgsql extension or use proxyUrl() if you only need the connection string.'
+            );
+        }
+
+        $dsn = self::urlToPdoDsn($url);
+        $parsed = parse_url($url);
+        $user = isset($parsed['user']) ? rawurldecode($parsed['user']) : null;
+        $pass = isset($parsed['pass']) ? rawurldecode($parsed['pass']) : null;
+        $pdo = new \PDO($dsn, $user, $pass);
+        $invPort = isset($config['invalidation_port'])
+            ? (int) $config['invalidation_port']
+            : $inst->port + 2;
+        return self::wrapPDO($pdo, $invPort);
+    }
+
+    /**
+     * Start the proxy and return the proxy URL string without wrapping.
+     */
+    public static function startUrl(string $upstream, ?int $port = null, array $config = [], array $extraArgs = []): string
     {
         if (isset(self::$instances[$upstream]) && self::$instances[$upstream]->isRunning()) {
             return self::$instances[$upstream]->url;
@@ -439,6 +486,36 @@ class GoldLapel
 
         proc_close($this->process);
         $this->process = null;
+    }
+
+    /**
+     * Convert a PostgreSQL connection URL to a PDO DSN string.
+     *
+     * Input:  postgresql://user:pass@localhost:7932/mydb?sslmode=require
+     * Output: pgsql:host=localhost;port=7932;dbname=mydb;sslmode=require
+     */
+    private static function urlToPdoDsn(string $url): string
+    {
+        $parsed = parse_url($url);
+        $params = [];
+
+        if (isset($parsed['host'])) {
+            $params[] = 'host=' . $parsed['host'];
+        }
+        if (isset($parsed['port'])) {
+            $params[] = 'port=' . $parsed['port'];
+        }
+        if (isset($parsed['path']) && $parsed['path'] !== '/') {
+            $params[] = 'dbname=' . ltrim($parsed['path'], '/');
+        }
+        if (isset($parsed['query'])) {
+            parse_str($parsed['query'], $queryParams);
+            foreach ($queryParams as $k => $v) {
+                $params[] = $k . '=' . $v;
+            }
+        }
+
+        return 'pgsql:' . implode(';', $params);
     }
 
     private static function isMusl(string $arch): bool
