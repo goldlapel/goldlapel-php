@@ -211,4 +211,56 @@ class Utils
         $value = $stmt->fetchColumn();
         return $value !== false ? (float) $value : null;
     }
+
+    public static function hset(\PDO $pdo, string $table, string $key, string $field, mixed $value): void
+    {
+        $pdo->exec("
+            CREATE TABLE IF NOT EXISTS {$table} (
+                key TEXT PRIMARY KEY,
+                data JSONB NOT NULL DEFAULT '{}'::jsonb
+            )
+        ");
+        $json = json_encode($value);
+        $stmt = $pdo->prepare("
+            INSERT INTO {$table} (key, data) VALUES (?, jsonb_build_object(?, ?::jsonb))
+            ON CONFLICT (key) DO UPDATE SET data = {$table}.data || jsonb_build_object(?, ?::jsonb)
+        ");
+        $stmt->execute([$key, $field, $json, $field, $json]);
+    }
+
+    public static function hget(\PDO $pdo, string $table, string $key, string $field): mixed
+    {
+        $stmt = $pdo->prepare("SELECT data->>? FROM {$table} WHERE key = ?");
+        $stmt->execute([$field, $key]);
+        $value = $stmt->fetchColumn();
+        if ($value === false || $value === null) {
+            return null;
+        }
+        $decoded = json_decode($value, true);
+        return json_last_error() === JSON_ERROR_NONE ? $decoded : $value;
+    }
+
+    public static function hgetall(\PDO $pdo, string $table, string $key): array
+    {
+        $stmt = $pdo->prepare("SELECT data FROM {$table} WHERE key = ?");
+        $stmt->execute([$key]);
+        $value = $stmt->fetchColumn();
+        if ($value === false || $value === null) {
+            return [];
+        }
+        return json_decode($value, true) ?? [];
+    }
+
+    public static function hdel(\PDO $pdo, string $table, string $key, string $field): bool
+    {
+        $stmt = $pdo->prepare("SELECT data ? ? AS existed FROM {$table} WHERE key = ?");
+        $stmt->execute([$field, $key]);
+        $row = $stmt->fetch(\PDO::FETCH_ASSOC);
+        if ($row === false || !$row['existed']) {
+            return false;
+        }
+        $stmt = $pdo->prepare("UPDATE {$table} SET data = data - ? WHERE key = ?");
+        $stmt->execute([$field, $key]);
+        return true;
+    }
 }
