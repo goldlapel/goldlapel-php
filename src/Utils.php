@@ -263,4 +263,10 @@ class Utils
         $stmt->execute([$field, $key]);
         return true;
     }
+
+    public static function countDistinct(\PDO $pdo, string $table, string $column): int
+    {
+        $stmt = $pdo->query("SELECT COUNT(DISTINCT {$column}) FROM {$table}");
+        return (int) $stmt->fetchColumn();
+    }
 }
