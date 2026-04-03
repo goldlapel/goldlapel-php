@@ -269,4 +269,21 @@ class Utils
         $stmt = $pdo->query("SELECT COUNT(DISTINCT {$column}) FROM {$table}");
         return (int) $stmt->fetchColumn();
     }
+
+    public static function script(\PDO $pdo, string $luaCode, mixed ...$args): ?string
+    {
+        $pdo->exec("CREATE EXTENSION IF NOT EXISTS pllua");
+        $funcName = "_gl_lua_" . bin2hex(random_bytes(4));
+        $params = implode(", ", array_map(fn($i) => "p" . ($i + 1) . " text", range(0, count($args) - 1)));
+        $pdo->exec("CREATE OR REPLACE FUNCTION pg_temp.{$funcName}({$params}) RETURNS text LANGUAGE pllua AS \$pllua\$ {$luaCode} \$pllua\$");
+        if (empty($args)) {
+            $stmt = $pdo->query("SELECT pg_temp.{$funcName}()");
+        } else {
+            $placeholders = implode(", ", array_map(fn($i) => "?", range(0, count($args) - 1)));
+            $stmt = $pdo->prepare("SELECT pg_temp.{$funcName}({$placeholders})");
+            $stmt->execute(array_map('strval', $args));
+        }
+        $row = $stmt->fetch(\PDO::FETCH_NUM);
+        return $row ? $row[0] : null;
+    }
 }
