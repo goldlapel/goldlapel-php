@@ -10,6 +10,17 @@ class Utils
         $stmt->execute([$channel, $message]);
     }
 
+    public static function subscribe(\PDO $pdo, string $channel, callable $callback): void
+    {
+        $pdo->exec("LISTEN " . $channel);
+        while (true) {
+            $notify = $pdo->pgsqlGetNotify(\PDO::FETCH_ASSOC, 5000);
+            if ($notify) {
+                $callback($notify['message'], $notify['payload']);
+            }
+        }
+    }
+
     public static function enqueue(\PDO $pdo, string $queueTable, array $payload): void
     {
         $pdo->exec("
