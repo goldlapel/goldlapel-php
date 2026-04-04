@@ -281,6 +281,144 @@ class Utils
         return (int) $stmt->fetchColumn();
     }
 
+    public static function streamAdd(\PDO $pdo, string $stream, array $payload): int
+    {
+        $pdo->exec("
+            CREATE TABLE IF NOT EXISTS {$stream} (
+                id BIGSERIAL PRIMARY KEY,
+                payload JSONB NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        ");
+        $stmt = $pdo->prepare("INSERT INTO {$stream} (payload) VALUES (?) RETURNING id");
+        $stmt->execute([json_encode($payload)]);
+        return (int) $stmt->fetchColumn();
+    }
+
+    public static function streamCreateGroup(\PDO $pdo, string $stream, string $group): void
+    {
+        $groupsTable = $stream . '_groups';
+        $pendingTable = $stream . '_pending';
+        $pdo->exec("
+            CREATE TABLE IF NOT EXISTS {$groupsTable} (
+                group_name TEXT PRIMARY KEY,
+                last_id BIGINT NOT NULL DEFAULT 0
+            )
+        ");
+        $pdo->exec("
+            CREATE TABLE IF NOT EXISTS {$pendingTable} (
+                message_id BIGINT NOT NULL,
+                group_name TEXT NOT NULL,
+                consumer TEXT NOT NULL,
+                assigned_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                PRIMARY KEY (group_name, message_id)
+            )
+        ");
+        $stmt = $pdo->prepare("
+            INSERT INTO {$groupsTable} (group_name, last_id) VALUES (?, 0)
+            ON CONFLICT (group_name) DO NOTHING
+        ");
+        $stmt->execute([$group]);
+    }
+
+    public static function streamRead(\PDO $pdo, string $stream, string $group, string $consumer, int $count = 1): array
+    {
+        $groupsTable = $stream . '_groups';
+        $pendingTable = $stream . '_pending';
+
+        $pdo->beginTransaction();
+        try {
+            $stmt = $pdo->prepare("SELECT last_id FROM {$groupsTable} WHERE group_name = ? FOR UPDATE");
+            $stmt->execute([$group]);
+            $lastId = $stmt->fetchColumn();
+            if ($lastId === false) {
+                $pdo->commit();
+                return [];
+            }
+
+            $stmt = $pdo->prepare("
+                SELECT id, payload, created_at FROM {$stream}
+                WHERE id > ?
+                ORDER BY id
+                LIMIT ?
+                FOR UPDATE SKIP LOCKED
+            ");
+            $stmt->execute([$lastId, $count]);
+            $messages = $stmt->fetchAll(\PDO::FETCH_ASSOC);
+
+            if (empty($messages)) {
+                $pdo->commit();
+                return [];
+            }
+
+            $maxId = 0;
+            $insert = $pdo->prepare("
+                INSERT INTO {$pendingTable} (message_id, group_name, consumer)
+                VALUES (?, ?, ?)
+                ON CONFLICT (group_name, message_id) DO NOTHING
+            ");
+            foreach ($messages as &$msg) {
+                $msg['payload'] = json_decode($msg['payload'], true);
+                $id = (int) $msg['id'];
+                if ($id > $maxId) {
+                    $maxId = $id;
+                }
+                $insert->execute([$id, $group, $consumer]);
+            }
+            unset($msg);
+
+            $stmt = $pdo->prepare("UPDATE {$groupsTable} SET last_id = ? WHERE group_name = ?");
+            $stmt->execute([$maxId, $group]);
+
+            $pdo->commit();
+            return $messages;
+        } catch (\Throwable $e) {
+            $pdo->rollBack();
+            throw $e;
+        }
+    }
+
+    public static function streamAck(\PDO $pdo, string $stream, string $group, int $messageId): bool
+    {
+        $pendingTable = $stream . '_pending';
+        $stmt = $pdo->prepare("DELETE FROM {$pendingTable} WHERE group_name = ? AND message_id = ?");
+        $stmt->execute([$group, $messageId]);
+        return $stmt->rowCount() > 0;
+    }
+
+    public static function streamClaim(\PDO $pdo, string $stream, string $group, string $consumer, int $minIdleMs = 60000): array
+    {
+        $pendingTable = $stream . '_pending';
+        $stmt = $pdo->prepare("
+            UPDATE {$pendingTable}
+            SET consumer = ?, assigned_at = NOW()
+            WHERE group_name = ?
+            AND assigned_at < NOW() - (? || ' milliseconds')::interval
+            RETURNING message_id
+        ");
+        $stmt->execute([$consumer, $group, $minIdleMs]);
+        $claimed = $stmt->fetchAll(\PDO::FETCH_COLUMN);
+
+        if (empty($claimed)) {
+            return [];
+        }
+
+        $placeholders = implode(', ', array_fill(0, count($claimed), '?'));
+        $stmt = $pdo->prepare("
+            SELECT id, payload, created_at FROM {$stream}
+            WHERE id IN ({$placeholders})
+            ORDER BY id
+        ");
+        $stmt->execute($claimed);
+        $messages = $stmt->fetchAll(\PDO::FETCH_ASSOC);
+        foreach ($messages as &$msg) {
+            $msg['payload'] = json_decode($msg['payload'], true);
+        }
+        unset($msg);
+
+        return $messages;
+    }
+
     public static function script(\PDO $pdo, string $luaCode, mixed ...$args): ?string
     {
         $pdo->exec("CREATE EXTENSION IF NOT EXISTS pllua");
