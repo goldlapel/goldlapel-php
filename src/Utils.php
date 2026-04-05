@@ -682,6 +682,37 @@ class Utils
         return $stmt->rowCount() > 0;
     }
 
+    public static function analyze(\PDO $pdo, string $text, string $lang = 'english'): array
+    {
+        $stmt = $pdo->prepare("SELECT alias, description, token, dictionaries, dictionary, lexemes FROM ts_debug(?, ?)");
+        $stmt->execute([$lang, $text]);
+        return $stmt->fetchAll(\PDO::FETCH_ASSOC);
+    }
+
+    public static function explainScore(
+        \PDO $pdo,
+        string $table,
+        string $column,
+        string $query,
+        string $idColumn,
+        mixed $idValue,
+        string $lang = 'english',
+    ): ?array {
+        self::validateIdentifier($table);
+        self::validateIdentifier($column);
+        self::validateIdentifier($idColumn);
+        $sql = "SELECT {$column} AS document_text, to_tsvector(?, {$column})::text AS document_tokens, "
+            . "plainto_tsquery(?, ?)::text AS query_tokens, "
+            . "to_tsvector(?, {$column}) @@ plainto_tsquery(?, ?) AS matches, "
+            . "ts_rank(to_tsvector(?, {$column}), plainto_tsquery(?, ?)) AS score, "
+            . "ts_headline(?, {$column}, plainto_tsquery(?, ?), 'StartSel=**, StopSel=**, MaxWords=50, MinWords=20') AS headline "
+            . "FROM {$table} WHERE {$idColumn} = ?";
+        $stmt = $pdo->prepare($sql);
+        $stmt->execute([$lang, $lang, $query, $lang, $lang, $query, $lang, $lang, $query, $lang, $lang, $query, $idValue]);
+        $row = $stmt->fetch(\PDO::FETCH_ASSOC);
+        return $row !== false ? $row : null;
+    }
+
     public static function script(\PDO $pdo, string $luaCode, mixed ...$args): ?string
     {
         $pdo->exec("CREATE EXTENSION IF NOT EXISTS pllua");
