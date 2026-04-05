@@ -4,6 +4,133 @@ namespace GoldLapel;
 
 class Utils
 {
+    private static function validateIdentifier(string $name): string
+    {
+        if ($name === '' || !preg_match('/^[a-zA-Z_][a-zA-Z0-9_]*$/', $name)) {
+            throw new \InvalidArgumentException("Invalid identifier: {$name}");
+        }
+        return $name;
+    }
+
+    public static function search(
+        \PDO $pdo,
+        string $table,
+        string|array $column,
+        string $query,
+        int $limit = 50,
+        string $lang = 'english',
+        bool $highlight = false,
+    ): array {
+        self::validateIdentifier($table);
+        $columns = is_array($column) ? $column : [$column];
+        foreach ($columns as $c) {
+            self::validateIdentifier($c);
+        }
+        $tsvector = implode(" || ' ' || ", array_map(fn($c) => "coalesce({$c}, '')", $columns));
+        $tsv = "to_tsvector(?, {$tsvector})";
+        $tsq = "plainto_tsquery(?, ?)";
+        if ($highlight) {
+            $fields = "*, ts_rank({$tsv}, {$tsq}) AS _score, ts_headline(?, {$tsvector}, {$tsq}) AS _highlight";
+            $sql = "SELECT {$fields} FROM {$table} WHERE {$tsv} @@ {$tsq} ORDER BY _score DESC LIMIT ?";
+            $stmt = $pdo->prepare($sql);
+            // ?-params: ts_rank(tsv[lang], tsq[lang,query]) + ts_headline(lang, tsq[lang,query]) + WHERE tsv[lang] @@ tsq[lang,query] + LIMIT
+            $stmt->execute([$lang, $lang, $query, $lang, $lang, $query, $lang, $lang, $query, $limit]);
+        } else {
+            $fields = "*, ts_rank({$tsv}, {$tsq}) AS _score";
+            $sql = "SELECT {$fields} FROM {$table} WHERE {$tsv} @@ {$tsq} ORDER BY _score DESC LIMIT ?";
+            $stmt = $pdo->prepare($sql);
+            // ?-params: ts_rank(tsv[lang], tsq[lang,query]) + WHERE tsv[lang] @@ tsq[lang,query] + LIMIT
+            $stmt->execute([$lang, $lang, $query, $lang, $lang, $query, $limit]);
+        }
+        return $stmt->fetchAll(\PDO::FETCH_ASSOC);
+    }
+
+    public static function searchFuzzy(
+        \PDO $pdo,
+        string $table,
+        string $column,
+        string $query,
+        int $limit = 50,
+        float $threshold = 0.3,
+    ): array {
+        self::validateIdentifier($table);
+        self::validateIdentifier($column);
+        $pdo->exec("CREATE EXTENSION IF NOT EXISTS pg_trgm");
+        $stmt = $pdo->prepare("
+            SELECT *, similarity({$column}, ?) AS _score
+            FROM {$table}
+            WHERE similarity({$column}, ?) > ?
+            ORDER BY _score DESC
+            LIMIT ?
+        ");
+        $stmt->execute([$query, $query, $threshold, $limit]);
+        return $stmt->fetchAll(\PDO::FETCH_ASSOC);
+    }
+
+    public static function searchPhonetic(
+        \PDO $pdo,
+        string $table,
+        string $column,
+        string $query,
+        int $limit = 50,
+    ): array {
+        self::validateIdentifier($table);
+        self::validateIdentifier($column);
+        $pdo->exec("CREATE EXTENSION IF NOT EXISTS fuzzystrmatch");
+        $pdo->exec("CREATE EXTENSION IF NOT EXISTS pg_trgm");
+        $stmt = $pdo->prepare("
+            SELECT *, similarity({$column}, ?) AS _score
+            FROM {$table}
+            WHERE soundex({$column}) = soundex(?)
+            ORDER BY _score DESC, {$column}
+            LIMIT ?
+        ");
+        $stmt->execute([$query, $query, $limit]);
+        return $stmt->fetchAll(\PDO::FETCH_ASSOC);
+    }
+
+    public static function similar(
+        \PDO $pdo,
+        string $table,
+        string $column,
+        array $vector,
+        int $limit = 10,
+    ): array {
+        self::validateIdentifier($table);
+        self::validateIdentifier($column);
+        $pdo->exec("CREATE EXTENSION IF NOT EXISTS vector");
+        $vectorLiteral = '[' . implode(',', $vector) . ']';
+        $stmt = $pdo->prepare("
+            SELECT *, ({$column} <=> ?::vector) AS _score
+            FROM {$table}
+            ORDER BY _score
+            LIMIT ?
+        ");
+        $stmt->execute([$vectorLiteral, $limit]);
+        return $stmt->fetchAll(\PDO::FETCH_ASSOC);
+    }
+
+    public static function suggest(
+        \PDO $pdo,
+        string $table,
+        string $column,
+        string $prefix,
+        int $limit = 10,
+    ): array {
+        self::validateIdentifier($table);
+        self::validateIdentifier($column);
+        $pdo->exec("CREATE EXTENSION IF NOT EXISTS pg_trgm");
+        $stmt = $pdo->prepare("
+            SELECT *, similarity({$column}, ?) AS _score
+            FROM {$table}
+            WHERE {$column} ILIKE ?
+            ORDER BY _score DESC, {$column}
+            LIMIT ?
+        ");
+        $stmt->execute([$prefix, $prefix . '%', $limit]);
+        return $stmt->fetchAll(\PDO::FETCH_ASSOC);
+    }
+
     public static function publish(\PDO $pdo, string $channel, string $message): void
     {
         $stmt = $pdo->prepare("SELECT pg_notify(?, ?)");
