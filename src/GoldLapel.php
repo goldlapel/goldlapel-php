@@ -122,7 +122,7 @@ class GoldLapel
 
         $binary = self::findBinary();
         $cmd = array_merge(
-            [$binary, '--upstream', $this->upstream, '--port', (string) $this->port],
+            [$binary, '--upstream', $this->upstream, '--proxy-port', (string) $this->port],
             self::configToArgs($this->config),
             $this->extraArgs
         );
