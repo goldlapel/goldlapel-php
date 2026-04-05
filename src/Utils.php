@@ -615,6 +615,73 @@ class Utils
         $pdo->exec("CREATE TEXT SEARCH CONFIGURATION {$name} (COPY = {$copyFrom})");
     }
 
+    public static function percolateAdd(
+        \PDO $pdo,
+        string $name,
+        string $queryId,
+        string $query,
+        string $lang = 'english',
+        ?array $metadata = null,
+    ): void {
+        self::validateIdentifier($name);
+        $pdo->exec("
+            CREATE TABLE IF NOT EXISTS {$name} (
+                query_id TEXT PRIMARY KEY,
+                query_text TEXT NOT NULL,
+                tsquery TSQUERY NOT NULL,
+                lang TEXT NOT NULL DEFAULT 'english',
+                metadata JSONB,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            )
+        ");
+        $pdo->exec("CREATE INDEX IF NOT EXISTS {$name}_tsq_idx ON {$name} USING GIN (tsquery)");
+        $stmt = $pdo->prepare("
+            INSERT INTO {$name} (query_id, query_text, tsquery, lang, metadata)
+            VALUES (?, ?, plainto_tsquery(?, ?), ?, ?)
+            ON CONFLICT (query_id) DO UPDATE SET
+                query_text = EXCLUDED.query_text,
+                tsquery = EXCLUDED.tsquery,
+                lang = EXCLUDED.lang,
+                metadata = EXCLUDED.metadata
+        ");
+        $stmt->execute([
+            $queryId,
+            $query,
+            $lang,
+            $query,
+            $lang,
+            $metadata !== null ? json_encode($metadata) : null,
+        ]);
+    }
+
+    public static function percolate(
+        \PDO $pdo,
+        string $name,
+        string $text,
+        int $limit = 50,
+        string $lang = 'english',
+    ): array {
+        self::validateIdentifier($name);
+        $stmt = $pdo->prepare("
+            SELECT query_id, query_text, metadata,
+                ts_rank(to_tsvector(?, ?), tsquery) AS _score
+            FROM {$name}
+            WHERE to_tsvector(?, ?) @@ tsquery
+            ORDER BY _score DESC
+            LIMIT ?
+        ");
+        $stmt->execute([$lang, $text, $lang, $text, $limit]);
+        return $stmt->fetchAll(\PDO::FETCH_ASSOC);
+    }
+
+    public static function percolateDelete(\PDO $pdo, string $name, string $queryId): bool
+    {
+        self::validateIdentifier($name);
+        $stmt = $pdo->prepare("DELETE FROM {$name} WHERE query_id = ? RETURNING query_id");
+        $stmt->execute([$queryId]);
+        return $stmt->rowCount() > 0;
+    }
+
     public static function script(\PDO $pdo, string $luaCode, mixed ...$args): ?string
     {
         $pdo->exec("CREATE EXTENSION IF NOT EXISTS pllua");
