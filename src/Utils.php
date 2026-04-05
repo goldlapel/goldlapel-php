@@ -546,6 +546,75 @@ class Utils
         return $messages;
     }
 
+    public static function facets(
+        \PDO $pdo,
+        string $table,
+        string $column,
+        int $limit = 50,
+        ?string $query = null,
+        string|array|null $queryColumn = null,
+        string $lang = 'english',
+    ): array {
+        self::validateIdentifier($table);
+        self::validateIdentifier($column);
+        if ($query !== null && $queryColumn !== null) {
+            $columns = is_array($queryColumn) ? $queryColumn : [$queryColumn];
+            foreach ($columns as $c) {
+                self::validateIdentifier($c);
+            }
+            $tsvector = implode(" || ' ' || ", array_map(fn($c) => "coalesce({$c}, '')", $columns));
+            $sql = "SELECT {$column} AS value, COUNT(*) AS count FROM {$table} WHERE to_tsvector(?, {$tsvector}) @@ plainto_tsquery(?, ?) GROUP BY {$column} ORDER BY count DESC, {$column} LIMIT ?";
+            $stmt = $pdo->prepare($sql);
+            $stmt->execute([$lang, $lang, $query, $limit]);
+        } else {
+            $sql = "SELECT {$column} AS value, COUNT(*) AS count FROM {$table} GROUP BY {$column} ORDER BY count DESC, {$column} LIMIT ?";
+            $stmt = $pdo->prepare($sql);
+            $stmt->execute([$limit]);
+        }
+        return $stmt->fetchAll(\PDO::FETCH_ASSOC);
+    }
+
+    public static function aggregate(
+        \PDO $pdo,
+        string $table,
+        string $column,
+        string $func,
+        ?string $groupBy = null,
+        int $limit = 50,
+    ): array {
+        $allowed = ['count', 'sum', 'avg', 'min', 'max'];
+        if (!in_array(strtolower($func), $allowed, true)) {
+            throw new \InvalidArgumentException("Invalid aggregate function: {$func}. Must be one of: " . implode(', ', $allowed));
+        }
+        self::validateIdentifier($table);
+        self::validateIdentifier($column);
+        $funcUpper = strtoupper($func);
+        $expr = $funcUpper === 'COUNT' ? 'COUNT(*)' : "{$funcUpper}({$column})";
+        if ($groupBy !== null) {
+            self::validateIdentifier($groupBy);
+            $sql = "SELECT {$groupBy}, {$expr} AS value FROM {$table} GROUP BY {$groupBy} ORDER BY value DESC LIMIT ?";
+            $stmt = $pdo->prepare($sql);
+            $stmt->execute([$limit]);
+        } else {
+            $sql = "SELECT {$expr} AS value FROM {$table}";
+            $stmt = $pdo->prepare($sql);
+            $stmt->execute();
+        }
+        return $stmt->fetchAll(\PDO::FETCH_ASSOC);
+    }
+
+    public static function createSearchConfig(\PDO $pdo, string $name, string $copyFrom = 'english'): void
+    {
+        self::validateIdentifier($name);
+        self::validateIdentifier($copyFrom);
+        $stmt = $pdo->prepare("SELECT 1 FROM pg_ts_config WHERE cfgname = ?");
+        $stmt->execute([$name]);
+        if ($stmt->fetchColumn() !== false) {
+            return;
+        }
+        $pdo->exec("CREATE TEXT SEARCH CONFIGURATION {$name} (COPY = {$copyFrom})");
+    }
+
     public static function script(\PDO $pdo, string $luaCode, mixed ...$args): ?string
     {
         $pdo->exec("CREATE EXTENSION IF NOT EXISTS pllua");
