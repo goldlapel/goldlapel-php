@@ -30,7 +30,7 @@ class Utils
         $tsv = "to_tsvector(?, {$tsvector})";
         $tsq = "plainto_tsquery(?, ?)";
         if ($highlight) {
-            $fields = "*, ts_rank({$tsv}, {$tsq}) AS _score, ts_headline(?, {$tsvector}, {$tsq}) AS _highlight";
+            $fields = "*, ts_rank({$tsv}, {$tsq}) AS _score, ts_headline(?, {$tsvector}, {$tsq}, 'StartSel=<mark>, StopSel=</mark>, MaxWords=35, MinWords=15') AS _highlight";
             $sql = "SELECT {$fields} FROM {$table} WHERE {$tsv} @@ {$tsq} ORDER BY _score DESC LIMIT ?";
             $stmt = $pdo->prepare($sql);
             // ?-params: ts_rank(tsv[lang], tsq[lang,query]) + ts_headline(lang, tsq[lang,query]) + WHERE tsv[lang] @@ tsq[lang,query] + LIMIT
