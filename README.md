@@ -66,7 +66,7 @@ Pass a config array to configure the proxy:
 use GoldLapel\GoldLapel;
 
 $conn = GoldLapel::start('postgresql://user:pass@localhost/mydb', config: [
-    'mode' => 'butler',
+    'mode' => 'waiter',
     'pool_size' => 50,
     'disable_matviews' => true,
     'replica' => ['postgresql://user:pass@replica1/mydb'],

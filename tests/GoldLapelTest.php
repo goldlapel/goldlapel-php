@@ -334,8 +334,8 @@ class GoldLapelTest extends TestCase
     public function testConfigStringValue(): void
     {
         $this->assertSame(
-            ['--mode', 'butler'],
-            GoldLapel::configToArgs(['mode' => 'butler'])
+            ['--mode', 'waiter'],
+            GoldLapel::configToArgs(['mode' => 'waiter'])
         );
     }
 
@@ -381,12 +381,12 @@ class GoldLapelTest extends TestCase
     public function testConfigMultipleKeys(): void
     {
         $result = GoldLapel::configToArgs([
-            'mode' => 'butler',
+            'mode' => 'waiter',
             'pool_size' => 10,
             'disable_rewrite' => true,
         ]);
         $this->assertSame(
-            ['--mode', 'butler', '--pool-size', '10', '--disable-rewrite'],
+            ['--mode', 'waiter', '--pool-size', '10', '--disable-rewrite'],
             $result
         );
     }
@@ -421,7 +421,7 @@ class GoldLapelTest extends TestCase
     public function testConfigConstructorIntegration(): void
     {
         $gl = new GoldLapel('postgresql://host:5432/db', null, [
-            'mode' => 'butler',
+            'mode' => 'waiter',
             'disable_matviews' => true,
         ]);
         $this->assertSame(7932, $gl->getPort());
