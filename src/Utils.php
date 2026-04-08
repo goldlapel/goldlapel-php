@@ -881,6 +881,206 @@ class Utils
         return (int) $stmt->fetchColumn();
     }
 
+    public static function docAggregate(\PDO $pdo, string $collection, array $pipeline): array
+    {
+        self::validateIdentifier($collection);
+
+        if (empty($pipeline)) {
+            return [];
+        }
+
+        $whereParams = [];
+        $where = '';
+        $groupBy = '';
+        $selectFields = [];
+        $orderBy = '';
+        $limit = '';
+        $offset = '';
+        $limitValue = null;
+        $offsetValue = null;
+        $hasGroup = false;
+        $groupId = null;
+        $accumulators = [];
+
+        foreach ($pipeline as $stage) {
+            if (!is_array($stage) || count($stage) !== 1) {
+                throw new \InvalidArgumentException("Each pipeline stage must be an associative array with exactly one key");
+            }
+
+            $stageKey = array_key_first($stage);
+            $stageValue = $stage[$stageKey];
+
+            switch ($stageKey) {
+                case '$match':
+                    if (!is_array($stageValue)) {
+                        throw new \InvalidArgumentException('$match stage value must be an array');
+                    }
+                    $whereParams[] = json_encode($stageValue);
+                    $where = "WHERE data @> ?::jsonb";
+                    break;
+
+                case '$group':
+                    if (!is_array($stageValue) || !array_key_exists('_id', $stageValue)) {
+                        throw new \InvalidArgumentException('$group stage must contain _id');
+                    }
+                    $hasGroup = true;
+                    $groupId = $stageValue['_id'];
+
+                    if ($groupId !== null) {
+                        if (!is_string($groupId) || $groupId === '' || $groupId[0] !== '$') {
+                            throw new \InvalidArgumentException('$group _id must be null or a "$field" reference');
+                        }
+                        $groupField = substr($groupId, 1);
+                        if (!preg_match('/^[a-zA-Z_][a-zA-Z0-9_.]*$/', $groupField)) {
+                            throw new \InvalidArgumentException("Invalid group field: {$groupField}");
+                        }
+                        $selectFields[] = "data->>'{$groupField}' AS _id";
+                        $groupBy = "GROUP BY data->>'{$groupField}'";
+                    }
+
+                    foreach ($stageValue as $alias => $expr) {
+                        if ($alias === '_id') {
+                            continue;
+                        }
+                        if (!preg_match('/^[a-zA-Z_][a-zA-Z0-9_]*$/', $alias)) {
+                            throw new \InvalidArgumentException("Invalid accumulator alias: {$alias}");
+                        }
+                        if (!is_array($expr) || count($expr) !== 1) {
+                            throw new \InvalidArgumentException("Accumulator for '{$alias}' must be an associative array with one operator");
+                        }
+
+                        $op = array_key_first($expr);
+                        $opValue = $expr[$op];
+                        $accumulators[$alias] = true;
+
+                        switch ($op) {
+                            case '$sum':
+                                if ($opValue === 1) {
+                                    $selectFields[] = "COUNT(*) AS {$alias}";
+                                } else {
+                                    if (!is_string($opValue) || $opValue === '' || $opValue[0] !== '$') {
+                                        throw new \InvalidArgumentException("Invalid field reference in \$sum");
+                                    }
+                                    $field = substr($opValue, 1);
+                                    if (!preg_match('/^[a-zA-Z_][a-zA-Z0-9_.]*$/', $field)) {
+                                        throw new \InvalidArgumentException("Invalid field: {$field}");
+                                    }
+                                    $selectFields[] = "SUM((data->>'{$field}')::numeric) AS {$alias}";
+                                }
+                                break;
+
+                            case '$avg':
+                                if (!is_string($opValue) || $opValue === '' || $opValue[0] !== '$') {
+                                    throw new \InvalidArgumentException("Invalid field reference in \$avg");
+                                }
+                                $field = substr($opValue, 1);
+                                if (!preg_match('/^[a-zA-Z_][a-zA-Z0-9_.]*$/', $field)) {
+                                    throw new \InvalidArgumentException("Invalid field: {$field}");
+                                }
+                                $selectFields[] = "AVG((data->>'{$field}')::numeric) AS {$alias}";
+                                break;
+
+                            case '$min':
+                                if (!is_string($opValue) || $opValue === '' || $opValue[0] !== '$') {
+                                    throw new \InvalidArgumentException("Invalid field reference in \$min");
+                                }
+                                $field = substr($opValue, 1);
+                                if (!preg_match('/^[a-zA-Z_][a-zA-Z0-9_.]*$/', $field)) {
+                                    throw new \InvalidArgumentException("Invalid field: {$field}");
+                                }
+                                $selectFields[] = "MIN((data->>'{$field}')::numeric) AS {$alias}";
+                                break;
+
+                            case '$max':
+                                if (!is_string($opValue) || $opValue === '' || $opValue[0] !== '$') {
+                                    throw new \InvalidArgumentException("Invalid field reference in \$max");
+                                }
+                                $field = substr($opValue, 1);
+                                if (!preg_match('/^[a-zA-Z_][a-zA-Z0-9_.]*$/', $field)) {
+                                    throw new \InvalidArgumentException("Invalid field: {$field}");
+                                }
+                                $selectFields[] = "MAX((data->>'{$field}')::numeric) AS {$alias}";
+                                break;
+
+                            case '$count':
+                                $selectFields[] = "COUNT(*) AS {$alias}";
+                                break;
+
+                            default:
+                                throw new \InvalidArgumentException("Unsupported accumulator: {$op}");
+                        }
+                    }
+                    break;
+
+                case '$sort':
+                    if (!is_array($stageValue)) {
+                        throw new \InvalidArgumentException('$sort stage value must be an array');
+                    }
+                    $sortClauses = [];
+                    foreach ($stageValue as $key => $dir) {
+                        if (!preg_match('/^[a-zA-Z_][a-zA-Z0-9_.]*$/', $key)) {
+                            throw new \InvalidArgumentException("Invalid sort key: {$key}");
+                        }
+                        $direction = $dir === -1 ? 'DESC' : 'ASC';
+                        if ($hasGroup && isset($accumulators[$key])) {
+                            $sortClauses[] = "{$key} {$direction}";
+                        } else {
+                            $sortClauses[] = "data->>'{$key}' {$direction}";
+                        }
+                    }
+                    $orderBy = "ORDER BY " . implode(', ', $sortClauses);
+                    break;
+
+                case '$limit':
+                    if (!is_int($stageValue) || $stageValue < 0) {
+                        throw new \InvalidArgumentException('$limit must be a non-negative integer');
+                    }
+                    $limitValue = $stageValue;
+                    $limit = "LIMIT ?";
+                    break;
+
+                case '$skip':
+                    if (!is_int($stageValue) || $stageValue < 0) {
+                        throw new \InvalidArgumentException('$skip must be a non-negative integer');
+                    }
+                    $offsetValue = $stageValue;
+                    $offset = "OFFSET ?";
+                    break;
+
+                default:
+                    throw new \InvalidArgumentException("Unsupported pipeline stage: {$stageKey}");
+            }
+        }
+
+        if (empty($selectFields)) {
+            $selectFields[] = '_id';
+            $selectFields[] = 'data';
+            $selectFields[] = 'created_at';
+        }
+
+        $params = $whereParams;
+        if ($limitValue !== null) {
+            $params[] = $limitValue;
+        }
+        if ($offsetValue !== null) {
+            $params[] = $offsetValue;
+        }
+
+        $select = implode(', ', $selectFields);
+        $sql = trim(implode(' ', array_filter([
+            "SELECT {$select} FROM {$collection}",
+            $where,
+            $groupBy,
+            $orderBy,
+            $limit,
+            $offset,
+        ])));
+
+        $stmt = $pdo->prepare($sql);
+        $stmt->execute($params);
+        return $stmt->fetchAll(\PDO::FETCH_ASSOC);
+    }
+
     public static function docCreateIndex(\PDO $pdo, string $collection, ?array $keys = null): void
     {
         self::validateIdentifier($collection);

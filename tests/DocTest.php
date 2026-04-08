@@ -602,4 +602,235 @@ class DocTest extends TestCase
         $result = Utils::docCreateIndex($pdo, 'users');
         $this->assertNull($result);
     }
+
+    // ========================================================================
+    // docAggregate
+    // ========================================================================
+
+    public function testDocAggregateFullPipeline(): void
+    {
+        $rows = [
+            ['_id' => 'electronics', 'total' => '250'],
+            ['_id' => 'books', 'total' => '100'],
+        ];
+
+        $pdo = $this->makeMockPDO();
+        $stmt = $this->makeMockStmt($rows);
+        $pdo->expects($this->once())->method('prepare')
+            ->with($this->callback(function (string $sql) {
+                $this->assertStringContainsString("data->>'category' AS _id", $sql);
+                $this->assertStringContainsString("SUM((data->>'price')::numeric) AS total", $sql);
+                $this->assertStringContainsString("WHERE data @> ?::jsonb", $sql);
+                $this->assertStringContainsString("GROUP BY data->>'category'", $sql);
+                $this->assertStringContainsString("ORDER BY total DESC", $sql);
+                $this->assertStringContainsString("LIMIT ?", $sql);
+                $this->assertStringContainsString("OFFSET ?", $sql);
+                return true;
+            }))
+            ->willReturn($stmt);
+
+        $stmt->expects($this->once())->method('execute')
+            ->with([json_encode(['active' => true]), 10, 5]);
+
+        $result = Utils::docAggregate($pdo, 'orders', [
+            ['$match' => ['active' => true]],
+            ['$group' => [
+                '_id' => '$category',
+                'total' => ['$sum' => '$price'],
+            ]],
+            ['$sort' => ['total' => -1]],
+            ['$limit' => 10],
+            ['$skip' => 5],
+        ]);
+        $this->assertCount(2, $result);
+        $this->assertSame('electronics', $result[0]['_id']);
+    }
+
+    public function testDocAggregateAvgAccumulator(): void
+    {
+        $rows = [['_id' => 'A', 'avg_score' => '85.5']];
+
+        $pdo = $this->makeMockPDO();
+        $stmt = $this->makeMockStmt($rows);
+        $pdo->expects($this->once())->method('prepare')
+            ->with($this->callback(function (string $sql) {
+                $this->assertStringContainsString("AVG((data->>'score')::numeric) AS avg_score", $sql);
+                $this->assertStringContainsString("GROUP BY data->>'department'", $sql);
+                return true;
+            }))
+            ->willReturn($stmt);
+
+        $result = Utils::docAggregate($pdo, 'employees', [
+            ['$group' => [
+                '_id' => '$department',
+                'avg_score' => ['$avg' => '$score'],
+            ]],
+        ]);
+        $this->assertCount(1, $result);
+        $this->assertSame('85.5', $result[0]['avg_score']);
+    }
+
+    public function testDocAggregateNullGroupId(): void
+    {
+        $rows = [['total' => '500']];
+
+        $pdo = $this->makeMockPDO();
+        $stmt = $this->makeMockStmt($rows);
+        $pdo->expects($this->once())->method('prepare')
+            ->with($this->callback(function (string $sql) {
+                $this->assertStringContainsString("SUM((data->>'amount')::numeric) AS total", $sql);
+                $this->assertStringNotContainsString('GROUP BY', $sql);
+                $this->assertStringNotContainsString('_id', $sql);
+                return true;
+            }))
+            ->willReturn($stmt);
+
+        $result = Utils::docAggregate($pdo, 'orders', [
+            ['$group' => [
+                '_id' => null,
+                'total' => ['$sum' => '$amount'],
+            ]],
+        ]);
+        $this->assertCount(1, $result);
+    }
+
+    public function testDocAggregateMatchOnly(): void
+    {
+        $rows = [['_id' => 'a', 'data' => '{"status":"active"}', 'created_at' => 'now']];
+
+        $pdo = $this->makeMockPDO();
+        $stmt = $this->makeMockStmt($rows);
+        $pdo->expects($this->once())->method('prepare')
+            ->with($this->callback(function (string $sql) {
+                $this->assertStringContainsString('SELECT _id, data, created_at FROM orders', $sql);
+                $this->assertStringContainsString('WHERE data @> ?::jsonb', $sql);
+                $this->assertStringNotContainsString('GROUP BY', $sql);
+                return true;
+            }))
+            ->willReturn($stmt);
+
+        $stmt->expects($this->once())->method('execute')
+            ->with([json_encode(['status' => 'active'])]);
+
+        $result = Utils::docAggregate($pdo, 'orders', [
+            ['$match' => ['status' => 'active']],
+        ]);
+        $this->assertCount(1, $result);
+    }
+
+    public function testDocAggregateSortContextAfterGroup(): void
+    {
+        $pdo = $this->makeMockPDO();
+        $stmt = $this->makeMockStmt([]);
+        $pdo->expects($this->once())->method('prepare')
+            ->with($this->callback(function (string $sql) {
+                $this->assertStringContainsString('ORDER BY cnt DESC', $sql);
+                return true;
+            }))
+            ->willReturn($stmt);
+
+        Utils::docAggregate($pdo, 'events', [
+            ['$group' => [
+                '_id' => '$type',
+                'cnt' => ['$count' => true],
+            ]],
+            ['$sort' => ['cnt' => -1]],
+        ]);
+    }
+
+    public function testDocAggregateSortContextWithoutGroup(): void
+    {
+        $pdo = $this->makeMockPDO();
+        $stmt = $this->makeMockStmt([]);
+        $pdo->expects($this->once())->method('prepare')
+            ->with($this->callback(function (string $sql) {
+                $this->assertStringContainsString("ORDER BY data->>'name' ASC", $sql);
+                return true;
+            }))
+            ->willReturn($stmt);
+
+        Utils::docAggregate($pdo, 'users', [
+            ['$sort' => ['name' => 1]],
+        ]);
+    }
+
+    public function testDocAggregateUnsupportedStage(): void
+    {
+        $pdo = $this->makeMockPDO();
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('Unsupported pipeline stage: $unwind');
+        Utils::docAggregate($pdo, 'users', [
+            ['$unwind' => '$tags'],
+        ]);
+    }
+
+    public function testDocAggregateUnsupportedAccumulator(): void
+    {
+        $pdo = $this->makeMockPDO();
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('Unsupported accumulator: $push');
+        Utils::docAggregate($pdo, 'users', [
+            ['$group' => [
+                '_id' => '$status',
+                'names' => ['$push' => '$name'],
+            ]],
+        ]);
+    }
+
+    public function testDocAggregateEmptyPipeline(): void
+    {
+        $pdo = $this->makeMockPDO();
+        $result = Utils::docAggregate($pdo, 'users', []);
+        $this->assertSame([], $result);
+    }
+
+    public function testDocAggregateInvalidCollection(): void
+    {
+        $pdo = $this->makeMockPDO();
+        $this->expectException(\InvalidArgumentException::class);
+        Utils::docAggregate($pdo, 'bad table', []);
+    }
+
+    public function testDocAggregateCountAccumulator(): void
+    {
+        $rows = [['_id' => 'active', 'cnt' => '42']];
+
+        $pdo = $this->makeMockPDO();
+        $stmt = $this->makeMockStmt($rows);
+        $pdo->expects($this->once())->method('prepare')
+            ->with($this->callback(function (string $sql) {
+                $this->assertStringContainsString("COUNT(*) AS cnt", $sql);
+                return true;
+            }))
+            ->willReturn($stmt);
+
+        $result = Utils::docAggregate($pdo, 'users', [
+            ['$group' => [
+                '_id' => '$status',
+                'cnt' => ['$count' => true],
+            ]],
+        ]);
+        $this->assertCount(1, $result);
+    }
+
+    public function testDocAggregateMinMaxAccumulators(): void
+    {
+        $pdo = $this->makeMockPDO();
+        $stmt = $this->makeMockStmt([['_id' => 'A', 'lo' => '10', 'hi' => '99']]);
+        $pdo->expects($this->once())->method('prepare')
+            ->with($this->callback(function (string $sql) {
+                $this->assertStringContainsString("MIN((data->>'price')::numeric) AS lo", $sql);
+                $this->assertStringContainsString("MAX((data->>'price')::numeric) AS hi", $sql);
+                return true;
+            }))
+            ->willReturn($stmt);
+
+        Utils::docAggregate($pdo, 'products', [
+            ['$group' => [
+                '_id' => '$category',
+                'lo' => ['$min' => '$price'],
+                'hi' => ['$max' => '$price'],
+            ]],
+        ]);
+    }
 }
