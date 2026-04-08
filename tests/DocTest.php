@@ -768,11 +768,11 @@ class DocTest extends TestCase
     {
         $pdo = $this->makeMockPDO();
         $this->expectException(\InvalidArgumentException::class);
-        $this->expectExceptionMessage('Unsupported accumulator: $push');
+        $this->expectExceptionMessage('Unsupported accumulator: $first');
         Utils::docAggregate($pdo, 'users', [
             ['$group' => [
                 '_id' => '$status',
-                'names' => ['$push' => '$name'],
+                'top' => ['$first' => '$name'],
             ]],
         ]);
     }
@@ -832,6 +832,158 @@ class DocTest extends TestCase
                 'hi' => ['$max' => '$price'],
             ]],
         ]);
+    }
+
+    // ========================================================================
+    // Composite $group._id + $push/$addToSet
+    // ========================================================================
+
+    public function testDocAggregateCompositeIdBasic(): void
+    {
+        $rows = [['_id' => '{"region":"US","type":"premium"}', 'total' => '500']];
+
+        $pdo = $this->makeMockPDO();
+        $stmt = $this->makeMockStmt($rows);
+        $pdo->expects($this->once())->method('prepare')
+            ->with($this->callback(function (string $sql) {
+                $this->assertStringContainsString("json_build_object('region', data->>'region', 'type', data->>'type') AS _id", $sql);
+                $this->assertStringContainsString("SUM((data->>'amount')::numeric) AS total", $sql);
+                $this->assertStringContainsString("GROUP BY data->>'region', data->>'type'", $sql);
+                return true;
+            }))
+            ->willReturn($stmt);
+
+        $result = Utils::docAggregate($pdo, 'sales', [
+            ['$group' => [
+                '_id' => ['region' => '$region', 'type' => '$type'],
+                'total' => ['$sum' => '$amount'],
+            ]],
+        ]);
+        $this->assertCount(1, $result);
+    }
+
+    public function testDocAggregateCompositeIdDotNotation(): void
+    {
+        $pdo = $this->makeMockPDO();
+        $stmt = $this->makeMockStmt([]);
+        $pdo->expects($this->once())->method('prepare')
+            ->with($this->callback(function (string $sql) {
+                $this->assertStringContainsString("json_build_object('city', data->'address'->>'city', 'zip', data->'address'->>'zip') AS _id", $sql);
+                $this->assertStringContainsString("GROUP BY data->'address'->>'city', data->'address'->>'zip'", $sql);
+                return true;
+            }))
+            ->willReturn($stmt);
+
+        Utils::docAggregate($pdo, 'users', [
+            ['$group' => [
+                '_id' => ['city' => '$address.city', 'zip' => '$address.zip'],
+                'cnt' => ['$count' => true],
+            ]],
+        ]);
+    }
+
+    public function testDocAggregateCompositeIdInvalidAlias(): void
+    {
+        $pdo = $this->makeMockPDO();
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('Invalid _id alias');
+        Utils::docAggregate($pdo, 'users', [
+            ['$group' => [
+                '_id' => ['bad alias!' => '$field'],
+                'cnt' => ['$count' => true],
+            ]],
+        ]);
+    }
+
+    public function testDocAggregateCompositeIdInvalidRef(): void
+    {
+        $pdo = $this->makeMockPDO();
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('Invalid field reference in _id');
+        Utils::docAggregate($pdo, 'users', [
+            ['$group' => [
+                '_id' => ['region' => 'not_a_ref'],
+                'cnt' => ['$count' => true],
+            ]],
+        ]);
+    }
+
+    public function testDocAggregateCompositeIdEmptyArray(): void
+    {
+        $pdo = $this->makeMockPDO();
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('non-empty associative array');
+        Utils::docAggregate($pdo, 'users', [
+            ['$group' => [
+                '_id' => [],
+                'cnt' => ['$count' => true],
+            ]],
+        ]);
+    }
+
+    public function testDocAggregatePushAccumulator(): void
+    {
+        $pdo = $this->makeMockPDO();
+        $stmt = $this->makeMockStmt([['_id' => 'engineering', 'names' => '{Alice,Bob}']]);
+        $pdo->expects($this->once())->method('prepare')
+            ->with($this->callback(function (string $sql) {
+                $this->assertStringContainsString("array_agg(data->>'name') AS names", $sql);
+                $this->assertStringContainsString("GROUP BY data->>'department'", $sql);
+                return true;
+            }))
+            ->willReturn($stmt);
+
+        $result = Utils::docAggregate($pdo, 'employees', [
+            ['$group' => [
+                '_id' => '$department',
+                'names' => ['$push' => '$name'],
+            ]],
+        ]);
+        $this->assertCount(1, $result);
+    }
+
+    public function testDocAggregateAddToSetAccumulator(): void
+    {
+        $pdo = $this->makeMockPDO();
+        $stmt = $this->makeMockStmt([['_id' => 'engineering', 'tags' => '{go,rust}']]);
+        $pdo->expects($this->once())->method('prepare')
+            ->with($this->callback(function (string $sql) {
+                $this->assertStringContainsString("array_agg(DISTINCT data->>'tag') AS tags", $sql);
+                $this->assertStringContainsString("GROUP BY data->>'department'", $sql);
+                return true;
+            }))
+            ->willReturn($stmt);
+
+        $result = Utils::docAggregate($pdo, 'employees', [
+            ['$group' => [
+                '_id' => '$department',
+                'tags' => ['$addToSet' => '$tag'],
+            ]],
+        ]);
+        $this->assertCount(1, $result);
+    }
+
+    public function testDocAggregateBackwardCompatSingleId(): void
+    {
+        $pdo = $this->makeMockPDO();
+        $stmt = $this->makeMockStmt([['_id' => 'active', 'cnt' => '5']]);
+        $pdo->expects($this->once())->method('prepare')
+            ->with($this->callback(function (string $sql) {
+                $this->assertStringContainsString("data->>'status' AS _id", $sql);
+                $this->assertStringContainsString("COUNT(*) AS cnt", $sql);
+                $this->assertStringContainsString("GROUP BY data->>'status'", $sql);
+                $this->assertStringNotContainsString('json_build_object', $sql);
+                return true;
+            }))
+            ->willReturn($stmt);
+
+        $result = Utils::docAggregate($pdo, 'users', [
+            ['$group' => [
+                '_id' => '$status',
+                'cnt' => ['$count' => true],
+            ]],
+        ]);
+        $this->assertCount(1, $result);
     }
 
     // ========================================================================

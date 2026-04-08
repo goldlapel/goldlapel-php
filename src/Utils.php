@@ -1048,15 +1048,37 @@ class Utils
                     $groupId = $stageValue['_id'];
 
                     if ($groupId !== null) {
-                        if (!is_string($groupId) || $groupId === '' || $groupId[0] !== '$') {
-                            throw new \InvalidArgumentException('$group _id must be null or a "$field" reference');
+                        if (is_array($groupId)) {
+                            if (array_is_list($groupId) || empty($groupId)) {
+                                throw new \InvalidArgumentException('$group _id object must be a non-empty associative array');
+                            }
+                            $objParts = [];
+                            $groupByCols = [];
+                            foreach ($groupId as $alias => $ref) {
+                                if (!preg_match('/^[a-zA-Z_][a-zA-Z0-9_]*$/', $alias)) {
+                                    throw new \InvalidArgumentException("Invalid _id alias: {$alias}");
+                                }
+                                if (!is_string($ref) || $ref === '' || $ref[0] !== '$') {
+                                    throw new \InvalidArgumentException("Invalid field reference in _id: each value must be a \"\$field\" reference");
+                                }
+                                $field = substr($ref, 1);
+                                $sqlExpr = self::fieldPath($field);
+                                $objParts[] = "'{$alias}', {$sqlExpr}";
+                                $groupByCols[] = $sqlExpr;
+                            }
+                            $selectFields[] = "json_build_object(" . implode(', ', $objParts) . ") AS _id";
+                            $groupBy = "GROUP BY " . implode(', ', $groupByCols);
+                        } else {
+                            if (!is_string($groupId) || $groupId === '' || $groupId[0] !== '$') {
+                                throw new \InvalidArgumentException('$group _id must be null, a "$field" reference, or an associative array');
+                            }
+                            $groupField = substr($groupId, 1);
+                            if (!preg_match('/^[a-zA-Z_][a-zA-Z0-9_.]*$/', $groupField)) {
+                                throw new \InvalidArgumentException("Invalid group field: {$groupField}");
+                            }
+                            $selectFields[] = "data->>'{$groupField}' AS _id";
+                            $groupBy = "GROUP BY data->>'{$groupField}'";
                         }
-                        $groupField = substr($groupId, 1);
-                        if (!preg_match('/^[a-zA-Z_][a-zA-Z0-9_.]*$/', $groupField)) {
-                            throw new \InvalidArgumentException("Invalid group field: {$groupField}");
-                        }
-                        $selectFields[] = "data->>'{$groupField}' AS _id";
-                        $groupBy = "GROUP BY data->>'{$groupField}'";
                     }
 
                     foreach ($stageValue as $alias => $expr) {
@@ -1125,6 +1147,24 @@ class Utils
 
                             case '$count':
                                 $selectFields[] = "COUNT(*) AS {$alias}";
+                                break;
+
+                            case '$push':
+                                if (!is_string($opValue) || $opValue === '' || $opValue[0] !== '$') {
+                                    throw new \InvalidArgumentException("Invalid field reference in \$push");
+                                }
+                                $field = substr($opValue, 1);
+                                $sqlExpr = self::fieldPath($field);
+                                $selectFields[] = "array_agg({$sqlExpr}) AS {$alias}";
+                                break;
+
+                            case '$addToSet':
+                                if (!is_string($opValue) || $opValue === '' || $opValue[0] !== '$') {
+                                    throw new \InvalidArgumentException("Invalid field reference in \$addToSet");
+                                }
+                                $field = substr($opValue, 1);
+                                $sqlExpr = self::fieldPath($field);
+                                $selectFields[] = "array_agg(DISTINCT {$sqlExpr}) AS {$alias}";
                                 break;
 
                             default:
