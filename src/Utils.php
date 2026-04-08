@@ -1453,4 +1453,153 @@ class Utils
             );
         }
     }
+
+    // ========================================================================
+    // Change Streams (Watch)
+    // ========================================================================
+
+    public static function docWatch(\PDO $pdo, string $collection, ?callable $callback = null): void
+    {
+        self::validateIdentifier($collection);
+        $channel = "{$collection}_changes";
+        $funcName = "{$collection}_notify_fn";
+        $triggerName = "{$collection}_notify_trg";
+
+        $pdo->exec("
+            CREATE OR REPLACE FUNCTION {$funcName}()
+            RETURNS TRIGGER LANGUAGE plpgsql AS \$\$
+            BEGIN
+                IF TG_OP = 'DELETE' THEN
+                    PERFORM pg_notify('{$channel}', json_build_object('op', TG_OP, '_id', OLD._id::text)::text);
+                    RETURN OLD;
+                ELSE
+                    PERFORM pg_notify('{$channel}', json_build_object('op', TG_OP, '_id', NEW._id::text, 'data', NEW.data)::text);
+                    RETURN NEW;
+                END IF;
+            END;
+            \$\$
+        ");
+
+        $pdo->exec("DROP TRIGGER IF EXISTS {$triggerName} ON {$collection}");
+
+        $pdo->exec(
+            "CREATE TRIGGER {$triggerName} "
+            . "AFTER INSERT OR UPDATE OR DELETE ON {$collection} "
+            . "FOR EACH ROW EXECUTE FUNCTION {$funcName}()"
+        );
+
+        $pdo->exec("LISTEN {$channel}");
+    }
+
+    public static function docUnwatch(\PDO $pdo, string $collection): void
+    {
+        self::validateIdentifier($collection);
+        $channel = "{$collection}_changes";
+        $funcName = "{$collection}_notify_fn";
+        $triggerName = "{$collection}_notify_trg";
+
+        $pdo->exec("DROP TRIGGER IF EXISTS {$triggerName} ON {$collection}");
+        $pdo->exec("DROP FUNCTION IF EXISTS {$funcName}()");
+        $pdo->exec("UNLISTEN {$channel}");
+    }
+
+    // ========================================================================
+    // TTL Indexes
+    // ========================================================================
+
+    public static function docCreateTtlIndex(\PDO $pdo, string $collection, int $expireAfterSeconds, string $field = 'created_at'): void
+    {
+        self::validateIdentifier($collection);
+        self::validateIdentifier($field);
+        if ($expireAfterSeconds <= 0) {
+            throw new \InvalidArgumentException('expireAfterSeconds must be a positive integer');
+        }
+
+        $idxName = "{$collection}_ttl_idx";
+        $funcName = "{$collection}_ttl_fn";
+        $triggerName = "{$collection}_ttl_trg";
+
+        $pdo->exec("CREATE INDEX IF NOT EXISTS {$idxName} ON {$collection} ({$field})");
+
+        $pdo->exec("
+            CREATE OR REPLACE FUNCTION {$funcName}()
+            RETURNS TRIGGER LANGUAGE plpgsql AS \$\$
+            BEGIN
+                DELETE FROM {$collection} WHERE {$field} < NOW() - INTERVAL '{$expireAfterSeconds} seconds';
+                RETURN NEW;
+            END;
+            \$\$
+        ");
+
+        $pdo->exec("DROP TRIGGER IF EXISTS {$triggerName} ON {$collection}");
+
+        $pdo->exec(
+            "CREATE TRIGGER {$triggerName} "
+            . "BEFORE INSERT ON {$collection} "
+            . "FOR EACH ROW EXECUTE FUNCTION {$funcName}()"
+        );
+    }
+
+    public static function docRemoveTtlIndex(\PDO $pdo, string $collection): void
+    {
+        self::validateIdentifier($collection);
+
+        $idxName = "{$collection}_ttl_idx";
+        $funcName = "{$collection}_ttl_fn";
+        $triggerName = "{$collection}_ttl_trg";
+
+        $pdo->exec("DROP TRIGGER IF EXISTS {$triggerName} ON {$collection}");
+        $pdo->exec("DROP FUNCTION IF EXISTS {$funcName}()");
+        $pdo->exec("DROP INDEX IF EXISTS {$idxName}");
+    }
+
+    // ========================================================================
+    // Capped Collections
+    // ========================================================================
+
+    public static function docCreateCapped(\PDO $pdo, string $collection, int $maxDocuments): void
+    {
+        self::validateIdentifier($collection);
+        if ($maxDocuments <= 0) {
+            throw new \InvalidArgumentException('maxDocuments must be a positive integer');
+        }
+
+        self::ensureCollection($pdo, $collection);
+
+        $funcName = "{$collection}_cap_fn";
+        $triggerName = "{$collection}_cap_trg";
+
+        $pdo->exec("
+            CREATE OR REPLACE FUNCTION {$funcName}()
+            RETURNS TRIGGER LANGUAGE plpgsql AS \$\$
+            BEGIN
+                DELETE FROM {$collection} WHERE _id IN (
+                    SELECT _id FROM {$collection}
+                    ORDER BY created_at ASC, _id ASC
+                    LIMIT GREATEST((SELECT COUNT(*) FROM {$collection}) - {$maxDocuments}, 0)
+                );
+                RETURN NEW;
+            END;
+            \$\$
+        ");
+
+        $pdo->exec("DROP TRIGGER IF EXISTS {$triggerName} ON {$collection}");
+
+        $pdo->exec(
+            "CREATE TRIGGER {$triggerName} "
+            . "AFTER INSERT ON {$collection} "
+            . "FOR EACH ROW EXECUTE FUNCTION {$funcName}()"
+        );
+    }
+
+    public static function docRemoveCap(\PDO $pdo, string $collection): void
+    {
+        self::validateIdentifier($collection);
+
+        $funcName = "{$collection}_cap_fn";
+        $triggerName = "{$collection}_cap_trg";
+
+        $pdo->exec("DROP TRIGGER IF EXISTS {$triggerName} ON {$collection}");
+        $pdo->exec("DROP FUNCTION IF EXISTS {$funcName}()");
+    }
 }

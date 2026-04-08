@@ -1462,4 +1462,198 @@ class DocTest extends TestCase
         $result = Utils::docCount($pdo, 'users', ['addr.city' => 'NY']);
         $this->assertSame(3, $result);
     }
+
+    // ========================================================================
+    // docWatch
+    // ========================================================================
+
+    public function testDocWatchCreatesTriggerFunctionAndListen(): void
+    {
+        $execCalls = [];
+        $pdo = $this->makeMockPDO();
+        $pdo->method('exec')->willReturnCallback(function ($sql) use (&$execCalls) {
+            $execCalls[] = $sql;
+            return 0;
+        });
+
+        Utils::docWatch($pdo, 'orders');
+
+        $this->assertCount(4, $execCalls);
+        $this->assertStringContainsString('CREATE OR REPLACE FUNCTION orders_notify_fn', $execCalls[0]);
+        $this->assertStringContainsString('pg_notify', $execCalls[0]);
+        $this->assertStringContainsString('TG_OP', $execCalls[0]);
+        $this->assertStringContainsString('DROP TRIGGER IF EXISTS orders_notify_trg ON orders', $execCalls[1]);
+        $this->assertStringContainsString('CREATE TRIGGER orders_notify_trg', $execCalls[2]);
+        $this->assertStringContainsString('AFTER INSERT OR UPDATE OR DELETE ON orders', $execCalls[2]);
+        $this->assertStringContainsString('EXECUTE FUNCTION orders_notify_fn()', $execCalls[2]);
+        $this->assertStringContainsString('LISTEN orders_changes', $execCalls[3]);
+    }
+
+    public function testDocWatchInvalidCollection(): void
+    {
+        $pdo = $this->makeMockPDO();
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('Invalid identifier');
+        Utils::docWatch($pdo, 'DROP;--');
+    }
+
+    // ========================================================================
+    // docUnwatch
+    // ========================================================================
+
+    public function testDocUnwatchDropsTriggerFunctionAndUnlisten(): void
+    {
+        $execCalls = [];
+        $pdo = $this->makeMockPDO();
+        $pdo->method('exec')->willReturnCallback(function ($sql) use (&$execCalls) {
+            $execCalls[] = $sql;
+            return 0;
+        });
+
+        Utils::docUnwatch($pdo, 'orders');
+
+        $this->assertCount(3, $execCalls);
+        $this->assertStringContainsString('DROP TRIGGER IF EXISTS orders_notify_trg ON orders', $execCalls[0]);
+        $this->assertStringContainsString('DROP FUNCTION IF EXISTS orders_notify_fn()', $execCalls[1]);
+        $this->assertStringContainsString('UNLISTEN orders_changes', $execCalls[2]);
+    }
+
+    public function testDocUnwatchInvalidCollection(): void
+    {
+        $pdo = $this->makeMockPDO();
+        $this->expectException(\InvalidArgumentException::class);
+        Utils::docUnwatch($pdo, '1bad');
+    }
+
+    // ========================================================================
+    // docCreateTtlIndex
+    // ========================================================================
+
+    public function testDocCreateTtlIndexDefaultField(): void
+    {
+        $execCalls = [];
+        $pdo = $this->makeMockPDO();
+        $pdo->method('exec')->willReturnCallback(function ($sql) use (&$execCalls) {
+            $execCalls[] = $sql;
+            return 0;
+        });
+
+        Utils::docCreateTtlIndex($pdo, 'sessions', 3600);
+
+        $this->assertCount(4, $execCalls);
+        $this->assertStringContainsString('CREATE INDEX IF NOT EXISTS sessions_ttl_idx ON sessions (created_at)', $execCalls[0]);
+        $this->assertStringContainsString('CREATE OR REPLACE FUNCTION sessions_ttl_fn', $execCalls[1]);
+        $this->assertStringContainsString("INTERVAL '3600 seconds'", $execCalls[1]);
+        $this->assertStringContainsString('DELETE FROM sessions WHERE created_at', $execCalls[1]);
+        $this->assertStringContainsString('DROP TRIGGER IF EXISTS sessions_ttl_trg ON sessions', $execCalls[2]);
+        $this->assertStringContainsString('CREATE TRIGGER sessions_ttl_trg', $execCalls[3]);
+        $this->assertStringContainsString('BEFORE INSERT ON sessions', $execCalls[3]);
+    }
+
+    public function testDocCreateTtlIndexCustomField(): void
+    {
+        $execCalls = [];
+        $pdo = $this->makeMockPDO();
+        $pdo->method('exec')->willReturnCallback(function ($sql) use (&$execCalls) {
+            $execCalls[] = $sql;
+            return 0;
+        });
+
+        Utils::docCreateTtlIndex($pdo, 'tokens', 86400, 'expires_at');
+
+        $this->assertStringContainsString('ON tokens (expires_at)', $execCalls[0]);
+        $this->assertStringContainsString('WHERE expires_at', $execCalls[1]);
+    }
+
+    public function testDocCreateTtlIndexRejectsNonPositive(): void
+    {
+        $pdo = $this->makeMockPDO();
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('expireAfterSeconds must be a positive integer');
+        Utils::docCreateTtlIndex($pdo, 'items', 0);
+    }
+
+    // ========================================================================
+    // docRemoveTtlIndex
+    // ========================================================================
+
+    public function testDocRemoveTtlIndexDropsAll(): void
+    {
+        $execCalls = [];
+        $pdo = $this->makeMockPDO();
+        $pdo->method('exec')->willReturnCallback(function ($sql) use (&$execCalls) {
+            $execCalls[] = $sql;
+            return 0;
+        });
+
+        Utils::docRemoveTtlIndex($pdo, 'sessions');
+
+        $this->assertCount(3, $execCalls);
+        $this->assertStringContainsString('DROP TRIGGER IF EXISTS sessions_ttl_trg ON sessions', $execCalls[0]);
+        $this->assertStringContainsString('DROP FUNCTION IF EXISTS sessions_ttl_fn()', $execCalls[1]);
+        $this->assertStringContainsString('DROP INDEX IF EXISTS sessions_ttl_idx', $execCalls[2]);
+    }
+
+    // ========================================================================
+    // docCreateCapped
+    // ========================================================================
+
+    public function testDocCreateCappedEnsuresCollectionAndCreatesTrigger(): void
+    {
+        $execCalls = [];
+        $pdo = $this->makeMockPDO();
+        $pdo->method('exec')->willReturnCallback(function ($sql) use (&$execCalls) {
+            $execCalls[] = $sql;
+            return 0;
+        });
+
+        Utils::docCreateCapped($pdo, 'logs', 1000);
+
+        // ensureCollection (1) + CREATE FUNCTION (2) + DROP TRIGGER (3) + CREATE TRIGGER (4)
+        $this->assertCount(4, $execCalls);
+        $this->assertStringContainsString('CREATE TABLE IF NOT EXISTS logs', $execCalls[0]);
+        $this->assertStringContainsString('CREATE OR REPLACE FUNCTION logs_cap_fn', $execCalls[1]);
+        $this->assertStringContainsString('DELETE FROM logs', $execCalls[1]);
+        $this->assertStringContainsString('ORDER BY created_at ASC', $execCalls[1]);
+        $this->assertStringContainsString('LIMIT GREATEST', $execCalls[1]);
+        $this->assertStringContainsString('1000', $execCalls[1]);
+        $this->assertStringContainsString('DROP TRIGGER IF EXISTS logs_cap_trg ON logs', $execCalls[2]);
+        $this->assertStringContainsString('CREATE TRIGGER logs_cap_trg', $execCalls[3]);
+        $this->assertStringContainsString('AFTER INSERT ON logs', $execCalls[3]);
+    }
+
+    public function testDocCreateCappedRejectsNonPositive(): void
+    {
+        $pdo = $this->makeMockPDO();
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('maxDocuments must be a positive integer');
+        Utils::docCreateCapped($pdo, 'logs', 0);
+    }
+
+    // ========================================================================
+    // docRemoveCap
+    // ========================================================================
+
+    public function testDocRemoveCapDropsTriggerAndFunction(): void
+    {
+        $execCalls = [];
+        $pdo = $this->makeMockPDO();
+        $pdo->method('exec')->willReturnCallback(function ($sql) use (&$execCalls) {
+            $execCalls[] = $sql;
+            return 0;
+        });
+
+        Utils::docRemoveCap($pdo, 'logs');
+
+        $this->assertCount(2, $execCalls);
+        $this->assertStringContainsString('DROP TRIGGER IF EXISTS logs_cap_trg ON logs', $execCalls[0]);
+        $this->assertStringContainsString('DROP FUNCTION IF EXISTS logs_cap_fn()', $execCalls[1]);
+    }
+
+    public function testDocRemoveCapInvalidCollection(): void
+    {
+        $pdo = $this->makeMockPDO();
+        $this->expectException(\InvalidArgumentException::class);
+        Utils::docRemoveCap($pdo, 'bad table');
+    }
 }

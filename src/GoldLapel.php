@@ -314,6 +314,36 @@ class GoldLapel
         return Utils::docAggregate($this->pdo(), $collection, $pipeline);
     }
 
+    public function docWatch(string $collection, ?callable $callback = null): void
+    {
+        Utils::docWatch($this->pdo(), $collection, $callback);
+    }
+
+    public function docUnwatch(string $collection): void
+    {
+        Utils::docUnwatch($this->pdo(), $collection);
+    }
+
+    public function docCreateTtlIndex(string $collection, int $expireAfterSeconds, string $field = 'created_at'): void
+    {
+        Utils::docCreateTtlIndex($this->pdo(), $collection, $expireAfterSeconds, $field);
+    }
+
+    public function docRemoveTtlIndex(string $collection): void
+    {
+        Utils::docRemoveTtlIndex($this->pdo(), $collection);
+    }
+
+    public function docCreateCapped(string $collection, int $maxDocuments): void
+    {
+        Utils::docCreateCapped($this->pdo(), $collection, $maxDocuments);
+    }
+
+    public function docRemoveCap(string $collection): void
+    {
+        Utils::docRemoveCap($this->pdo(), $collection);
+    }
+
     // Search
 
     public function search(string $table, string|array $column, string $query, int $limit = 50, string $lang = 'english', bool $highlight = false): array
