@@ -1363,4 +1363,103 @@ class DocTest extends TestCase
             ['$limit' => 5],
         ]);
     }
+
+    // ========================================================================
+    // Dot notation expansion in plain containment filters
+    // ========================================================================
+
+    public function testExpandDotKeysSingleLevel(): void
+    {
+        $result = Utils::expandDotKeys(['addr.city' => 'NY']);
+        $this->assertSame(['addr' => ['city' => 'NY']], $result);
+    }
+
+    public function testExpandDotKeysDeepNesting(): void
+    {
+        $result = Utils::expandDotKeys(['a.b.c' => 1]);
+        $this->assertSame(['a' => ['b' => ['c' => 1]]], $result);
+    }
+
+    public function testExpandDotKeysMixedWithPlain(): void
+    {
+        $result = Utils::expandDotKeys(['status' => 'active', 'addr.city' => 'NY']);
+        $this->assertSame(['status' => 'active', 'addr' => ['city' => 'NY']], $result);
+    }
+
+    public function testExpandDotKeysMergeSiblings(): void
+    {
+        $result = Utils::expandDotKeys(['a.b' => 1, 'a.c' => 2]);
+        $this->assertSame(['a' => ['b' => 1, 'c' => 2]], $result);
+    }
+
+    public function testExpandDotKeysNoDotsUnchanged(): void
+    {
+        $result = Utils::expandDotKeys(['status' => 'active']);
+        $this->assertSame(['status' => 'active'], $result);
+    }
+
+    public function testDotNotationWithOperators(): void
+    {
+        $pdo = $this->makeMockPDO();
+        $stmt = $this->makeMockStmt([]);
+        $pdo->expects($this->once())->method('prepare')
+            ->with($this->callback(function (string $sql) {
+                $this->assertStringContainsString('WHERE data @> ?::jsonb', $sql);
+                $this->assertStringContainsString('::numeric >', $sql);
+                return true;
+            }))
+            ->willReturn($stmt);
+
+        $stmt->expects($this->once())->method('execute')
+            ->with($this->callback(function (array $params) {
+                $this->assertSame(['addr' => ['city' => 'NY']], json_decode($params[0], true));
+                $this->assertSame(25, $params[1]);
+                return true;
+            }));
+
+        Utils::docFind($pdo, 'users', ['addr.city' => 'NY', 'age' => ['$gt' => 25]]);
+    }
+
+    public function testDotNotationInDocFind(): void
+    {
+        $pdo = $this->makeMockPDO();
+        $stmt = $this->makeMockStmt([]);
+        $pdo->expects($this->once())->method('prepare')
+            ->with($this->callback(function (string $sql) {
+                $this->assertStringContainsString('WHERE data @> ?::jsonb', $sql);
+                return true;
+            }))
+            ->willReturn($stmt);
+
+        $stmt->expects($this->once())->method('execute')
+            ->with($this->callback(function (array $params) {
+                $this->assertSame(['addr' => ['city' => 'NY']], json_decode($params[0], true));
+                return true;
+            }));
+
+        Utils::docFind($pdo, 'users', ['addr.city' => 'NY']);
+    }
+
+    public function testDotNotationInDocCount(): void
+    {
+        $pdo = $this->makeMockPDO();
+        $stmt = $this->createMock(\PDOStatement::class);
+        $stmt->method('execute')->willReturn(true);
+        $stmt->method('fetchColumn')->willReturn(3);
+        $pdo->expects($this->once())->method('prepare')
+            ->with($this->callback(function (string $sql) {
+                $this->assertStringContainsString('WHERE data @> ?::jsonb', $sql);
+                return true;
+            }))
+            ->willReturn($stmt);
+
+        $stmt->expects($this->once())->method('execute')
+            ->with($this->callback(function (array $params) {
+                $this->assertSame(['addr' => ['city' => 'NY']], json_decode($params[0], true));
+                return true;
+            }));
+
+        $result = Utils::docCount($pdo, 'users', ['addr.city' => 'NY']);
+        $this->assertSame(3, $result);
+    }
 }

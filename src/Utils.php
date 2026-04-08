@@ -770,6 +770,24 @@ class Utils
         return self::fieldPath($field);
     }
 
+    public static function expandDotKeys(array $d): array
+    {
+        $result = [];
+        foreach ($d as $key => $value) {
+            $parts = explode('.', $key);
+            $current = &$result;
+            foreach (array_slice($parts, 0, -1) as $part) {
+                if (!isset($current[$part])) {
+                    $current[$part] = [];
+                }
+                $current = &$current[$part];
+            }
+            $current[$parts[count($parts) - 1]] = $value;
+            unset($current);
+        }
+        return $result;
+    }
+
     private static function buildFilter(?array $filter): array
     {
         if ($filter === null || count($filter) === 0) {
@@ -838,7 +856,7 @@ class Utils
 
         if (count($containment) > 0) {
             $allClauses[] = 'data @> ?::jsonb';
-            $allParams[] = json_encode($containment);
+            $allParams[] = json_encode(self::expandDotKeys($containment));
         }
 
         array_push($allClauses, ...$opClauses);
