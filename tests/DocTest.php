@@ -758,9 +758,9 @@ class DocTest extends TestCase
     {
         $pdo = $this->makeMockPDO();
         $this->expectException(\InvalidArgumentException::class);
-        $this->expectExceptionMessage('Unsupported pipeline stage: $unwind');
+        $this->expectExceptionMessage('Unsupported pipeline stage: $bucket');
         Utils::docAggregate($pdo, 'users', [
-            ['$unwind' => '$tags'],
+            ['$bucket' => ['groupBy' => '$price']],
         ]);
     }
 
@@ -1108,5 +1108,259 @@ class DocTest extends TestCase
         $this->expectException(\InvalidArgumentException::class);
         $this->expectExceptionMessage('Unknown filter operator');
         $this->callBuildFilter(['x' => ['$unknown' => 1]]);
+    }
+
+    // ========================================================================
+    // $project
+    // ========================================================================
+
+    public function testProjectIncludeFields(): void
+    {
+        $pdo = $this->makeMockPDO();
+        $stmt = $this->makeMockStmt([]);
+        $pdo->expects($this->once())->method('prepare')
+            ->with($this->callback(function (string $sql) {
+                $this->assertStringContainsString("_id", $sql);
+                $this->assertStringContainsString("data->>'name' AS name", $sql);
+                $this->assertStringContainsString("data->>'status' AS status", $sql);
+                return true;
+            }))
+            ->willReturn($stmt);
+
+        Utils::docAggregate($pdo, 'orders', [
+            ['$project' => ['name' => 1, 'status' => 1]],
+        ]);
+    }
+
+    public function testProjectExcludeId(): void
+    {
+        $pdo = $this->makeMockPDO();
+        $stmt = $this->makeMockStmt([]);
+        $pdo->expects($this->once())->method('prepare')
+            ->with($this->callback(function (string $sql) {
+                $this->assertStringContainsString("data->>'name' AS name", $sql);
+                $this->assertStringContainsString("data->>'price' AS price", $sql);
+                // _id should not appear
+                $this->assertStringNotContainsString('_id', $sql);
+                return true;
+            }))
+            ->willReturn($stmt);
+
+        Utils::docAggregate($pdo, 'orders', [
+            ['$project' => ['_id' => 0, 'name' => 1, 'price' => 1]],
+        ]);
+    }
+
+    public function testProjectRenameViaFieldRef(): void
+    {
+        $pdo = $this->makeMockPDO();
+        $stmt = $this->makeMockStmt([]);
+        $pdo->expects($this->once())->method('prepare')
+            ->with($this->callback(function (string $sql) {
+                $this->assertStringContainsString("data->>'name' AS customer_name", $sql);
+                $this->assertStringContainsString("data->>'amount' AS total", $sql);
+                $this->assertStringNotContainsString('_id', $sql);
+                return true;
+            }))
+            ->willReturn($stmt);
+
+        Utils::docAggregate($pdo, 'orders', [
+            ['$project' => ['_id' => 0, 'customer_name' => '$name', 'total' => '$amount']],
+        ]);
+    }
+
+    public function testProjectDotNotation(): void
+    {
+        $pdo = $this->makeMockPDO();
+        $stmt = $this->makeMockStmt([]);
+        $pdo->expects($this->once())->method('prepare')
+            ->with($this->callback(function (string $sql) {
+                $this->assertStringContainsString("data->'address'->>'city' AS city", $sql);
+                return true;
+            }))
+            ->willReturn($stmt);
+
+        Utils::docAggregate($pdo, 'orders', [
+            ['$project' => ['_id' => 0, 'city' => '$address.city']],
+        ]);
+    }
+
+    public function testProjectRejectsInvalidField(): void
+    {
+        $pdo = $this->makeMockPDO();
+        $this->expectException(\InvalidArgumentException::class);
+        Utils::docAggregate($pdo, 'orders', [
+            ['$project' => ['bad field!' => 1]],
+        ]);
+    }
+
+    // ========================================================================
+    // $unwind
+    // ========================================================================
+
+    public function testUnwindStringSyntax(): void
+    {
+        $pdo = $this->makeMockPDO();
+        $stmt = $this->makeMockStmt([]);
+        $pdo->expects($this->once())->method('prepare')
+            ->with($this->callback(function (string $sql) {
+                $this->assertStringContainsString("CROSS JOIN jsonb_array_elements_text(data->'tags') AS _uw_tags", $sql);
+                return true;
+            }))
+            ->willReturn($stmt);
+
+        Utils::docAggregate($pdo, 'orders', [
+            ['$unwind' => '$tags'],
+        ]);
+    }
+
+    public function testUnwindArraySyntax(): void
+    {
+        $pdo = $this->makeMockPDO();
+        $stmt = $this->makeMockStmt([]);
+        $pdo->expects($this->once())->method('prepare')
+            ->with($this->callback(function (string $sql) {
+                $this->assertStringContainsString("CROSS JOIN jsonb_array_elements_text(data->'items') AS _uw_items", $sql);
+                return true;
+            }))
+            ->willReturn($stmt);
+
+        Utils::docAggregate($pdo, 'orders', [
+            ['$unwind' => ['path' => '$items']],
+        ]);
+    }
+
+    public function testUnwindWithGroup(): void
+    {
+        $pdo = $this->makeMockPDO();
+        $stmt = $this->makeMockStmt([]);
+        $pdo->expects($this->once())->method('prepare')
+            ->with($this->callback(function (string $sql) {
+                $this->assertStringContainsString("_uw_tags AS _id", $sql);
+                $this->assertStringContainsString("GROUP BY _uw_tags", $sql);
+                $this->assertStringContainsString("CROSS JOIN jsonb_array_elements_text(data->'tags') AS _uw_tags", $sql);
+                return true;
+            }))
+            ->willReturn($stmt);
+
+        Utils::docAggregate($pdo, 'orders', [
+            ['$unwind' => '$tags'],
+            ['$group' => [
+                '_id' => '$tags',
+                'cnt' => ['$count' => true],
+            ]],
+        ]);
+    }
+
+    public function testUnwindRejectsInvalidField(): void
+    {
+        $pdo = $this->makeMockPDO();
+        $this->expectException(\InvalidArgumentException::class);
+        Utils::docAggregate($pdo, 'orders', [
+            ['$unwind' => '$bad field!'],
+        ]);
+    }
+
+    // ========================================================================
+    // $lookup
+    // ========================================================================
+
+    public function testLookupCorrelatedSubquery(): void
+    {
+        $pdo = $this->makeMockPDO();
+        $stmt = $this->makeMockStmt([]);
+        $pdo->expects($this->once())->method('prepare')
+            ->with($this->callback(function (string $sql) {
+                $this->assertStringContainsString(
+                    "COALESCE((SELECT json_agg(users.data) FROM users WHERE users.data->>'uid' = orders.data->>'user_id'), '[]'::json) AS user_docs",
+                    $sql
+                );
+                return true;
+            }))
+            ->willReturn($stmt);
+
+        Utils::docAggregate($pdo, 'orders', [
+            ['$lookup' => [
+                'from' => 'users',
+                'localField' => 'user_id',
+                'foreignField' => 'uid',
+                'as' => 'user_docs',
+            ]],
+        ]);
+    }
+
+    public function testLookupRejectsInvalidIdentifiers(): void
+    {
+        $pdo = $this->makeMockPDO();
+        $this->expectException(\InvalidArgumentException::class);
+        Utils::docAggregate($pdo, 'orders', [
+            ['$lookup' => [
+                'from' => 'bad table!',
+                'localField' => 'user_id',
+                'foreignField' => 'uid',
+                'as' => 'user_docs',
+            ]],
+        ]);
+    }
+
+    public function testLookupWithMatch(): void
+    {
+        $pdo = $this->makeMockPDO();
+        $stmt = $this->makeMockStmt([]);
+        $pdo->expects($this->once())->method('prepare')
+            ->with($this->callback(function (string $sql) {
+                $this->assertStringContainsString('WHERE data @> ?::jsonb', $sql);
+                $this->assertStringContainsString(
+                    "COALESCE((SELECT json_agg(products.data) FROM products WHERE products.data->>'pid' = orders.data->>'product_id'), '[]'::json) AS product_info",
+                    $sql
+                );
+                return true;
+            }))
+            ->willReturn($stmt);
+
+        $stmt->expects($this->once())->method('execute')
+            ->with([json_encode(['status' => 'active'])]);
+
+        Utils::docAggregate($pdo, 'orders', [
+            ['$match' => ['status' => 'active']],
+            ['$lookup' => [
+                'from' => 'products',
+                'localField' => 'product_id',
+                'foreignField' => 'pid',
+                'as' => 'product_info',
+            ]],
+        ]);
+    }
+
+    public function testUnwindGroupSortPipeline(): void
+    {
+        $pdo = $this->makeMockPDO();
+        $stmt = $this->makeMockStmt([]);
+        $pdo->expects($this->once())->method('prepare')
+            ->with($this->callback(function (string $sql) {
+                $this->assertStringContainsString("_uw_items AS _id", $sql);
+                $this->assertStringContainsString("CROSS JOIN jsonb_array_elements_text(data->'items') AS _uw_items", $sql);
+                $this->assertStringContainsString("GROUP BY _uw_items", $sql);
+                $this->assertStringContainsString("WHERE data @> ?::jsonb", $sql);
+                $this->assertStringContainsString("ORDER BY total DESC", $sql);
+                $this->assertStringContainsString("LIMIT ?", $sql);
+                return true;
+            }))
+            ->willReturn($stmt);
+
+        $stmt->expects($this->once())->method('execute')
+            ->with([json_encode(['status' => 'complete']), 5]);
+
+        Utils::docAggregate($pdo, 'orders', [
+            ['$match' => ['status' => 'complete']],
+            ['$unwind' => '$items'],
+            ['$group' => [
+                '_id' => '$items',
+                'total' => ['$sum' => '$amount'],
+                'cnt' => ['$count' => true],
+            ]],
+            ['$sort' => ['total' => -1]],
+            ['$limit' => 5],
+        ]);
     }
 }
