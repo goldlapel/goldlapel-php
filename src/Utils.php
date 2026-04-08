@@ -799,7 +799,16 @@ class Utils
         $params = [];
 
         foreach ($filter as $key => $value) {
-            if ($key === '$or' || $key === '$and') {
+            if ($key === '$text') {
+                if (!is_array($value) || array_is_list($value) || !isset($value['$search'])) {
+                    throw new \InvalidArgumentException('$text requires {$search: \'query\'}');
+                }
+                $lang = $value['$language'] ?? 'english';
+                $opClauses[] = "to_tsvector(?, data::text) @@ plainto_tsquery(?, ?)";
+                $params[] = $lang;
+                $params[] = $lang;
+                $params[] = $value['$search'];
+            } elseif ($key === '$or' || $key === '$and') {
                 if (!is_array($value) || !array_is_list($value) || count($value) === 0) {
                     throw new \InvalidArgumentException("{$key} value must be a non-empty array");
                 }
@@ -867,6 +876,41 @@ class Utils
                     } elseif ($op === '$regex') {
                         $opClauses[] = "{$fp} ~ ?";
                         $params[] = $operand;
+                    } elseif ($op === '$elemMatch') {
+                        if (!is_array($operand) || array_is_list($operand)) {
+                            throw new \InvalidArgumentException('$elemMatch value must be an object');
+                        }
+                        $fieldJson = self::fieldPathJson($key);
+                        $elemClauses = [];
+                        foreach ($operand as $subOp => $subVal) {
+                            if (isset(self::$COMPARISON_OPS[$subOp])) {
+                                $sqlOp = self::$COMPARISON_OPS[$subOp];
+                                if (is_int($subVal) || is_float($subVal)) {
+                                    $elemClauses[] = "(elem#>>'{}')::numeric {$sqlOp} ?";
+                                    $params[] = $subVal;
+                                } else {
+                                    $elemClauses[] = "elem#>>'{}' {$sqlOp} ?";
+                                    $params[] = (string) $subVal;
+                                }
+                            } elseif ($subOp === '$regex') {
+                                $elemClauses[] = "elem#>>'{}' ~ ?";
+                                $params[] = $subVal;
+                            } else {
+                                throw new \InvalidArgumentException("Unsupported \$elemMatch operator: {$subOp}");
+                            }
+                        }
+                        if (count($elemClauses) > 0) {
+                            $opClauses[] = "EXISTS (SELECT 1 FROM jsonb_array_elements({$fieldJson}) AS elem WHERE " . implode(' AND ', $elemClauses) . ")";
+                        }
+                    } elseif ($op === '$text') {
+                        if (!is_array($operand) || array_is_list($operand) || !isset($operand['$search'])) {
+                            throw new \InvalidArgumentException('$text requires {$search: \'query\'}');
+                        }
+                        $lang = $operand['$language'] ?? 'english';
+                        $opClauses[] = "to_tsvector(?, {$fp}) @@ plainto_tsquery(?, ?)";
+                        $params[] = $lang;
+                        $params[] = $lang;
+                        $params[] = $operand['$search'];
                     } else {
                         throw new \InvalidArgumentException("Unknown filter operator: {$op}");
                     }
@@ -1130,6 +1174,63 @@ class Utils
         $stmt = $pdo->prepare($sql);
         $stmt->execute($params);
         return $stmt->fetchAll(\PDO::FETCH_ASSOC);
+    }
+
+    public static function docFindCursor(
+        \PDO $pdo,
+        string $collection,
+        ?array $filter = null,
+        ?array $sort = null,
+        ?int $limit = null,
+        ?int $skip = null,
+        int $batchSize = 100,
+    ): \Generator {
+        self::validateIdentifier($collection);
+        [$clause, $params] = self::buildFilter($filter);
+        $sql = "SELECT _id, data, created_at FROM {$collection}";
+        if ($clause !== '') {
+            $sql .= " WHERE {$clause}";
+        }
+        if ($sort !== null && count($sort) > 0) {
+            $clauses = [];
+            foreach ($sort as $key => $dir) {
+                if (!preg_match('/^[a-zA-Z_][a-zA-Z0-9_.]*$/', $key)) {
+                    throw new \InvalidArgumentException("Invalid sort key: {$key}");
+                }
+                $clauses[] = "data->>'{$key}' " . ($dir === -1 ? 'DESC' : 'ASC');
+            }
+            $sql .= " ORDER BY " . implode(', ', $clauses);
+        }
+        if ($limit !== null) {
+            $params[] = $limit;
+            $sql .= " LIMIT ?";
+        }
+        if ($skip !== null) {
+            $params[] = $skip;
+            $sql .= " OFFSET ?";
+        }
+
+        $cursorName = 'gl_cursor_' . bin2hex(random_bytes(4));
+        $pdo->exec('BEGIN');
+        try {
+            $declareStmt = $pdo->prepare("DECLARE {$cursorName} CURSOR FOR {$sql}");
+            $declareStmt->execute($params);
+            while (true) {
+                $fetchStmt = $pdo->query("FETCH {$batchSize} FROM {$cursorName}");
+                $rows = $fetchStmt->fetchAll(\PDO::FETCH_ASSOC);
+                if (empty($rows)) {
+                    break;
+                }
+                foreach ($rows as $row) {
+                    yield $row;
+                }
+            }
+            $pdo->exec("CLOSE {$cursorName}");
+            $pdo->exec('COMMIT');
+        } catch (\Throwable $e) {
+            $pdo->exec('ROLLBACK');
+            throw $e;
+        }
     }
 
     public static function docFindOne(\PDO $pdo, string $collection, ?array $filter = null): ?array

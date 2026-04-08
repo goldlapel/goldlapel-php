@@ -2178,4 +2178,349 @@ class DocTest extends TestCase
         $this->expectException(\InvalidArgumentException::class);
         Utils::docDistinct($pdo, 'bad table', 'status');
     }
+
+    // ========================================================================
+    // $elemMatch filter
+    // ========================================================================
+
+    public function testFilterElemMatchNumericRange(): void
+    {
+        [$clause, $params] = $this->callBuildFilter([
+            'scores' => ['$elemMatch' => ['$gt' => 80, '$lt' => 90]],
+        ]);
+        $this->assertStringContainsString('EXISTS (SELECT 1 FROM jsonb_array_elements(', $clause);
+        $this->assertStringContainsString("data->'scores'", $clause);
+        $this->assertStringContainsString("(elem#>>'{}')::numeric > ?", $clause);
+        $this->assertStringContainsString("(elem#>>'{}')::numeric < ?", $clause);
+        $this->assertSame([80, 90], $params);
+    }
+
+    public function testFilterElemMatchStringComparison(): void
+    {
+        [$clause, $params] = $this->callBuildFilter([
+            'tags' => ['$elemMatch' => ['$eq' => 'important']],
+        ]);
+        $this->assertStringContainsString("elem#>>'{}' = ?", $clause);
+        $this->assertSame(['important'], $params);
+    }
+
+    public function testFilterElemMatchWithRegex(): void
+    {
+        [$clause, $params] = $this->callBuildFilter([
+            'names' => ['$elemMatch' => ['$regex' => '^A']],
+        ]);
+        $this->assertStringContainsString("elem#>>'{}' ~ ?", $clause);
+        $this->assertSame(['^A'], $params);
+    }
+
+    public function testFilterElemMatchDotNotation(): void
+    {
+        [$clause, $params] = $this->callBuildFilter([
+            'results.grades' => ['$elemMatch' => ['$gte' => 90]],
+        ]);
+        $this->assertStringContainsString("data->'results'->'grades'", $clause);
+        $this->assertStringContainsString("(elem#>>'{}')::numeric >= ?", $clause);
+        $this->assertSame([90], $params);
+    }
+
+    public function testFilterElemMatchRejectsNonObject(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('$elemMatch value must be an object');
+        $this->callBuildFilter(['scores' => ['$elemMatch' => [1, 2, 3]]]);
+    }
+
+    public function testFilterElemMatchRejectsUnsupportedOp(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('Unsupported $elemMatch operator');
+        $this->callBuildFilter(['scores' => ['$elemMatch' => ['$in' => [1, 2]]]]);
+    }
+
+    public function testFilterElemMatchInDocFind(): void
+    {
+        $pdo = $this->makeMockPDO();
+        $stmt = $this->makeMockStmt([]);
+        $pdo->expects($this->once())->method('prepare')
+            ->with($this->callback(function (string $sql) {
+                $this->assertStringContainsString('EXISTS (SELECT 1 FROM jsonb_array_elements(', $sql);
+                return true;
+            }))
+            ->willReturn($stmt);
+
+        Utils::docFind($pdo, 'users', [
+            'scores' => ['$elemMatch' => ['$gt' => 80, '$lt' => 90]],
+        ]);
+    }
+
+    // ========================================================================
+    // $text filter
+    // ========================================================================
+
+    public function testFilterTextTopLevel(): void
+    {
+        [$clause, $params] = $this->callBuildFilter([
+            '$text' => ['$search' => 'hello world'],
+        ]);
+        $this->assertStringContainsString('to_tsvector(?, data::text) @@ plainto_tsquery(?, ?)', $clause);
+        $this->assertSame(['english', 'english', 'hello world'], $params);
+    }
+
+    public function testFilterTextTopLevelCustomLanguage(): void
+    {
+        [$clause, $params] = $this->callBuildFilter([
+            '$text' => ['$search' => 'bonjour', '$language' => 'french'],
+        ]);
+        $this->assertSame(['french', 'french', 'bonjour'], $params);
+    }
+
+    public function testFilterTextFieldLevel(): void
+    {
+        [$clause, $params] = $this->callBuildFilter([
+            'content' => ['$text' => ['$search' => 'search terms']],
+        ]);
+        $this->assertStringContainsString("to_tsvector(?, data->>'content') @@ plainto_tsquery(?, ?)", $clause);
+        $this->assertSame(['english', 'english', 'search terms'], $params);
+    }
+
+    public function testFilterTextFieldLevelCustomLanguage(): void
+    {
+        [$clause, $params] = $this->callBuildFilter([
+            'body' => ['$text' => ['$search' => 'suchen', '$language' => 'german']],
+        ]);
+        $this->assertSame(['german', 'german', 'suchen'], $params);
+    }
+
+    public function testFilterTextTopLevelRejectsInvalid(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('$text requires');
+        $this->callBuildFilter(['$text' => 'not an object']);
+    }
+
+    public function testFilterTextTopLevelRejectsMissingSearch(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('$text requires');
+        $this->callBuildFilter(['$text' => ['$language' => 'english']]);
+    }
+
+    public function testFilterTextFieldLevelRejectsInvalid(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('$text requires');
+        $this->callBuildFilter(['content' => ['$text' => 'not an object']]);
+    }
+
+    public function testFilterTextFieldLevelRejectsMissingSearch(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('$text requires');
+        $this->callBuildFilter(['content' => ['$text' => ['$language' => 'english']]]);
+    }
+
+    public function testFilterTextInDocFind(): void
+    {
+        $pdo = $this->makeMockPDO();
+        $stmt = $this->makeMockStmt([]);
+        $pdo->expects($this->once())->method('prepare')
+            ->with($this->callback(function (string $sql) {
+                $this->assertStringContainsString('to_tsvector(?, data::text) @@ plainto_tsquery(?, ?)', $sql);
+                return true;
+            }))
+            ->willReturn($stmt);
+
+        $stmt->expects($this->once())->method('execute')
+            ->with(['english', 'english', 'hello']);
+
+        Utils::docFind($pdo, 'users', ['$text' => ['$search' => 'hello']]);
+    }
+
+    public function testFilterTextFieldLevelInDocFind(): void
+    {
+        $pdo = $this->makeMockPDO();
+        $stmt = $this->makeMockStmt([]);
+        $pdo->expects($this->once())->method('prepare')
+            ->with($this->callback(function (string $sql) {
+                $this->assertStringContainsString("to_tsvector(?, data->>'title') @@ plainto_tsquery(?, ?)", $sql);
+                return true;
+            }))
+            ->willReturn($stmt);
+
+        Utils::docFind($pdo, 'posts', [
+            'title' => ['$text' => ['$search' => 'postgres']],
+        ]);
+    }
+
+    public function testFilterTextMixedWithOtherFilters(): void
+    {
+        [$clause, $params] = $this->callBuildFilter([
+            'status' => 'active',
+            '$text' => ['$search' => 'query'],
+        ]);
+        $this->assertStringContainsString('data @> ?::jsonb', $clause);
+        $this->assertStringContainsString('to_tsvector(?, data::text) @@ plainto_tsquery(?, ?)', $clause);
+        $this->assertSame(json_encode(['status' => 'active']), $params[0]);
+        $this->assertSame('english', $params[1]);
+        $this->assertSame('english', $params[2]);
+        $this->assertSame('query', $params[3]);
+    }
+
+    // ========================================================================
+    // docFindCursor
+    // ========================================================================
+
+    public function testDocFindCursorBasic(): void
+    {
+        $rows = [
+            ['_id' => 'a', 'data' => '{"x":1}', 'created_at' => 'now'],
+            ['_id' => 'b', 'data' => '{"x":2}', 'created_at' => 'now'],
+        ];
+
+        $pdo = $this->makeMockPDO();
+        $declareStmt = $this->createMock(\PDOStatement::class);
+        $declareStmt->method('execute')->willReturn(true);
+
+        $fetchStmt = $this->createMock(\PDOStatement::class);
+        $fetchCallCount = 0;
+        $fetchStmt->method('fetchAll')->willReturnCallback(function () use (&$fetchCallCount, $rows) {
+            $fetchCallCount++;
+            return $fetchCallCount === 1 ? $rows : [];
+        });
+
+        $prepareCalls = [];
+        $pdo->method('prepare')->willReturnCallback(function (string $sql) use (&$prepareCalls, $declareStmt) {
+            $prepareCalls[] = $sql;
+            return $declareStmt;
+        });
+
+        $execCalls = [];
+        $pdo->method('exec')->willReturnCallback(function (string $sql) use (&$execCalls) {
+            $execCalls[] = $sql;
+            return 0;
+        });
+
+        $queryCalls = [];
+        $pdo->method('query')->willReturnCallback(function (string $sql) use (&$queryCalls, $fetchStmt) {
+            $queryCalls[] = $sql;
+            return $fetchStmt;
+        });
+
+        $results = [];
+        foreach (Utils::docFindCursor($pdo, 'users') as $row) {
+            $results[] = $row;
+        }
+
+        $this->assertCount(2, $results);
+        $this->assertSame('a', $results[0]['_id']);
+        $this->assertSame('b', $results[1]['_id']);
+
+        // Verify transaction lifecycle
+        $this->assertSame('BEGIN', $execCalls[0]);
+        $this->assertStringContainsString('CLOSE', $execCalls[1]);
+        $this->assertSame('COMMIT', $execCalls[2]);
+
+        // Verify DECLARE CURSOR
+        $this->assertCount(1, $prepareCalls);
+        $this->assertStringContainsString('DECLARE', $prepareCalls[0]);
+        $this->assertStringContainsString('CURSOR FOR', $prepareCalls[0]);
+        $this->assertStringContainsString('SELECT _id, data, created_at FROM users', $prepareCalls[0]);
+    }
+
+    public function testDocFindCursorWithFilterAndSort(): void
+    {
+        $pdo = $this->makeMockPDO();
+        $declareStmt = $this->createMock(\PDOStatement::class);
+        $declareStmt->method('execute')->willReturn(true);
+
+        $fetchStmt = $this->createMock(\PDOStatement::class);
+        $fetchStmt->method('fetchAll')->willReturn([]);
+
+        $prepareCalls = [];
+        $pdo->method('prepare')->willReturnCallback(function (string $sql) use (&$prepareCalls, $declareStmt) {
+            $prepareCalls[] = $sql;
+            return $declareStmt;
+        });
+
+        $pdo->method('exec')->willReturn(0);
+        $pdo->method('query')->willReturn($fetchStmt);
+
+        $results = [];
+        foreach (Utils::docFindCursor($pdo, 'users', ['active' => true], ['name' => 1], 10, 5) as $row) {
+            $results[] = $row;
+        }
+
+        $this->assertCount(0, $results);
+        $this->assertStringContainsString('WHERE data @> ?::jsonb', $prepareCalls[0]);
+        $this->assertStringContainsString("ORDER BY data->>'name' ASC", $prepareCalls[0]);
+        $this->assertStringContainsString('LIMIT ?', $prepareCalls[0]);
+        $this->assertStringContainsString('OFFSET ?', $prepareCalls[0]);
+    }
+
+    public function testDocFindCursorCustomBatchSize(): void
+    {
+        $pdo = $this->makeMockPDO();
+        $declareStmt = $this->createMock(\PDOStatement::class);
+        $declareStmt->method('execute')->willReturn(true);
+
+        $fetchStmt = $this->createMock(\PDOStatement::class);
+        $fetchStmt->method('fetchAll')->willReturn([]);
+
+        $pdo->method('prepare')->willReturn($declareStmt);
+        $pdo->method('exec')->willReturn(0);
+
+        $queryCalls = [];
+        $pdo->method('query')->willReturnCallback(function (string $sql) use (&$queryCalls, $fetchStmt) {
+            $queryCalls[] = $sql;
+            return $fetchStmt;
+        });
+
+        $results = [];
+        foreach (Utils::docFindCursor($pdo, 'items', null, null, null, null, 50) as $row) {
+            $results[] = $row;
+        }
+
+        $this->assertCount(1, $queryCalls);
+        $this->assertStringContainsString('FETCH 50', $queryCalls[0]);
+    }
+
+    public function testDocFindCursorInvalidCollection(): void
+    {
+        $pdo = $this->makeMockPDO();
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('Invalid identifier');
+        // Must consume the generator to trigger execution
+        iterator_to_array(Utils::docFindCursor($pdo, 'bad table'));
+    }
+
+    public function testDocFindCursorRollsBackOnError(): void
+    {
+        $pdo = $this->makeMockPDO();
+        $declareStmt = $this->createMock(\PDOStatement::class);
+        $declareStmt->method('execute')->willReturn(true);
+
+        $fetchStmt = $this->createMock(\PDOStatement::class);
+        $fetchStmt->method('fetchAll')->willThrowException(new \RuntimeException('DB error'));
+
+        $pdo->method('prepare')->willReturn($declareStmt);
+
+        $execCalls = [];
+        $pdo->method('exec')->willReturnCallback(function (string $sql) use (&$execCalls) {
+            $execCalls[] = $sql;
+            return 0;
+        });
+        $pdo->method('query')->willReturn($fetchStmt);
+
+        try {
+            iterator_to_array(Utils::docFindCursor($pdo, 'users'));
+            $this->fail('Expected RuntimeException');
+        } catch (\RuntimeException $e) {
+            $this->assertSame('DB error', $e->getMessage());
+        }
+
+        // Verify ROLLBACK was called (not COMMIT)
+        $this->assertSame('BEGIN', $execCalls[0]);
+        $this->assertSame('ROLLBACK', $execCalls[1]);
+        $this->assertCount(2, $execCalls);
+    }
 }
