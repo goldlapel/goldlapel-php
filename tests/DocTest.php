@@ -833,4 +833,128 @@ class DocTest extends TestCase
             ]],
         ]);
     }
+
+    // ========================================================================
+    // Filter operators (buildFilter / fieldPath)
+    // ========================================================================
+
+    private function callBuildFilter(?array $filter): array
+    {
+        $method = new \ReflectionMethod(Utils::class, 'buildFilter');
+        return $method->invoke(null, $filter);
+    }
+
+    public function testFilterGtNumeric(): void
+    {
+        [$clause, $params] = $this->callBuildFilter(['age' => ['$gt' => 25]]);
+        $this->assertStringContainsString('::numeric', $clause);
+        $this->assertStringContainsString('>', $clause);
+        $this->assertSame([25], $params);
+    }
+
+    public function testFilterLteString(): void
+    {
+        [$clause, $params] = $this->callBuildFilter(['name' => ['$lte' => 'M']]);
+        $this->assertStringNotContainsString('::numeric', $clause);
+        $this->assertStringContainsString('<=', $clause);
+        $this->assertSame(['M'], $params);
+    }
+
+    public function testFilterIn(): void
+    {
+        [$clause, $params] = $this->callBuildFilter(['status' => ['$in' => ['a', 'b']]]);
+        $this->assertStringContainsString('IN (?, ?)', $clause);
+        $this->assertSame(['a', 'b'], $params);
+    }
+
+    public function testFilterNin(): void
+    {
+        [$clause, $params] = $this->callBuildFilter(['status' => ['$nin' => ['x']]]);
+        $this->assertStringContainsString('NOT IN (?)', $clause);
+        $this->assertSame(['x'], $params);
+    }
+
+    public function testFilterExistsTrue(): void
+    {
+        [$clause, $params] = $this->callBuildFilter(['email' => ['$exists' => true]]);
+        $this->assertStringContainsString('data ? ?', $clause);
+        $this->assertStringNotContainsString('NOT', $clause);
+        $this->assertSame(['email'], $params);
+    }
+
+    public function testFilterExistsFalse(): void
+    {
+        [$clause, $params] = $this->callBuildFilter(['email' => ['$exists' => false]]);
+        $this->assertStringContainsString('NOT (data ? ?)', $clause);
+        $this->assertSame(['email'], $params);
+    }
+
+    public function testFilterRegex(): void
+    {
+        [$clause, $params] = $this->callBuildFilter(['name' => ['$regex' => '^J']]);
+        $this->assertStringContainsString('~ ?', $clause);
+        $this->assertSame(['^J'], $params);
+    }
+
+    public function testFilterEqNe(): void
+    {
+        [$clause, $params] = $this->callBuildFilter(['x' => ['$eq' => 'a'], 'y' => ['$ne' => 'b']]);
+        $this->assertStringContainsString('= ?', $clause);
+        $this->assertStringContainsString('!= ?', $clause);
+        $this->assertContains('a', $params);
+        $this->assertContains('b', $params);
+    }
+
+    public function testFilterMixed(): void
+    {
+        [$clause, $params] = $this->callBuildFilter(['active' => true, 'age' => ['$gt' => 18]]);
+        $this->assertStringContainsString('data @> ?::jsonb', $clause);
+        $this->assertStringContainsString('::numeric >', $clause);
+        $this->assertSame(json_encode(['active' => true]), $params[0]);
+        $this->assertSame(18, $params[1]);
+    }
+
+    public function testFilterDotNotation(): void
+    {
+        [$clause, $params] = $this->callBuildFilter(['addr.city' => ['$eq' => 'NY']]);
+        $this->assertStringContainsString("data->'addr'->>'city'", $clause);
+        $this->assertSame(['NY'], $params);
+    }
+
+    public function testFilterRange(): void
+    {
+        [$clause, $params] = $this->callBuildFilter(['age' => ['$gte' => 18, '$lt' => 65]]);
+        $this->assertStringContainsString('>=', $clause);
+        $this->assertStringContainsString('<', $clause);
+        $this->assertContains(18, $params);
+        $this->assertContains(65, $params);
+    }
+
+    public function testFilterPlainUnchanged(): void
+    {
+        [$clause, $params] = $this->callBuildFilter(['status' => 'active']);
+        $this->assertSame('data @> ?::jsonb', $clause);
+        $this->assertSame([json_encode(['status' => 'active'])], $params);
+    }
+
+    public function testFilterEmptyUnchanged(): void
+    {
+        [$clause, $params] = $this->callBuildFilter(null);
+        $this->assertSame('', $clause);
+        $this->assertSame([], $params);
+    }
+
+    public function testFilterInvalidKey(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('Invalid filter key');
+        $this->callBuildFilter(['bad;key' => ['$gt' => 1]]);
+    }
+
+    public function testFilterUnknownOperator(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('Unknown filter operator');
+        $this->callBuildFilter(['x' => ['$unknown' => 1]]);
+    }
 }

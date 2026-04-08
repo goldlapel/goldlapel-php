@@ -734,6 +734,117 @@ class Utils
     // Document Store
     // ========================================================================
 
+    private static $COMPARISON_OPS = [
+        '$gt' => '>', '$gte' => '>=', '$lt' => '<', '$lte' => '<=',
+        '$eq' => '=', '$ne' => '!=',
+    ];
+
+    private static function fieldPath(string $key): string
+    {
+        $parts = explode('.', $key);
+        foreach ($parts as $part) {
+            if (!preg_match('/^[a-zA-Z_][a-zA-Z0-9_]*$/', $part)) {
+                throw new \InvalidArgumentException("Invalid filter key: {$key}");
+            }
+        }
+        if (count($parts) === 1) {
+            return "data->>'{$parts[0]}'";
+        }
+        $path = 'data';
+        for ($i = 0; $i < count($parts) - 1; $i++) {
+            $path .= "->'{$parts[$i]}'";
+        }
+        $path .= "->>'{$parts[count($parts) - 1]}'";
+        return $path;
+    }
+
+    private static function buildFilter(?array $filter): array
+    {
+        if ($filter === null || count($filter) === 0) {
+            return ['', []];
+        }
+
+        $containment = [];
+        $opClauses = [];
+        $params = [];
+
+        foreach ($filter as $key => $value) {
+            if (is_array($value) && !array_is_list($value) && self::hasOperators($value)) {
+                $fp = self::fieldPath($key);
+
+                foreach ($value as $op => $operand) {
+                    if (isset(self::$COMPARISON_OPS[$op])) {
+                        $sqlOp = self::$COMPARISON_OPS[$op];
+                        if (is_int($operand) || is_float($operand)) {
+                            $opClauses[] = "({$fp})::numeric {$sqlOp} ?";
+                            $params[] = $operand;
+                        } else {
+                            $opClauses[] = "{$fp} {$sqlOp} ?";
+                            $params[] = (string) $operand;
+                        }
+                    } elseif ($op === '$in') {
+                        if (!is_array($operand) || count($operand) === 0) {
+                            throw new \InvalidArgumentException('$in requires a non-empty array');
+                        }
+                        $placeholders = implode(', ', array_fill(0, count($operand), '?'));
+                        $opClauses[] = "{$fp} IN ({$placeholders})";
+                        foreach ($operand as $item) {
+                            $params[] = (string) $item;
+                        }
+                    } elseif ($op === '$nin') {
+                        if (!is_array($operand) || count($operand) === 0) {
+                            throw new \InvalidArgumentException('$nin requires a non-empty array');
+                        }
+                        $placeholders = implode(', ', array_fill(0, count($operand), '?'));
+                        $opClauses[] = "{$fp} NOT IN ({$placeholders})";
+                        foreach ($operand as $item) {
+                            $params[] = (string) $item;
+                        }
+                    } elseif ($op === '$exists') {
+                        $parts = explode('.', $key);
+                        $topKey = $parts[0];
+                        if ($operand) {
+                            $opClauses[] = "data ? ?";
+                        } else {
+                            $opClauses[] = "NOT (data ? ?)";
+                        }
+                        $params[] = $topKey;
+                    } elseif ($op === '$regex') {
+                        $opClauses[] = "{$fp} ~ ?";
+                        $params[] = $operand;
+                    } else {
+                        throw new \InvalidArgumentException("Unknown filter operator: {$op}");
+                    }
+                }
+            } else {
+                $containment[$key] = $value;
+            }
+        }
+
+        $allClauses = [];
+        $allParams = [];
+
+        if (count($containment) > 0) {
+            $allClauses[] = 'data @> ?::jsonb';
+            $allParams[] = json_encode($containment);
+        }
+
+        array_push($allClauses, ...$opClauses);
+        array_push($allParams, ...$params);
+
+        return [implode(' AND ', $allClauses), $allParams];
+    }
+
+    private static function hasOperators(array $value): bool
+    {
+        foreach (array_keys($value) as $k) {
+            if (is_string($k) && str_starts_with($k, '$')) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     private static function ensureCollection(\PDO $pdo, string $collection): void
     {
         $pdo->exec(
@@ -777,11 +888,10 @@ class Utils
         ?int $skip = null,
     ): array {
         self::validateIdentifier($collection);
-        $params = [];
+        [$clause, $params] = self::buildFilter($filter);
         $sql = "SELECT _id, data, created_at FROM {$collection}";
-        if ($filter !== null && count($filter) > 0) {
-            $params[] = json_encode($filter);
-            $sql .= " WHERE data @> ?::jsonb";
+        if ($clause !== '') {
+            $sql .= " WHERE {$clause}";
         }
         if ($sort !== null && count($sort) > 0) {
             $clauses = [];
@@ -809,11 +919,10 @@ class Utils
     public static function docFindOne(\PDO $pdo, string $collection, ?array $filter = null): ?array
     {
         self::validateIdentifier($collection);
-        $params = [];
+        [$clause, $params] = self::buildFilter($filter);
         $sql = "SELECT _id, data, created_at FROM {$collection}";
-        if ($filter !== null && count($filter) > 0) {
-            $params[] = json_encode($filter);
-            $sql .= " WHERE data @> ?::jsonb";
+        if ($clause !== '') {
+            $sql .= " WHERE {$clause}";
         }
         $sql .= " LIMIT 1";
         $stmt = $pdo->prepare($sql);
@@ -825,56 +934,65 @@ class Utils
     public static function docUpdate(\PDO $pdo, string $collection, array $filter, array $update): int
     {
         self::validateIdentifier($collection);
+        [$clause, $params] = self::buildFilter($filter);
+        $where = $clause !== '' ? $clause : 'TRUE';
+        $allParams = [json_encode($update), ...$params];
         $stmt = $pdo->prepare(
-            "UPDATE {$collection} SET data = data || ?::jsonb WHERE data @> ?::jsonb"
+            "UPDATE {$collection} SET data = data || ?::jsonb WHERE {$where}"
         );
-        $stmt->execute([json_encode($update), json_encode($filter)]);
+        $stmt->execute($allParams);
         return $stmt->rowCount();
     }
 
     public static function docUpdateOne(\PDO $pdo, string $collection, array $filter, array $update): int
     {
         self::validateIdentifier($collection);
+        [$clause, $params] = self::buildFilter($filter);
+        $where = $clause !== '' ? $clause : 'TRUE';
+        $allParams = [...$params, json_encode($update)];
         $stmt = $pdo->prepare(
             "WITH target AS ("
-            . "SELECT _id FROM {$collection} WHERE data @> ?::jsonb LIMIT 1"
+            . "SELECT _id FROM {$collection} WHERE {$where} LIMIT 1"
             . ") UPDATE {$collection} SET data = data || ?::jsonb "
             . "FROM target WHERE {$collection}._id = target._id"
         );
-        $stmt->execute([json_encode($filter), json_encode($update)]);
+        $stmt->execute($allParams);
         return $stmt->rowCount();
     }
 
     public static function docDelete(\PDO $pdo, string $collection, array $filter): int
     {
         self::validateIdentifier($collection);
+        [$clause, $params] = self::buildFilter($filter);
+        $where = $clause !== '' ? $clause : 'TRUE';
         $stmt = $pdo->prepare(
-            "DELETE FROM {$collection} WHERE data @> ?::jsonb"
+            "DELETE FROM {$collection} WHERE {$where}"
         );
-        $stmt->execute([json_encode($filter)]);
+        $stmt->execute($params);
         return $stmt->rowCount();
     }
 
     public static function docDeleteOne(\PDO $pdo, string $collection, array $filter): int
     {
         self::validateIdentifier($collection);
+        [$clause, $params] = self::buildFilter($filter);
+        $where = $clause !== '' ? $clause : 'TRUE';
         $stmt = $pdo->prepare(
             "WITH target AS ("
-            . "SELECT _id FROM {$collection} WHERE data @> ?::jsonb LIMIT 1"
+            . "SELECT _id FROM {$collection} WHERE {$where} LIMIT 1"
             . ") DELETE FROM {$collection} USING target WHERE {$collection}._id = target._id"
         );
-        $stmt->execute([json_encode($filter)]);
+        $stmt->execute($params);
         return $stmt->rowCount();
     }
 
     public static function docCount(\PDO $pdo, string $collection, ?array $filter = null): int
     {
         self::validateIdentifier($collection);
-        $params = [];
+        [$clause, $params] = self::buildFilter($filter);
         $sql = "SELECT COUNT(*) FROM {$collection}";
-        if ($filter !== null && count($filter) > 0) {
-            $params[] = json_encode($filter);
-            $sql .= " WHERE data @> ?::jsonb";
+        if ($clause !== '') {
+            $sql .= " WHERE {$clause}";
         }
         $stmt = $pdo->prepare($sql);
         $stmt->execute($params);
@@ -915,8 +1033,11 @@ class Utils
                     if (!is_array($stageValue)) {
                         throw new \InvalidArgumentException('$match stage value must be an array');
                     }
-                    $whereParams[] = json_encode($stageValue);
-                    $where = "WHERE data @> ?::jsonb";
+                    [$matchClause, $matchParams] = self::buildFilter($stageValue);
+                    if ($matchClause !== '') {
+                        $where = "WHERE {$matchClause}";
+                        $whereParams = $matchParams;
+                    }
                     break;
 
                 case '$group':
