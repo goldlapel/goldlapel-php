@@ -729,4 +729,177 @@ class Utils
         $row = $stmt->fetch(\PDO::FETCH_NUM);
         return $row ? $row[0] : null;
     }
+
+    // ========================================================================
+    // Document Store
+    // ========================================================================
+
+    private static function ensureCollection(\PDO $pdo, string $collection): void
+    {
+        $pdo->exec(
+            "CREATE TABLE IF NOT EXISTS {$collection} ("
+            . "_id UUID PRIMARY KEY DEFAULT gen_random_uuid(), "
+            . "data JSONB NOT NULL, "
+            . "created_at TIMESTAMPTZ DEFAULT NOW())"
+        );
+    }
+
+    public static function docInsert(\PDO $pdo, string $collection, array $document): array
+    {
+        self::validateIdentifier($collection);
+        self::ensureCollection($pdo, $collection);
+        $stmt = $pdo->prepare(
+            "INSERT INTO {$collection} (data) VALUES (?::jsonb) RETURNING _id, data, created_at"
+        );
+        $stmt->execute([json_encode($document)]);
+        return $stmt->fetch(\PDO::FETCH_ASSOC);
+    }
+
+    public static function docInsertMany(\PDO $pdo, string $collection, array $documents): array
+    {
+        self::validateIdentifier($collection);
+        self::ensureCollection($pdo, $collection);
+        $placeholders = implode(', ', array_map(fn() => '(?::jsonb)', $documents));
+        $params = array_map(fn($d) => json_encode($d), $documents);
+        $stmt = $pdo->prepare(
+            "INSERT INTO {$collection} (data) VALUES {$placeholders} RETURNING _id, data, created_at"
+        );
+        $stmt->execute($params);
+        return $stmt->fetchAll(\PDO::FETCH_ASSOC);
+    }
+
+    public static function docFind(
+        \PDO $pdo,
+        string $collection,
+        ?array $filter = null,
+        ?array $sort = null,
+        ?int $limit = null,
+        ?int $skip = null,
+    ): array {
+        self::validateIdentifier($collection);
+        $params = [];
+        $sql = "SELECT _id, data, created_at FROM {$collection}";
+        if ($filter !== null && count($filter) > 0) {
+            $params[] = json_encode($filter);
+            $sql .= " WHERE data @> ?::jsonb";
+        }
+        if ($sort !== null && count($sort) > 0) {
+            $clauses = [];
+            foreach ($sort as $key => $dir) {
+                if (!preg_match('/^[a-zA-Z_][a-zA-Z0-9_.]*$/', $key)) {
+                    throw new \InvalidArgumentException("Invalid sort key: {$key}");
+                }
+                $clauses[] = "data->>'{$key}' " . ($dir === -1 ? 'DESC' : 'ASC');
+            }
+            $sql .= " ORDER BY " . implode(', ', $clauses);
+        }
+        if ($limit !== null) {
+            $params[] = $limit;
+            $sql .= " LIMIT ?";
+        }
+        if ($skip !== null) {
+            $params[] = $skip;
+            $sql .= " OFFSET ?";
+        }
+        $stmt = $pdo->prepare($sql);
+        $stmt->execute($params);
+        return $stmt->fetchAll(\PDO::FETCH_ASSOC);
+    }
+
+    public static function docFindOne(\PDO $pdo, string $collection, ?array $filter = null): ?array
+    {
+        self::validateIdentifier($collection);
+        $params = [];
+        $sql = "SELECT _id, data, created_at FROM {$collection}";
+        if ($filter !== null && count($filter) > 0) {
+            $params[] = json_encode($filter);
+            $sql .= " WHERE data @> ?::jsonb";
+        }
+        $sql .= " LIMIT 1";
+        $stmt = $pdo->prepare($sql);
+        $stmt->execute($params);
+        $row = $stmt->fetch(\PDO::FETCH_ASSOC);
+        return $row !== false ? $row : null;
+    }
+
+    public static function docUpdate(\PDO $pdo, string $collection, array $filter, array $update): int
+    {
+        self::validateIdentifier($collection);
+        $stmt = $pdo->prepare(
+            "UPDATE {$collection} SET data = data || ?::jsonb WHERE data @> ?::jsonb"
+        );
+        $stmt->execute([json_encode($update), json_encode($filter)]);
+        return $stmt->rowCount();
+    }
+
+    public static function docUpdateOne(\PDO $pdo, string $collection, array $filter, array $update): int
+    {
+        self::validateIdentifier($collection);
+        $stmt = $pdo->prepare(
+            "WITH target AS ("
+            . "SELECT _id FROM {$collection} WHERE data @> ?::jsonb LIMIT 1"
+            . ") UPDATE {$collection} SET data = data || ?::jsonb "
+            . "FROM target WHERE {$collection}._id = target._id"
+        );
+        $stmt->execute([json_encode($filter), json_encode($update)]);
+        return $stmt->rowCount();
+    }
+
+    public static function docDelete(\PDO $pdo, string $collection, array $filter): int
+    {
+        self::validateIdentifier($collection);
+        $stmt = $pdo->prepare(
+            "DELETE FROM {$collection} WHERE data @> ?::jsonb"
+        );
+        $stmt->execute([json_encode($filter)]);
+        return $stmt->rowCount();
+    }
+
+    public static function docDeleteOne(\PDO $pdo, string $collection, array $filter): int
+    {
+        self::validateIdentifier($collection);
+        $stmt = $pdo->prepare(
+            "WITH target AS ("
+            . "SELECT _id FROM {$collection} WHERE data @> ?::jsonb LIMIT 1"
+            . ") DELETE FROM {$collection} USING target WHERE {$collection}._id = target._id"
+        );
+        $stmt->execute([json_encode($filter)]);
+        return $stmt->rowCount();
+    }
+
+    public static function docCount(\PDO $pdo, string $collection, ?array $filter = null): int
+    {
+        self::validateIdentifier($collection);
+        $params = [];
+        $sql = "SELECT COUNT(*) FROM {$collection}";
+        if ($filter !== null && count($filter) > 0) {
+            $params[] = json_encode($filter);
+            $sql .= " WHERE data @> ?::jsonb";
+        }
+        $stmt = $pdo->prepare($sql);
+        $stmt->execute($params);
+        return (int) $stmt->fetchColumn();
+    }
+
+    public static function docCreateIndex(\PDO $pdo, string $collection, ?array $keys = null): void
+    {
+        self::validateIdentifier($collection);
+        if ($keys === null || count($keys) === 0) {
+            $pdo->exec(
+                "CREATE INDEX IF NOT EXISTS {$collection}_data_gin ON {$collection} USING GIN (data)"
+            );
+            return;
+        }
+        foreach ($keys as $key => $dir) {
+            if (!preg_match('/^[a-zA-Z_][a-zA-Z0-9_.]*$/', $key)) {
+                throw new \InvalidArgumentException("Invalid index key: {$key}");
+            }
+            $order = $dir === -1 ? 'DESC' : 'ASC';
+            $safeName = str_replace('.', '_', $key);
+            $pdo->exec(
+                "CREATE INDEX IF NOT EXISTS {$collection}_{$safeName}_idx "
+                . "ON {$collection} ((data->>'{$key}') {$order})"
+            );
+        }
+    }
 }
