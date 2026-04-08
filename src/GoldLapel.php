@@ -49,6 +49,7 @@ class GoldLapel
     /** @var resource|null */
     private $process = null;
     private ?string $url = null;
+    private ?\PDO $pdo = null;
 
     /** @var array<string, self> */
     private static array $instances = [];
@@ -114,6 +115,16 @@ class GoldLapel
         return self::VALID_CONFIG_KEYS;
     }
 
+    public function pdo(): \PDO
+    {
+        if ($this->pdo === null) {
+            throw new RuntimeException(
+                "Not connected. Call startProxy() before using instance methods."
+            );
+        }
+        return $this->pdo;
+    }
+
     public function startProxy(): string
     {
         if ($this->process !== null && $this->isRunning()) {
@@ -167,6 +178,14 @@ class GoldLapel
                 fclose($stderr);
                 $this->url = self::makeProxyUrl($this->upstream, $this->port);
 
+                if (extension_loaded('pdo_pgsql')) {
+                    $dsn = self::urlToPdoDsn($this->url);
+                    $parsed = parse_url($this->url);
+                    $user = isset($parsed['user']) ? rawurldecode($parsed['user']) : null;
+                    $pass = isset($parsed['pass']) ? rawurldecode($parsed['pass']) : null;
+                    $this->pdo = new \PDO($dsn, $user, $pass);
+                }
+
                 if ($this->dashboardPort > 0) {
                     echo "goldlapel → :{$this->port} (proxy) | http://127.0.0.1:{$this->dashboardPort} (dashboard)\n";
                 } else {
@@ -193,6 +212,8 @@ class GoldLapel
 
     public function stopProxy(): void
     {
+        $this->pdo = null;
+
         if ($this->process === null) {
             return;
         }
@@ -232,6 +253,280 @@ class GoldLapel
 
         $status = proc_get_status($this->process);
         return $status['running'];
+    }
+
+    // -- Instance methods (delegate to Utils with stored PDO) --
+
+    // Document Store
+
+    public function docInsert(string $collection, array $document): array
+    {
+        return Utils::docInsert($this->pdo(), $collection, $document);
+    }
+
+    public function docInsertMany(string $collection, array $documents): array
+    {
+        return Utils::docInsertMany($this->pdo(), $collection, $documents);
+    }
+
+    public function docFind(string $collection, ?array $filter = null, ?array $sort = null, ?int $limit = null, ?int $skip = null): array
+    {
+        return Utils::docFind($this->pdo(), $collection, $filter, $sort, $limit, $skip);
+    }
+
+    public function docFindOne(string $collection, ?array $filter = null): ?array
+    {
+        return Utils::docFindOne($this->pdo(), $collection, $filter);
+    }
+
+    public function docUpdate(string $collection, array $filter, array $update): int
+    {
+        return Utils::docUpdate($this->pdo(), $collection, $filter, $update);
+    }
+
+    public function docUpdateOne(string $collection, array $filter, array $update): int
+    {
+        return Utils::docUpdateOne($this->pdo(), $collection, $filter, $update);
+    }
+
+    public function docDelete(string $collection, array $filter): int
+    {
+        return Utils::docDelete($this->pdo(), $collection, $filter);
+    }
+
+    public function docDeleteOne(string $collection, array $filter): int
+    {
+        return Utils::docDeleteOne($this->pdo(), $collection, $filter);
+    }
+
+    public function docCount(string $collection, ?array $filter = null): int
+    {
+        return Utils::docCount($this->pdo(), $collection, $filter);
+    }
+
+    public function docCreateIndex(string $collection, ?array $keys = null): void
+    {
+        Utils::docCreateIndex($this->pdo(), $collection, $keys);
+    }
+
+    public function docAggregate(string $collection, array $pipeline): array
+    {
+        return Utils::docAggregate($this->pdo(), $collection, $pipeline);
+    }
+
+    // Search
+
+    public function search(string $table, string|array $column, string $query, int $limit = 50, string $lang = 'english', bool $highlight = false): array
+    {
+        return Utils::search($this->pdo(), $table, $column, $query, $limit, $lang, $highlight);
+    }
+
+    public function searchFuzzy(string $table, string $column, string $query, int $limit = 50, float $threshold = 0.3): array
+    {
+        return Utils::searchFuzzy($this->pdo(), $table, $column, $query, $limit, $threshold);
+    }
+
+    public function searchPhonetic(string $table, string $column, string $query, int $limit = 50): array
+    {
+        return Utils::searchPhonetic($this->pdo(), $table, $column, $query, $limit);
+    }
+
+    public function similar(string $table, string $column, array $vector, int $limit = 10): array
+    {
+        return Utils::similar($this->pdo(), $table, $column, $vector, $limit);
+    }
+
+    public function suggest(string $table, string $column, string $prefix, int $limit = 10): array
+    {
+        return Utils::suggest($this->pdo(), $table, $column, $prefix, $limit);
+    }
+
+    public function facets(string $table, string $column, int $limit = 50, ?string $query = null, string|array|null $queryColumn = null, string $lang = 'english'): array
+    {
+        return Utils::facets($this->pdo(), $table, $column, $limit, $query, $queryColumn, $lang);
+    }
+
+    public function aggregate(string $table, string $column, string $func, ?string $groupBy = null, int $limit = 50): array
+    {
+        return Utils::aggregate($this->pdo(), $table, $column, $func, $groupBy, $limit);
+    }
+
+    public function createSearchConfig(string $name, string $copyFrom = 'english'): void
+    {
+        Utils::createSearchConfig($this->pdo(), $name, $copyFrom);
+    }
+
+    // Pub/Sub & Queue
+
+    public function publish(string $channel, string $message): void
+    {
+        Utils::publish($this->pdo(), $channel, $message);
+    }
+
+    public function subscribe(string $channel, callable $callback): void
+    {
+        Utils::subscribe($this->pdo(), $channel, $callback);
+    }
+
+    public function enqueue(string $queueTable, array $payload): void
+    {
+        Utils::enqueue($this->pdo(), $queueTable, $payload);
+    }
+
+    public function dequeue(string $queueTable): ?array
+    {
+        return Utils::dequeue($this->pdo(), $queueTable);
+    }
+
+    // Counters
+
+    public function incr(string $table, string $key, int $amount = 1): int
+    {
+        return Utils::incr($this->pdo(), $table, $key, $amount);
+    }
+
+    public function getCounter(string $table, string $key): int
+    {
+        return Utils::getCounter($this->pdo(), $table, $key);
+    }
+
+    // Hash
+
+    public function hset(string $table, string $key, string $field, mixed $value): void
+    {
+        Utils::hset($this->pdo(), $table, $key, $field, $value);
+    }
+
+    public function hget(string $table, string $key, string $field): mixed
+    {
+        return Utils::hget($this->pdo(), $table, $key, $field);
+    }
+
+    public function hgetall(string $table, string $key): array
+    {
+        return Utils::hgetall($this->pdo(), $table, $key);
+    }
+
+    public function hdel(string $table, string $key, string $field): bool
+    {
+        return Utils::hdel($this->pdo(), $table, $key, $field);
+    }
+
+    // Sorted Sets
+
+    public function zadd(string $table, string $member, float $score): void
+    {
+        Utils::zadd($this->pdo(), $table, $member, $score);
+    }
+
+    public function zincrby(string $table, string $member, float $amount = 1): float
+    {
+        return Utils::zincrby($this->pdo(), $table, $member, $amount);
+    }
+
+    public function zrange(string $table, int $start = 0, int $stop = 10, bool $desc = true): array
+    {
+        return Utils::zrange($this->pdo(), $table, $start, $stop, $desc);
+    }
+
+    public function zrank(string $table, string $member, bool $desc = true): ?int
+    {
+        return Utils::zrank($this->pdo(), $table, $member, $desc);
+    }
+
+    public function zscore(string $table, string $member): ?float
+    {
+        return Utils::zscore($this->pdo(), $table, $member);
+    }
+
+    public function zrem(string $table, string $member): bool
+    {
+        return Utils::zrem($this->pdo(), $table, $member);
+    }
+
+    // Geo
+
+    public function georadius(string $table, string $geomColumn, float $lon, float $lat, float $radiusMeters, int $limit = 50): array
+    {
+        return Utils::georadius($this->pdo(), $table, $geomColumn, $lon, $lat, $radiusMeters, $limit);
+    }
+
+    public function geoadd(string $table, string $nameColumn, string $geomColumn, string $name, float $lon, float $lat): void
+    {
+        Utils::geoadd($this->pdo(), $table, $nameColumn, $geomColumn, $name, $lon, $lat);
+    }
+
+    public function geodist(string $table, string $geomColumn, string $nameColumn, string $nameA, string $nameB): ?float
+    {
+        return Utils::geodist($this->pdo(), $table, $geomColumn, $nameColumn, $nameA, $nameB);
+    }
+
+    // Misc
+
+    public function countDistinct(string $table, string $column): int
+    {
+        return Utils::countDistinct($this->pdo(), $table, $column);
+    }
+
+    public function script(string $luaCode, mixed ...$args): ?string
+    {
+        return Utils::script($this->pdo(), $luaCode, ...$args);
+    }
+
+    // Streams
+
+    public function streamAdd(string $stream, array $payload): int
+    {
+        return Utils::streamAdd($this->pdo(), $stream, $payload);
+    }
+
+    public function streamCreateGroup(string $stream, string $group): void
+    {
+        Utils::streamCreateGroup($this->pdo(), $stream, $group);
+    }
+
+    public function streamRead(string $stream, string $group, string $consumer, int $count = 1): array
+    {
+        return Utils::streamRead($this->pdo(), $stream, $group, $consumer, $count);
+    }
+
+    public function streamAck(string $stream, string $group, int $messageId): bool
+    {
+        return Utils::streamAck($this->pdo(), $stream, $group, $messageId);
+    }
+
+    public function streamClaim(string $stream, string $group, string $consumer, int $minIdleMs = 60000): array
+    {
+        return Utils::streamClaim($this->pdo(), $stream, $group, $consumer, $minIdleMs);
+    }
+
+    // Percolate
+
+    public function percolateAdd(string $name, string $queryId, string $query, string $lang = 'english', ?array $metadata = null): void
+    {
+        Utils::percolateAdd($this->pdo(), $name, $queryId, $query, $lang, $metadata);
+    }
+
+    public function percolate(string $name, string $text, int $limit = 50, string $lang = 'english'): array
+    {
+        return Utils::percolate($this->pdo(), $name, $text, $limit, $lang);
+    }
+
+    public function percolateDelete(string $name, string $queryId): bool
+    {
+        return Utils::percolateDelete($this->pdo(), $name, $queryId);
+    }
+
+    // Debug
+
+    public function analyze(string $text, string $lang = 'english'): array
+    {
+        return Utils::analyze($this->pdo(), $text, $lang);
+    }
+
+    public function explainScore(string $table, string $column, string $query, string $idColumn, mixed $idValue, string $lang = 'english'): ?array
+    {
+        return Utils::explainScore($this->pdo(), $table, $column, $query, $idColumn, $idValue, $lang);
     }
 
     // -- Static instance management --
