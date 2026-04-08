@@ -1656,4 +1656,526 @@ class DocTest extends TestCase
         $this->expectException(\InvalidArgumentException::class);
         Utils::docRemoveCap($pdo, 'bad table');
     }
+
+    // ========================================================================
+    // Logical operators ($or, $and, $not)
+    // ========================================================================
+
+    public function testFilterOrSimple(): void
+    {
+        [$clause, $params] = $this->callBuildFilter([
+            '$or' => [['status' => 'active'], ['status' => 'inactive']],
+        ]);
+        $this->assertStringContainsString('OR', $clause);
+        $this->assertStringStartsWith('(', $clause);
+        $this->assertSame(json_encode(['status' => 'active']), $params[0]);
+        $this->assertSame(json_encode(['status' => 'inactive']), $params[1]);
+    }
+
+    public function testFilterAndExplicit(): void
+    {
+        [$clause, $params] = $this->callBuildFilter([
+            '$and' => [['age' => ['$gt' => 18]], ['age' => ['$lt' => 65]]],
+        ]);
+        $this->assertStringContainsString('AND', $clause);
+        $this->assertStringStartsWith('(', $clause);
+        $this->assertSame([18, 65], $params);
+    }
+
+    public function testFilterNot(): void
+    {
+        [$clause, $params] = $this->callBuildFilter([
+            '$not' => ['status' => 'active'],
+        ]);
+        $this->assertStringStartsWith('NOT (', $clause);
+        $this->assertSame([json_encode(['status' => 'active'])], $params);
+    }
+
+    public function testFilterOrWithOperators(): void
+    {
+        [$clause, $params] = $this->callBuildFilter([
+            '$or' => [['status' => 'active'], ['age' => ['$gt' => 25]]],
+        ]);
+        $this->assertStringContainsString('OR', $clause);
+        $this->assertCount(2, $params);
+        $this->assertSame(json_encode(['status' => 'active']), $params[0]);
+        $this->assertSame(25, $params[1]);
+    }
+
+    public function testFilterNestedOrAnd(): void
+    {
+        [$clause, $params] = $this->callBuildFilter([
+            '$or' => [
+                ['$and' => [['a' => 1], ['b' => 2]]],
+                ['$not' => ['c' => 3]],
+            ],
+        ]);
+        $this->assertStringContainsString('OR', $clause);
+        $this->assertStringContainsString('AND', $clause);
+        $this->assertStringContainsString('NOT', $clause);
+    }
+
+    public function testFilterMixedLogicalAndField(): void
+    {
+        [$clause, $params] = $this->callBuildFilter([
+            'name' => 'alice',
+            '$or' => [['status' => 'active'], ['age' => ['$gt' => 25]]],
+        ]);
+        $this->assertStringContainsString('AND', $clause);
+        $this->assertStringContainsString('OR', $clause);
+        $this->assertStringContainsString('alice', $params[0]);
+    }
+
+    public function testFilterOrEmptyRaises(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('non-empty array');
+        $this->callBuildFilter(['$or' => []]);
+    }
+
+    public function testFilterOrNonListRaises(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('non-empty array');
+        $this->callBuildFilter(['$or' => ['a' => 1]]);
+    }
+
+    public function testFilterNotNonDictRaises(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('filter object');
+        $this->callBuildFilter(['$not' => [['a' => 1]]]);
+    }
+
+    public function testFilterOrInDocFind(): void
+    {
+        $pdo = $this->makeMockPDO();
+        $stmt = $this->makeMockStmt([]);
+        $pdo->expects($this->once())->method('prepare')
+            ->with($this->callback(function (string $sql) {
+                $this->assertStringContainsString('OR', $sql);
+                return true;
+            }))
+            ->willReturn($stmt);
+
+        Utils::docFind($pdo, 'users', [
+            '$or' => [['status' => 'active'], ['status' => 'inactive']],
+        ]);
+    }
+
+    public function testFilterNotInDocCount(): void
+    {
+        $pdo = $this->makeMockPDO();
+        $stmt = $this->createMock(\PDOStatement::class);
+        $stmt->method('execute')->willReturn(true);
+        $stmt->method('fetchColumn')->willReturn(5);
+        $pdo->expects($this->once())->method('prepare')
+            ->with($this->callback(function (string $sql) {
+                $this->assertStringContainsString('NOT', $sql);
+                return true;
+            }))
+            ->willReturn($stmt);
+
+        Utils::docCount($pdo, 'users', ['$not' => ['status' => 'suspended']]);
+    }
+
+    // ========================================================================
+    // Field update operators ($set, $inc, $unset, $mul, $rename)
+    // ========================================================================
+
+    private function callBuildUpdate(array $update): array
+    {
+        $method = new \ReflectionMethod(Utils::class, 'buildUpdate');
+        return $method->invoke(null, $update);
+    }
+
+    public function testBuildUpdatePlainFallback(): void
+    {
+        [$expr, $params] = $this->callBuildUpdate(['name' => 'new']);
+        $this->assertSame('data || ?::jsonb', $expr);
+        $this->assertSame([json_encode(['name' => 'new'])], $params);
+    }
+
+    public function testBuildUpdateSet(): void
+    {
+        [$expr, $params] = $this->callBuildUpdate(['$set' => ['name' => 'new', 'age' => 30]]);
+        $this->assertStringContainsString('|| ?::jsonb', $expr);
+        $this->assertSame([json_encode(['name' => 'new', 'age' => 30])], $params);
+    }
+
+    public function testBuildUpdateInc(): void
+    {
+        [$expr, $params] = $this->callBuildUpdate(['$inc' => ['count' => 1]]);
+        $this->assertStringContainsString('jsonb_set', $expr);
+        $this->assertStringContainsString('COALESCE', $expr);
+        $this->assertStringContainsString('+ ?', $expr);
+        $this->assertSame(['{count}', 1], $params);
+    }
+
+    public function testBuildUpdateIncNested(): void
+    {
+        [$expr, $params] = $this->callBuildUpdate(['$inc' => ['stats.views' => 5]]);
+        $this->assertContains('{stats,views}', $params);
+        $this->assertStringContainsString("data->'stats'->>'views'", $expr);
+    }
+
+    public function testBuildUpdateUnsetTopLevel(): void
+    {
+        [$expr, $params] = $this->callBuildUpdate(['$unset' => ['old_field' => '']]);
+        $this->assertStringContainsString('- ?', $expr);
+        $this->assertSame(['old_field'], $params);
+    }
+
+    public function testBuildUpdateUnsetNested(): void
+    {
+        [$expr, $params] = $this->callBuildUpdate(['$unset' => ['nested.field' => '']]);
+        $this->assertStringContainsString('#- ?::text[]', $expr);
+        $this->assertSame(['{nested,field}'], $params);
+    }
+
+    public function testBuildUpdateMul(): void
+    {
+        [$expr, $params] = $this->callBuildUpdate(['$mul' => ['price' => 1.1]]);
+        $this->assertStringContainsString('jsonb_set', $expr);
+        $this->assertStringContainsString('* ?', $expr);
+        $this->assertSame(['{price}', 1.1], $params);
+    }
+
+    public function testBuildUpdateRename(): void
+    {
+        [$expr, $params] = $this->callBuildUpdate(['$rename' => ['old_name' => 'new_name']]);
+        $this->assertStringContainsString('jsonb_set', $expr);
+        $this->assertStringContainsString('- ?', $expr);
+        $this->assertSame(['old_name', '{new_name}'], $params);
+    }
+
+    public function testBuildUpdateCombinedSetIncUnset(): void
+    {
+        [$expr, $params] = $this->callBuildUpdate([
+            '$set' => ['name' => 'new'],
+            '$inc' => ['count' => 1],
+            '$unset' => ['temp' => ''],
+        ]);
+        $this->assertStringContainsString('|| ?::jsonb', $expr);
+        $this->assertStringContainsString('- ?', $expr);
+        $this->assertStringContainsString('jsonb_set', $expr);
+        $this->assertSame(json_encode(['name' => 'new']), $params[0]);
+        $this->assertContains('temp', $params);
+        $this->assertContains(1, $params);
+    }
+
+    public function testBuildUpdateSetInDocUpdate(): void
+    {
+        $pdo = $this->makeMockPDO();
+        $stmt = $this->makeMockStmt([], 1);
+        $pdo->expects($this->once())->method('prepare')
+            ->with($this->callback(function (string $sql) {
+                $this->assertStringContainsString('|| ?::jsonb', $sql);
+                $this->assertStringContainsString('UPDATE users SET data =', $sql);
+                return true;
+            }))
+            ->willReturn($stmt);
+
+        Utils::docUpdate($pdo, 'users', ['status' => 'old'], ['$set' => ['status' => 'new']]);
+    }
+
+    public function testBuildUpdateIncInDocUpdateOne(): void
+    {
+        $pdo = $this->makeMockPDO();
+        $stmt = $this->makeMockStmt([], 1);
+        $pdo->expects($this->once())->method('prepare')
+            ->with($this->callback(function (string $sql) {
+                $this->assertStringContainsString('jsonb_set', $sql);
+                $this->assertStringContainsString('COALESCE', $sql);
+                return true;
+            }))
+            ->willReturn($stmt);
+
+        Utils::docUpdateOne($pdo, 'users', ['name' => 'alice'], ['$inc' => ['score' => 10]]);
+    }
+
+    public function testBuildUpdateInvalidFieldKey(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('Invalid field key');
+        $this->callBuildUpdate(['$inc' => ['bad;field' => 1]]);
+    }
+
+    // ========================================================================
+    // Array update operators ($push, $pull, $addToSet)
+    // ========================================================================
+
+    public function testBuildUpdatePushString(): void
+    {
+        [$expr, $params] = $this->callBuildUpdate(['$push' => ['tags' => 'new_tag']]);
+        $this->assertStringContainsString('jsonb_set', $expr);
+        $this->assertStringContainsString('COALESCE', $expr);
+        $this->assertStringContainsString('to_jsonb(?::text)', $expr);
+        $this->assertSame(['{tags}', 'new_tag'], $params);
+    }
+
+    public function testBuildUpdatePushNumber(): void
+    {
+        [$expr, $params] = $this->callBuildUpdate(['$push' => ['scores' => 99]]);
+        $this->assertStringContainsString('to_jsonb(?::numeric)', $expr);
+        $this->assertSame(['{scores}', 99], $params);
+    }
+
+    public function testBuildUpdatePull(): void
+    {
+        [$expr, $params] = $this->callBuildUpdate(['$pull' => ['tags' => 'old_tag']]);
+        $this->assertStringContainsString('jsonb_agg(elem)', $expr);
+        $this->assertStringContainsString('WHERE elem !=', $expr);
+        $this->assertSame(['{tags}', 'old_tag'], $params);
+    }
+
+    public function testBuildUpdateAddToSet(): void
+    {
+        [$expr, $params] = $this->callBuildUpdate(['$addToSet' => ['tags' => 'maybe']]);
+        $this->assertStringContainsString('CASE WHEN', $expr);
+        $this->assertStringContainsString('@>', $expr);
+        $this->assertSame(['{tags}', 'maybe', 'maybe'], $params);
+    }
+
+    public function testBuildUpdatePushInDocUpdate(): void
+    {
+        $pdo = $this->makeMockPDO();
+        $stmt = $this->makeMockStmt([], 1);
+        $pdo->expects($this->once())->method('prepare')
+            ->with($this->callback(function (string $sql) {
+                $this->assertStringContainsString('jsonb_set', $sql);
+                $this->assertStringContainsString('COALESCE', $sql);
+                return true;
+            }))
+            ->willReturn($stmt);
+
+        Utils::docUpdate($pdo, 'users', ['name' => 'alice'], ['$push' => ['tags' => 'python']]);
+    }
+
+    public function testBuildUpdateCombinedSetPush(): void
+    {
+        [$expr, $params] = $this->callBuildUpdate([
+            '$set' => ['name' => 'new'],
+            '$push' => ['tags' => 'added'],
+        ]);
+        $this->assertStringContainsString('|| ?::jsonb', $expr);
+        $this->assertStringContainsString('jsonb_set', $expr);
+    }
+
+    // ========================================================================
+    // docFindOneAndUpdate
+    // ========================================================================
+
+    public function testDocFindOneAndUpdateReturnsDocument(): void
+    {
+        $row = ['_id' => 'uuid-1', 'data' => '{"name":"alice","score":10}', 'created_at' => '2026-01-01'];
+
+        $pdo = $this->makeMockPDO();
+        $stmt = $this->makeMockStmt([$row]);
+        $pdo->expects($this->once())->method('prepare')
+            ->with($this->callback(function (string $sql) {
+                $this->assertStringContainsString('WITH target AS', $sql);
+                $this->assertStringContainsString('RETURNING', $sql);
+                return true;
+            }))
+            ->willReturn($stmt);
+
+        $result = Utils::docFindOneAndUpdate($pdo, 'users', ['name' => 'alice'], ['$inc' => ['score' => 5]]);
+        $this->assertSame($row, $result);
+    }
+
+    public function testDocFindOneAndUpdateReturnsNullNoMatch(): void
+    {
+        $pdo = $this->makeMockPDO();
+        $stmt = $this->createMock(\PDOStatement::class);
+        $stmt->method('execute')->willReturn(true);
+        $stmt->method('fetch')->willReturn(false);
+        $pdo->method('prepare')->willReturn($stmt);
+
+        $result = Utils::docFindOneAndUpdate($pdo, 'users', ['name' => 'nobody'], ['status' => 'new']);
+        $this->assertNull($result);
+    }
+
+    public function testDocFindOneAndUpdatePlainUpdate(): void
+    {
+        $row = ['_id' => 'uuid-1', 'data' => '{"name":"alice"}', 'created_at' => '2026-01-01'];
+
+        $pdo = $this->makeMockPDO();
+        $stmt = $this->makeMockStmt([$row]);
+        $pdo->expects($this->once())->method('prepare')
+            ->with($this->callback(function (string $sql) {
+                $this->assertStringContainsString('|| ?::jsonb', $sql);
+                $this->assertStringContainsString('RETURNING', $sql);
+                return true;
+            }))
+            ->willReturn($stmt);
+
+        Utils::docFindOneAndUpdate($pdo, 'users', ['name' => 'alice'], ['status' => 'updated']);
+    }
+
+    public function testDocFindOneAndUpdateWithOperatorUpdate(): void
+    {
+        $row = ['_id' => 'uuid-1', 'data' => '{"name":"alice","score":15}', 'created_at' => '2026-01-01'];
+
+        $pdo = $this->makeMockPDO();
+        $stmt = $this->makeMockStmt([$row]);
+        $pdo->expects($this->once())->method('prepare')
+            ->with($this->callback(function (string $sql) {
+                $this->assertStringContainsString('jsonb_set', $sql);
+                $this->assertStringContainsString('COALESCE', $sql);
+                $this->assertStringContainsString('RETURNING', $sql);
+                return true;
+            }))
+            ->willReturn($stmt);
+
+        Utils::docFindOneAndUpdate($pdo, 'users', ['name' => 'alice'], ['$inc' => ['score' => 5]]);
+    }
+
+    public function testDocFindOneAndUpdateInvalidCollection(): void
+    {
+        $pdo = $this->makeMockPDO();
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('Invalid identifier');
+        Utils::docFindOneAndUpdate($pdo, 'bad; name', [], ['a' => 1]);
+    }
+
+    // ========================================================================
+    // docFindOneAndDelete
+    // ========================================================================
+
+    public function testDocFindOneAndDeleteReturnsDocument(): void
+    {
+        $row = ['_id' => 'uuid-1', 'data' => '{"name":"alice"}', 'created_at' => '2026-01-01'];
+
+        $pdo = $this->makeMockPDO();
+        $stmt = $this->makeMockStmt([$row]);
+        $pdo->expects($this->once())->method('prepare')
+            ->with($this->callback(function (string $sql) {
+                $this->assertStringContainsString('WITH target AS', $sql);
+                $this->assertStringContainsString('DELETE FROM', $sql);
+                $this->assertStringContainsString('RETURNING', $sql);
+                return true;
+            }))
+            ->willReturn($stmt);
+
+        $result = Utils::docFindOneAndDelete($pdo, 'users', ['name' => 'alice']);
+        $this->assertSame($row, $result);
+    }
+
+    public function testDocFindOneAndDeleteReturnsNullNoMatch(): void
+    {
+        $pdo = $this->makeMockPDO();
+        $stmt = $this->createMock(\PDOStatement::class);
+        $stmt->method('execute')->willReturn(true);
+        $stmt->method('fetch')->willReturn(false);
+        $pdo->method('prepare')->willReturn($stmt);
+
+        $result = Utils::docFindOneAndDelete($pdo, 'users', ['name' => 'nobody']);
+        $this->assertNull($result);
+    }
+
+    public function testDocFindOneAndDeleteInvalidCollection(): void
+    {
+        $pdo = $this->makeMockPDO();
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('Invalid identifier');
+        Utils::docFindOneAndDelete($pdo, 'bad; name', []);
+    }
+
+    // ========================================================================
+    // docDistinct
+    // ========================================================================
+
+    public function testDocDistinctBasic(): void
+    {
+        $rows = [['active'], ['inactive']];
+
+        $pdo = $this->makeMockPDO();
+        $stmt = $this->createMock(\PDOStatement::class);
+        $stmt->method('execute')->willReturn(true);
+        $stmt->method('fetchAll')->willReturn($rows);
+        $pdo->expects($this->once())->method('prepare')
+            ->with($this->callback(function (string $sql) {
+                $this->assertStringContainsString('SELECT DISTINCT', $sql);
+                $this->assertStringContainsString("data->>'status'", $sql);
+                $this->assertStringContainsString('IS NOT NULL', $sql);
+                return true;
+            }))
+            ->willReturn($stmt);
+
+        $result = Utils::docDistinct($pdo, 'users', 'status');
+        $this->assertSame(['active', 'inactive'], $result);
+    }
+
+    public function testDocDistinctDotNotation(): void
+    {
+        $rows = [['NYC'], ['LA']];
+
+        $pdo = $this->makeMockPDO();
+        $stmt = $this->createMock(\PDOStatement::class);
+        $stmt->method('execute')->willReturn(true);
+        $stmt->method('fetchAll')->willReturn($rows);
+        $pdo->expects($this->once())->method('prepare')
+            ->with($this->callback(function (string $sql) {
+                $this->assertStringContainsString("data->'address'->>'city'", $sql);
+                return true;
+            }))
+            ->willReturn($stmt);
+
+        $result = Utils::docDistinct($pdo, 'users', 'address.city');
+        $this->assertSame(['NYC', 'LA'], $result);
+    }
+
+    public function testDocDistinctWithFilter(): void
+    {
+        $rows = [['active']];
+
+        $pdo = $this->makeMockPDO();
+        $stmt = $this->createMock(\PDOStatement::class);
+        $stmt->method('execute')->willReturn(true);
+        $stmt->method('fetchAll')->willReturn($rows);
+        $pdo->expects($this->once())->method('prepare')
+            ->with($this->callback(function (string $sql) {
+                $this->assertStringContainsString('SELECT DISTINCT', $sql);
+                $this->assertStringContainsString('IS NOT NULL', $sql);
+                $this->assertStringContainsString("::numeric > ?", $sql);
+                return true;
+            }))
+            ->willReturn($stmt);
+
+        $result = Utils::docDistinct($pdo, 'users', 'status', ['age' => ['$gt' => 25]]);
+        $this->assertSame(['active'], $result);
+    }
+
+    public function testDocDistinctNoFilter(): void
+    {
+        $pdo = $this->makeMockPDO();
+        $stmt = $this->createMock(\PDOStatement::class);
+        $stmt->method('execute')->willReturn(true);
+        $stmt->method('fetchAll')->willReturn([]);
+        $pdo->expects($this->once())->method('prepare')
+            ->with($this->callback(function (string $sql) {
+                $this->assertStringContainsString('SELECT DISTINCT', $sql);
+                $this->assertStringContainsString('IS NOT NULL', $sql);
+                return true;
+            }))
+            ->willReturn($stmt);
+
+        Utils::docDistinct($pdo, 'users', 'status');
+    }
+
+    public function testDocDistinctInvalidField(): void
+    {
+        $pdo = $this->makeMockPDO();
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('Invalid filter key');
+        Utils::docDistinct($pdo, 'users', 'bad;field');
+    }
+
+    public function testDocDistinctInvalidCollection(): void
+    {
+        $pdo = $this->makeMockPDO();
+        $this->expectException(\InvalidArgumentException::class);
+        Utils::docDistinct($pdo, 'bad table', 'status');
+    }
 }

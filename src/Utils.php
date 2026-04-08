@@ -799,7 +799,32 @@ class Utils
         $params = [];
 
         foreach ($filter as $key => $value) {
-            if (is_array($value) && !array_is_list($value) && self::hasOperators($value)) {
+            if ($key === '$or' || $key === '$and') {
+                if (!is_array($value) || !array_is_list($value) || count($value) === 0) {
+                    throw new \InvalidArgumentException("{$key} value must be a non-empty array");
+                }
+                $joiner = $key === '$or' ? ' OR ' : ' AND ';
+                $subClauses = [];
+                foreach ($value as $subFilter) {
+                    [$sc, $sp] = self::buildFilter($subFilter);
+                    if ($sc !== '') {
+                        $subClauses[] = $sc;
+                        array_push($params, ...$sp);
+                    }
+                }
+                if (count($subClauses) > 0) {
+                    $opClauses[] = '(' . implode($joiner, $subClauses) . ')';
+                }
+            } elseif ($key === '$not') {
+                if (!is_array($value) || array_is_list($value)) {
+                    throw new \InvalidArgumentException('$not value must be a filter object');
+                }
+                [$sc, $sp] = self::buildFilter($value);
+                if ($sc !== '') {
+                    $opClauses[] = "NOT ({$sc})";
+                    array_push($params, ...$sp);
+                }
+            } elseif (is_array($value) && !array_is_list($value) && self::hasOperators($value)) {
                 $fp = self::fieldPath($key);
 
                 foreach ($value as $op => $operand) {
@@ -873,6 +898,167 @@ class Utils
             }
         }
         return false;
+    }
+
+    private static function fieldPathJson(string $key): string
+    {
+        $parts = explode('.', $key);
+        foreach ($parts as $part) {
+            if (!preg_match('/^[a-zA-Z_][a-zA-Z0-9_]*$/', $part)) {
+                throw new \InvalidArgumentException("Invalid field key: {$key}");
+            }
+        }
+        $chain = 'data';
+        foreach ($parts as $part) {
+            $chain .= "->'{$part}'";
+        }
+        return $chain;
+    }
+
+    private static function jsonbPath(string $key): string
+    {
+        $parts = explode('.', $key);
+        foreach ($parts as $part) {
+            if (!preg_match('/^[a-zA-Z_][a-zA-Z0-9_]*$/', $part)) {
+                throw new \InvalidArgumentException("Invalid field key: {$key}");
+            }
+        }
+        return '{' . implode(',', $parts) . '}';
+    }
+
+    private static function toJsonbExpr($value): array
+    {
+        if (is_bool($value)) {
+            return ['to_jsonb(?::boolean)', $value ? 'true' : 'false'];
+        } elseif (is_int($value) || is_float($value)) {
+            return ['to_jsonb(?::numeric)', $value];
+        } elseif (is_string($value)) {
+            return ['to_jsonb(?::text)', $value];
+        } else {
+            return ['?::jsonb', json_encode($value)];
+        }
+    }
+
+    private static function buildUpdate(array $update): array
+    {
+        if (!self::hasOperators($update)) {
+            return ['data || ?::jsonb', [json_encode($update)]];
+        }
+
+        $expr = 'data';
+        $params = [];
+
+        if (isset($update['$set'])) {
+            $expr = "({$expr} || ?::jsonb)";
+            $params[] = json_encode($update['$set']);
+        }
+
+        if (isset($update['$unset'])) {
+            foreach ($update['$unset'] as $field => $ignored) {
+                $parts = explode('.', $field);
+                foreach ($parts as $part) {
+                    if (!preg_match('/^[a-zA-Z_][a-zA-Z0-9_]*$/', $part)) {
+                        throw new \InvalidArgumentException("Invalid field key: {$field}");
+                    }
+                }
+                if (count($parts) === 1) {
+                    $expr = "({$expr} - ?)";
+                    $params[] = $field;
+                } else {
+                    $path = '{' . implode(',', $parts) . '}';
+                    $expr = "({$expr} #- ?::text[])";
+                    $params[] = $path;
+                }
+            }
+        }
+
+        if (isset($update['$inc'])) {
+            foreach ($update['$inc'] as $field => $amount) {
+                $jp = self::jsonbPath($field);
+                $fp = self::fieldPath($field);
+                $expr = "jsonb_set({$expr}, ?::text[], to_jsonb(COALESCE(({$fp})::numeric, 0) + ?))";
+                $params[] = $jp;
+                $params[] = $amount;
+            }
+        }
+
+        if (isset($update['$mul'])) {
+            foreach ($update['$mul'] as $field => $factor) {
+                $jp = self::jsonbPath($field);
+                $fp = self::fieldPath($field);
+                $expr = "jsonb_set({$expr}, ?::text[], to_jsonb(COALESCE(({$fp})::numeric, 0) * ?))";
+                $params[] = $jp;
+                $params[] = $factor;
+            }
+        }
+
+        if (isset($update['$rename'])) {
+            foreach ($update['$rename'] as $oldName => $newName) {
+                foreach (explode('.', $oldName) as $part) {
+                    if (!preg_match('/^[a-zA-Z_][a-zA-Z0-9_]*$/', $part)) {
+                        throw new \InvalidArgumentException("Invalid field key: {$oldName}");
+                    }
+                }
+                foreach (explode('.', $newName) as $part) {
+                    if (!preg_match('/^[a-zA-Z_][a-zA-Z0-9_]*$/', $part)) {
+                        throw new \InvalidArgumentException("Invalid field key: {$newName}");
+                    }
+                }
+                $oldJson = self::fieldPathJson($oldName);
+                $newJp = self::jsonbPath($newName);
+                if (str_contains($oldName, '.')) {
+                    $oldPath = '{' . implode(',', explode('.', $oldName)) . '}';
+                    $expr = "jsonb_set(({$expr} #- ?::text[]), ?::text[], {$oldJson})";
+                    $params[] = $oldPath;
+                    $params[] = $newJp;
+                } else {
+                    $expr = "jsonb_set(({$expr} - ?), ?::text[], {$oldJson})";
+                    $params[] = $oldName;
+                    $params[] = $newJp;
+                }
+            }
+        }
+
+        if (isset($update['$push'])) {
+            foreach ($update['$push'] as $field => $value) {
+                $jp = self::jsonbPath($field);
+                $fj = self::fieldPathJson($field);
+                [$valExpr, $valParam] = self::toJsonbExpr($value);
+                $expr = "jsonb_set({$expr}, ?::text[], COALESCE({$fj}, '[]'::jsonb) || {$valExpr})";
+                $params[] = $jp;
+                $params[] = $valParam;
+            }
+        }
+
+        if (isset($update['$pull'])) {
+            foreach ($update['$pull'] as $field => $value) {
+                $jp = self::jsonbPath($field);
+                $fj = self::fieldPathJson($field);
+                [$valExpr, $valParam] = self::toJsonbExpr($value);
+                $expr = "jsonb_set({$expr}, ?::text[], "
+                    . "COALESCE((SELECT jsonb_agg(elem) FROM jsonb_array_elements({$fj}) AS elem "
+                    . "WHERE elem != {$valExpr}), '[]'::jsonb))";
+                $params[] = $jp;
+                $params[] = $valParam;
+            }
+        }
+
+        if (isset($update['$addToSet'])) {
+            foreach ($update['$addToSet'] as $field => $value) {
+                $jp = self::jsonbPath($field);
+                $fj = self::fieldPathJson($field);
+                [$valExpr, $valParam] = self::toJsonbExpr($value);
+                $expr = "jsonb_set({$expr}, ?::text[], "
+                    . "CASE WHEN COALESCE({$fj}, '[]'::jsonb) @> {$valExpr} "
+                    . "THEN {$fj} "
+                    . "ELSE COALESCE({$fj}, '[]'::jsonb) || {$valExpr} END)";
+                $params[] = $jp;
+                $params[] = $valParam;
+                $params[] = $valParam;
+            }
+        }
+
+        return [$expr, $params];
     }
 
     private static function ensureCollection(\PDO $pdo, string $collection): void
@@ -964,11 +1150,12 @@ class Utils
     public static function docUpdate(\PDO $pdo, string $collection, array $filter, array $update): int
     {
         self::validateIdentifier($collection);
-        [$clause, $params] = self::buildFilter($filter);
+        [$clause, $filterParams] = self::buildFilter($filter);
+        [$updateExpr, $updateParams] = self::buildUpdate($update);
         $where = $clause !== '' ? $clause : 'TRUE';
-        $allParams = [json_encode($update), ...$params];
+        $allParams = [...$updateParams, ...$filterParams];
         $stmt = $pdo->prepare(
-            "UPDATE {$collection} SET data = data || ?::jsonb WHERE {$where}"
+            "UPDATE {$collection} SET data = {$updateExpr} WHERE {$where}"
         );
         $stmt->execute($allParams);
         return $stmt->rowCount();
@@ -977,13 +1164,14 @@ class Utils
     public static function docUpdateOne(\PDO $pdo, string $collection, array $filter, array $update): int
     {
         self::validateIdentifier($collection);
-        [$clause, $params] = self::buildFilter($filter);
+        [$clause, $filterParams] = self::buildFilter($filter);
+        [$updateExpr, $updateParams] = self::buildUpdate($update);
         $where = $clause !== '' ? $clause : 'TRUE';
-        $allParams = [...$params, json_encode($update)];
+        $allParams = [...$filterParams, ...$updateParams];
         $stmt = $pdo->prepare(
             "WITH target AS ("
             . "SELECT _id FROM {$collection} WHERE {$where} LIMIT 1"
-            . ") UPDATE {$collection} SET data = data || ?::jsonb "
+            . ") UPDATE {$collection} SET data = {$updateExpr} "
             . "FROM target WHERE {$collection}._id = target._id"
         );
         $stmt->execute($allParams);
@@ -1027,6 +1215,58 @@ class Utils
         $stmt = $pdo->prepare($sql);
         $stmt->execute($params);
         return (int) $stmt->fetchColumn();
+    }
+
+    public static function docFindOneAndUpdate(\PDO $pdo, string $collection, array $filter, array $update): ?array
+    {
+        self::validateIdentifier($collection);
+        [$clause, $filterParams] = self::buildFilter($filter);
+        [$updateExpr, $updateParams] = self::buildUpdate($update);
+        $cteWhere = $clause !== '' ? " WHERE {$clause}" : '';
+        $sql = "WITH target AS ("
+            . "SELECT _id FROM {$collection}{$cteWhere} LIMIT 1"
+            . ") UPDATE {$collection} SET data = {$updateExpr} FROM target "
+            . "WHERE {$collection}._id = target._id "
+            . "RETURNING {$collection}._id, {$collection}.data, {$collection}.created_at";
+        $allParams = [...$filterParams, ...$updateParams];
+        $stmt = $pdo->prepare($sql);
+        $stmt->execute($allParams);
+        $row = $stmt->fetch(\PDO::FETCH_ASSOC);
+        return $row !== false ? $row : null;
+    }
+
+    public static function docFindOneAndDelete(\PDO $pdo, string $collection, array $filter): ?array
+    {
+        self::validateIdentifier($collection);
+        [$clause, $filterParams] = self::buildFilter($filter);
+        $cteWhere = $clause !== '' ? " WHERE {$clause}" : '';
+        $sql = "WITH target AS ("
+            . "SELECT _id FROM {$collection}{$cteWhere} LIMIT 1"
+            . ") DELETE FROM {$collection} USING target "
+            . "WHERE {$collection}._id = target._id "
+            . "RETURNING {$collection}._id, {$collection}.data, {$collection}.created_at";
+        $stmt = $pdo->prepare($sql);
+        $stmt->execute($filterParams);
+        $row = $stmt->fetch(\PDO::FETCH_ASSOC);
+        return $row !== false ? $row : null;
+    }
+
+    public static function docDistinct(\PDO $pdo, string $collection, string $field, ?array $filter = null): array
+    {
+        self::validateIdentifier($collection);
+        $fieldExpr = self::fieldPath($field);
+        $sql = "SELECT DISTINCT {$fieldExpr} FROM {$collection}";
+        $params = [];
+        $whereParts = ["{$fieldExpr} IS NOT NULL"];
+        [$filterClause, $filterParams] = self::buildFilter($filter);
+        if ($filterClause !== '') {
+            $whereParts[] = $filterClause;
+            array_push($params, ...$filterParams);
+        }
+        $sql .= " WHERE " . implode(' AND ', $whereParts);
+        $stmt = $pdo->prepare($sql);
+        $stmt->execute($params);
+        return array_column($stmt->fetchAll(\PDO::FETCH_NUM), 0);
     }
 
     public static function docAggregate(\PDO $pdo, string $collection, array $pipeline): array
