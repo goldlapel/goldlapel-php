@@ -1595,6 +1595,52 @@ class DocTest extends TestCase
     }
 
     // ========================================================================
+    // docCreateCollection
+    // ========================================================================
+
+    public function testDocCreateCollectionCreatesRegularTable(): void
+    {
+        $execCalls = [];
+        $pdo = $this->makeMockPDO();
+        $pdo->method('exec')->willReturnCallback(function ($sql) use (&$execCalls) {
+            $execCalls[] = $sql;
+            return 0;
+        });
+
+        Utils::docCreateCollection($pdo, 'users');
+
+        $this->assertCount(1, $execCalls);
+        $this->assertStringContainsString('CREATE TABLE IF NOT EXISTS users', $execCalls[0]);
+        $this->assertStringNotContainsString('UNLOGGED', $execCalls[0]);
+        $this->assertStringContainsString('_id UUID PRIMARY KEY', $execCalls[0]);
+        $this->assertStringContainsString('data JSONB NOT NULL', $execCalls[0]);
+        $this->assertStringContainsString('created_at TIMESTAMPTZ', $execCalls[0]);
+    }
+
+    public function testDocCreateCollectionCreatesUnloggedTable(): void
+    {
+        $execCalls = [];
+        $pdo = $this->makeMockPDO();
+        $pdo->method('exec')->willReturnCallback(function ($sql) use (&$execCalls) {
+            $execCalls[] = $sql;
+            return 0;
+        });
+
+        Utils::docCreateCollection($pdo, 'ephemeral', true);
+
+        $this->assertCount(1, $execCalls);
+        $this->assertStringContainsString('CREATE UNLOGGED TABLE IF NOT EXISTS ephemeral', $execCalls[0]);
+        $this->assertStringNotContainsString('CREATE TABLE IF NOT EXISTS', $execCalls[0]);
+    }
+
+    public function testDocCreateCollectionInvalidCollection(): void
+    {
+        $pdo = $this->makeMockPDO();
+        $this->expectException(\InvalidArgumentException::class);
+        Utils::docCreateCollection($pdo, 'bad table');
+    }
+
+    // ========================================================================
     // docCreateCapped
     // ========================================================================
 

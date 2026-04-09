@@ -1105,14 +1105,26 @@ class Utils
         return [$expr, $params];
     }
 
-    private static function ensureCollection(\PDO $pdo, string $collection): void
+    private static function ensureCollection(\PDO $pdo, string $collection, bool $unlogged = false): void
     {
+        $prefix = $unlogged ? 'CREATE UNLOGGED TABLE' : 'CREATE TABLE';
         $pdo->exec(
-            "CREATE TABLE IF NOT EXISTS {$collection} ("
+            "{$prefix} IF NOT EXISTS {$collection} ("
             . "_id UUID PRIMARY KEY DEFAULT gen_random_uuid(), "
             . "data JSONB NOT NULL, "
             . "created_at TIMESTAMPTZ DEFAULT NOW())"
         );
+    }
+
+    /**
+     * Explicitly create a collection table. Like MongoDB createCollection().
+     * Optionally creates an UNLOGGED table for high-throughput ephemeral data.
+     * UNLOGGED tables are not crash-safe but significantly faster for writes.
+     */
+    public static function docCreateCollection(\PDO $pdo, string $collection, bool $unlogged = false): void
+    {
+        self::validateIdentifier($collection);
+        self::ensureCollection($pdo, $collection, $unlogged);
     }
 
     public static function docInsert(\PDO $pdo, string $collection, array $document): array

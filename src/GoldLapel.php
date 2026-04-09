@@ -334,6 +334,11 @@ class GoldLapel
         Utils::docRemoveTtlIndex($this->pdo(), $collection);
     }
 
+    public function docCreateCollection(string $collection, bool $unlogged = false): void
+    {
+        Utils::docCreateCollection($this->pdo(), $collection, $unlogged);
+    }
+
     public function docCreateCapped(string $collection, int $maxDocuments): void
     {
         Utils::docCreateCapped($this->pdo(), $collection, $maxDocuments);
