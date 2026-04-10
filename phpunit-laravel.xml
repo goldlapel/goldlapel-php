@@ -1,12 +1,13 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <phpunit xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
          xsi:noNamespaceSchemaLocation="vendor/phpunit/phpunit/phpunit.xsd"
+         bootstrap="tests/Laravel/bootstrap.php"
          colors="true"
          cacheDirectory=".phpunit.cache">
     <testsuites>
-        <testsuite name="default">
-            <directory>tests</directory>
-            <exclude>tests/Laravel</exclude>
+        <testsuite name="laravel">
+            <directory>tests/Laravel</directory>
+            <exclude>tests/Laravel/bootstrap.php</exclude>
         </testsuite>
     </testsuites>
 </phpunit>
