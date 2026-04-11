@@ -133,8 +133,7 @@ class UtilsTest extends TestCase
 
         $pdo = $this->makeMockPDO();
         $stmt = $this->makeMockStmt($rows);
-        $pdo->expects($this->once())->method('exec')
-            ->with('CREATE EXTENSION IF NOT EXISTS pg_trgm');
+        $pdo->expects($this->never())->method('exec');
         $pdo->expects($this->once())->method('prepare')
             ->with($this->callback(function (string $sql) {
                 $this->assertStringContainsString('similarity(name, ?)', $sql);
@@ -155,7 +154,6 @@ class UtilsTest extends TestCase
     {
         $pdo = $this->makeMockPDO();
         $stmt = $this->makeMockStmt([]);
-        $pdo->method('exec');
         $pdo->method('prepare')->willReturn($stmt);
         $stmt->expects($this->once())->method('execute')
             ->with(['helo', 'helo', 0.5, 20]);
@@ -187,13 +185,7 @@ class UtilsTest extends TestCase
 
         $pdo = $this->makeMockPDO();
         $stmt = $this->makeMockStmt($rows);
-
-        $execCalls = [];
-        $pdo->method('exec')->willReturnCallback(function ($sql) use (&$execCalls) {
-            $execCalls[] = $sql;
-            return 0;
-        });
-
+        $pdo->expects($this->never())->method('exec');
         $pdo->expects($this->once())->method('prepare')
             ->with($this->callback(function (string $sql) {
                 $this->assertStringContainsString('similarity(name, ?)', $sql);
@@ -208,17 +200,12 @@ class UtilsTest extends TestCase
 
         $result = Utils::searchPhonetic($pdo, 'users', 'name', 'Smyth');
         $this->assertCount(1, $result);
-
-        $this->assertCount(2, $execCalls);
-        $this->assertStringContainsString('fuzzystrmatch', $execCalls[0]);
-        $this->assertStringContainsString('pg_trgm', $execCalls[1]);
     }
 
     public function testSearchPhoneticCustomLimit(): void
     {
         $pdo = $this->makeMockPDO();
         $stmt = $this->makeMockStmt([]);
-        $pdo->method('exec');
         $pdo->method('prepare')->willReturn($stmt);
         $stmt->expects($this->once())->method('execute')
             ->with(['Jones', 'Jones', 10]);
@@ -250,8 +237,7 @@ class UtilsTest extends TestCase
 
         $pdo = $this->makeMockPDO();
         $stmt = $this->makeMockStmt($rows);
-        $pdo->expects($this->once())->method('exec')
-            ->with('CREATE EXTENSION IF NOT EXISTS vector');
+        $pdo->expects($this->never())->method('exec');
         $pdo->expects($this->once())->method('prepare')
             ->with($this->callback(function (string $sql) {
                 $this->assertStringContainsString('embedding <=> ?::vector', $sql);
@@ -272,7 +258,6 @@ class UtilsTest extends TestCase
     {
         $pdo = $this->makeMockPDO();
         $stmt = $this->makeMockStmt([]);
-        $pdo->method('exec');
         $pdo->method('prepare')->willReturn($stmt);
         $stmt->expects($this->once())->method('execute')
             ->with(['[1,2]', 5]);
@@ -284,7 +269,6 @@ class UtilsTest extends TestCase
     {
         $pdo = $this->makeMockPDO();
         $stmt = $this->makeMockStmt([]);
-        $pdo->method('exec');
         $pdo->method('prepare')->willReturn($stmt);
         $stmt->expects($this->once())->method('execute')
             ->with($this->callback(function (array $params) {
@@ -319,8 +303,7 @@ class UtilsTest extends TestCase
 
         $pdo = $this->makeMockPDO();
         $stmt = $this->makeMockStmt($rows);
-        $pdo->expects($this->once())->method('exec')
-            ->with('CREATE EXTENSION IF NOT EXISTS pg_trgm');
+        $pdo->expects($this->never())->method('exec');
         $pdo->expects($this->once())->method('prepare')
             ->with($this->callback(function (string $sql) {
                 $this->assertStringContainsString('similarity(name, ?)', $sql);
@@ -341,7 +324,6 @@ class UtilsTest extends TestCase
     {
         $pdo = $this->makeMockPDO();
         $stmt = $this->makeMockStmt([]);
-        $pdo->method('exec');
         $pdo->method('prepare')->willReturn($stmt);
         $stmt->expects($this->once())->method('execute')
             ->with(['py', 'py%', 5]);
@@ -353,7 +335,6 @@ class UtilsTest extends TestCase
     {
         $pdo = $this->makeMockPDO();
         $stmt = $this->makeMockStmt([]);
-        $pdo->method('exec');
         $pdo->method('prepare')->willReturn($stmt);
         $stmt->expects($this->once())->method('execute')
             ->with(['abc', 'abc%', 10]);
