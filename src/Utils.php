@@ -55,7 +55,6 @@ class Utils
     ): array {
         self::validateIdentifier($table);
         self::validateIdentifier($column);
-        $pdo->exec("CREATE EXTENSION IF NOT EXISTS pg_trgm");
         $stmt = $pdo->prepare("
             SELECT *, similarity({$column}, ?) AS _score
             FROM {$table}
@@ -76,8 +75,6 @@ class Utils
     ): array {
         self::validateIdentifier($table);
         self::validateIdentifier($column);
-        $pdo->exec("CREATE EXTENSION IF NOT EXISTS fuzzystrmatch");
-        $pdo->exec("CREATE EXTENSION IF NOT EXISTS pg_trgm");
         $stmt = $pdo->prepare("
             SELECT *, similarity({$column}, ?) AS _score
             FROM {$table}
@@ -98,7 +95,6 @@ class Utils
     ): array {
         self::validateIdentifier($table);
         self::validateIdentifier($column);
-        $pdo->exec("CREATE EXTENSION IF NOT EXISTS vector");
         $vectorLiteral = '[' . implode(',', $vector) . ']';
         $stmt = $pdo->prepare("
             SELECT *, ({$column} <=> ?::vector) AS _score
@@ -119,7 +115,6 @@ class Utils
     ): array {
         self::validateIdentifier($table);
         self::validateIdentifier($column);
-        $pdo->exec("CREATE EXTENSION IF NOT EXISTS pg_trgm");
         $stmt = $pdo->prepare("
             SELECT *, similarity({$column}, ?) AS _score
             FROM {$table}
@@ -290,7 +285,6 @@ class Utils
         float $lon,
         float $lat,
     ): void {
-        $pdo->exec("CREATE EXTENSION IF NOT EXISTS postgis");
         $pdo->exec("
             CREATE TABLE IF NOT EXISTS {$table} (
                 id BIGSERIAL PRIMARY KEY,
@@ -715,7 +709,6 @@ class Utils
 
     public static function script(\PDO $pdo, string $luaCode, mixed ...$args): ?string
     {
-        $pdo->exec("CREATE EXTENSION IF NOT EXISTS pllua");
         $funcName = "_gl_lua_" . bin2hex(random_bytes(4));
         $params = implode(", ", array_map(fn($i) => "p" . ($i + 1) . " text", range(0, count($args) - 1)));
         $pdo->exec("CREATE OR REPLACE FUNCTION pg_temp.{$funcName}({$params}) RETURNS text LANGUAGE pllua AS \$pllua\$ {$luaCode} \$pllua\$");
