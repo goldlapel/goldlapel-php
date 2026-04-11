@@ -18,7 +18,9 @@
       "GoldLapel\\": "src/",
       "GoldLapel\\Laravel\\": "src/Laravel/"
     },
-    "files": ["src/Laravel/helpers.php"]
+    "files": [
+      "src/Laravel/helpers.php"
+    ]
   },
   "autoload-dev": {
     "psr-4": {
@@ -36,5 +38,5 @@
   "bin": [
     "bin/goldlapel"
   ],
-  "version": "0.1.0-rc19"
+  "version": "0.1.0-rc20"
 }
