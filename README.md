@@ -15,62 +15,55 @@ composer require goldlapel/goldlapel
 ```php
 use GoldLapel\GoldLapel;
 
-// Start the proxy — returns a database connection with L1 cache built in
-$conn = GoldLapel::start('postgresql://user:pass@localhost:5432/mydb');
+// Create a proxy instance and start it
+$gl = new GoldLapel('postgresql://user:pass@localhost:5432/mydb');
+$gl->start();
 
-// Use the connection directly — no PDO or driver setup needed
-$result = $conn->query('SELECT * FROM users WHERE id = $1', [42]);
+// Use the proxy connection directly — no PDO or driver setup needed
+$result = $gl->query('SELECT * FROM users WHERE id = $1', [42]);
 ```
 
 ## API
 
-### `GoldLapel::start(upstream, port?, config?, extraArgs?)`
+### `new GoldLapel(upstream, port?, config?, extraArgs?)`
 
-Starts the Gold Lapel proxy and returns a database connection with L1 cache.
+Creates a Gold Lapel proxy instance.
 
 - `upstream` — your Postgres connection string (e.g. `postgresql://user:pass@localhost:5432/mydb`)
 - `port` — proxy port (default: 7932)
 - `config` — associative array of configuration keys (see [Configuration](#configuration))
 - `extraArgs` — additional CLI flags passed to the binary (e.g. `['--threshold-impact', '5000']`)
 
-### `GoldLapel::stop()`
+### `$gl->start()`
+
+Starts the proxy. Returns the instance for chaining.
+
+### `$gl->stop()`
 
 Stops the proxy. Also called automatically via `register_shutdown_function`.
 
-### `GoldLapel::proxyUrl()`
+### `$gl->proxyUrl()`
 
 Returns the current proxy URL, or `null` if not running.
 
-### `GoldLapel::dashboardUrl()`
+### `$gl->dashboardUrl()`
 
 Returns the dashboard URL (e.g. `http://127.0.0.1:7933`), or `null` if not running. The dashboard port defaults to 7933 and can be changed via `config: ['dashboard_port' => 8080]` or disabled with `0`.
 
-### `new GoldLapel(upstream, port?, config?, extraArgs?)`
-
-Instance API for managing multiple proxies:
-
-```php
-use GoldLapel\GoldLapel;
-
-$proxy = new GoldLapel('postgresql://user:pass@localhost:5432/mydb', 7932);
-$conn = $proxy->startProxy();
-// ...
-$proxy->stopProxy();
-```
-
 ## Configuration
 
-Pass a config array to configure the proxy:
+Pass a config array to the constructor to configure the proxy:
 
 ```php
 use GoldLapel\GoldLapel;
 
-$conn = GoldLapel::start('postgresql://user:pass@localhost/mydb', config: [
+$gl = new GoldLapel('postgresql://user:pass@localhost/mydb', config: [
     'mode' => 'waiter',
     'pool_size' => 50,
     'disable_matviews' => true,
     'replica' => ['postgresql://user:pass@replica1/mydb'],
 ]);
+$gl->start();
 ```
 
 Keys use `snake_case` and map to CLI flags (`pool_size` → `--pool-size`). Boolean keys are flags — `true` enables them. Array keys produce repeated flags.
@@ -78,7 +71,7 @@ Keys use `snake_case` and map to CLI flags (`pool_size` → `--pool-size`). Bool
 Unknown keys throw `InvalidArgumentException`. To see all valid keys:
 
 ```php
-GoldLapel::configKeys()
+GoldLapel::configKeys();
 ```
 
 For the full configuration reference, see the [main documentation](https://github.com/goldlapel/goldlapel#setting-reference).
