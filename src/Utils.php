@@ -629,7 +629,7 @@ class Utils
                 created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
             )
         ");
-        $pdo->exec("CREATE INDEX IF NOT EXISTS {$name}_tsq_idx ON {$name} USING GIN (tsquery)");
+        $pdo->exec("CREATE INDEX IF NOT EXISTS {$name}_tsq_idx ON {$name} USING GIST (tsquery)");
         $stmt = $pdo->prepare("
             INSERT INTO {$name} (query_id, query_text, tsquery, lang, metadata)
             VALUES (?, ?, plainto_tsquery(?, ?), ?, ?)
