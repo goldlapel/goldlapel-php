@@ -15,7 +15,7 @@ Requires PHP 8.0+ and the `pdo_pgsql` extension.
 ## Quick Start
 
 ```php
-use Goldlapel\GoldLapel; // alias also available: GoldLapel\GoldLapel
+use GoldLapel\GoldLapel;
 
 // Start the proxy — returns a ready-to-use GoldLapel instance.
 $gl = GoldLapel::start('postgresql://user:pass@localhost:5432/mydb', [
@@ -140,6 +140,7 @@ Supported `$options` keys:
 |---------------|---------|-------------------------------------------------------------|
 | `port`        | `int`   | Proxy port (default 7932)                                   |
 | `log_level`   | string  | `trace`, `debug`, `info`, `warn`, `error`                   |
+| `silent`      | `bool`  | Suppress the startup banner entirely (default `false` — banner prints to stderr) |
 | `config`      | `array` | Map of proxy config keys (see `GoldLapel::configKeys()`)    |
 | `extra_args`  | `array` | Raw extra CLI flags passed verbatim to the binary           |
 
@@ -163,7 +164,7 @@ construction (e.g. Laravel's service provider).
 - `$gl->cached(): CachedPDO` — internal PDO wrapped with L1 cache
 - `$gl->stop(): void` — stop the proxy (idempotent, auto-called at shutdown)
 
-Plus the full wrapper surface (~54 methods): `docInsert`, `docFind`,
+Plus the full wrapper surface (~61 methods): `docInsert`, `docFind`,
 `docAggregate`, `search`, `searchFuzzy`, `similar`, `publish`, `incr`,
 `zadd`, `hset`, `streamAdd`, `percolate`, `analyze`, etc. Every method
 accepts an optional `conn:` named argument.
