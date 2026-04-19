@@ -197,27 +197,44 @@ namespace GoldLapel {
             NativeCache::reset();
         }
 
-        public static function start(string $upstream, ?int $port = null, array $config = [], array $extraArgs = []): string
+        public static function start(string $upstream, array $options = []): self
         {
-            self::$calls[] = compact('upstream', 'port', 'config', 'extraArgs');
+            self::$calls[] = [
+                'upstream' => $upstream,
+                'port' => $options['port'] ?? self::DEFAULT_PORT,
+                'config' => $options['config'] ?? [],
+                'extraArgs' => $options['extra_args'] ?? [],
+            ];
+            return new self();
+        }
+
+        public static function startProxyOnly(string $upstream, array $options = []): string
+        {
+            $port = $options['port'] ?? self::DEFAULT_PORT;
+            self::$calls[] = [
+                'upstream' => $upstream,
+                'port' => $port,
+                'config' => $options['config'] ?? [],
+                'extraArgs' => $options['extra_args'] ?? [],
+            ];
             return "postgresql://localhost:{$port}/db";
         }
 
-        public static function wrapPDO(\PDO $pdo, ?int $invalidationPort = null): CachedPDO
+        public static function wrapPDOStatic(\PDO $pdo, int $invalidationPort): CachedPDO
         {
             self::$wrapCalls[] = compact('pdo', 'invalidationPort');
 
             $cache = NativeCache::getInstance();
             if (!$cache->isConnected()) {
-                $cache->connectInvalidation($invalidationPort ?? self::DEFAULT_PORT + 2);
+                $cache->connectInvalidation($invalidationPort);
             }
 
             return new CachedPDO($pdo, $cache);
         }
 
-        public static function stop(): void {}
-        public static function proxyUrl(): ?string { return null; }
-        public static function cleanup(): void {}
+        public function stop(): void {}
+        public function url(): ?string { return null; }
+        public static function cleanupAll(): void {}
     }
 }
 

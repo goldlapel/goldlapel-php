@@ -8,6 +8,7 @@ use Illuminate\Support\ServiceProvider;
 
 class GoldLapelServiceProvider extends ServiceProvider
 {
+    /** @var array<string, array{port:int, invalidation_port:?int, instance:?GoldLapel}> */
     private array $glConnections = [];
 
     public function boot(): void
@@ -33,7 +34,13 @@ class GoldLapelServiceProvider extends ServiceProvider
             try {
                 $upstream = buildUpstreamUrl($config);
                 putenv('GOLDLAPEL_CLIENT=laravel');
-                GoldLapel::start($upstream, $port, $glOptions, $extraArgs);
+                // Use the connection-less factory variant — Laravel manages
+                // its own PDOs via the Connection resolver below.
+                GoldLapel::startProxyOnly($upstream, [
+                    'port' => $port,
+                    'config' => $glOptions,
+                    'extra_args' => $extraArgs,
+                ]);
             } catch (\Exception $e) {
                 logger()->warning("Gold Lapel failed to start for connection '{$name}': " . $e->getMessage());
                 continue;

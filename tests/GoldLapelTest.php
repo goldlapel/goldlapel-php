@@ -195,7 +195,10 @@ class GoldLapelTest extends TestCase
         $this->assertFalse(GoldLapel::waitForPort('127.0.0.1', 19999, 0.2));
     }
 
-    // -- GoldLapel class (5 tests) --
+    // -- Construction / state (5 tests) --
+    //
+    // Note: we still test the direct constructor for unit-testing
+    // purposes. Production code should use GoldLapel::start().
 
     public function testDefaultPort(): void
     {
@@ -218,115 +221,37 @@ class GoldLapelTest extends TestCase
     public function testStopNoOp(): void
     {
         $gl = new GoldLapel('postgresql://host:5432/db');
-        $gl->stopProxy();
+        $gl->stop();
         $this->assertFalse($gl->isRunning());
     }
 
     public function testStopIdempotent(): void
     {
         $gl = new GoldLapel('postgresql://host:5432/db');
-        $gl->stopProxy();
-        $gl->stopProxy();
+        $gl->stop();
+        $gl->stop();
         $this->assertFalse($gl->isRunning());
     }
 
-    // -- Static instance management (9 tests) --
+    // -- Factory / cleanup (3 tests) --
 
-    public function testProxyUrlNullWhenNotStarted(): void
+    public function testCleanupAllNoLiveInstances(): void
     {
-        GoldLapel::stop();
-        $this->assertNull(GoldLapel::proxyUrl());
+        // Safe to call cleanupAll() with no instances — should not throw.
+        GoldLapel::cleanupAll();
+        $this->assertTrue(true);
     }
 
-    public function testProxyUrlNullForUnknownUpstream(): void
+    public function testUrlNullBeforeStart(): void
     {
-        GoldLapel::stop();
-        $this->assertNull(GoldLapel::proxyUrl('postgresql://unknown:5432/db'));
+        $gl = new GoldLapel('postgresql://host:5432/db');
+        $this->assertNull($gl->url());
     }
 
-    public function testDashboardUrlNullForUnknownUpstream(): void
+    public function testPdoDsnNullBeforeStart(): void
     {
-        GoldLapel::stop();
-        $this->assertNull(GoldLapel::dashboardUrl('postgresql://unknown:5432/db'));
-    }
-
-    public function testStopSpecificUpstreamNoOp(): void
-    {
-        GoldLapel::stop();
-        GoldLapel::stop('postgresql://unknown:5432/db');
-        $this->assertNull(GoldLapel::proxyUrl());
-    }
-
-    public function testStopAllNoOp(): void
-    {
-        GoldLapel::stop();
-        GoldLapel::stop();
-        $this->assertNull(GoldLapel::proxyUrl());
-    }
-
-    public function testStopAcceptsNullParameter(): void
-    {
-        GoldLapel::stop(null);
-        $this->assertNull(GoldLapel::proxyUrl());
-    }
-
-    public function testCleanupStopsAll(): void
-    {
-        GoldLapel::cleanup();
-        $this->assertNull(GoldLapel::proxyUrl());
-        $this->assertNull(GoldLapel::dashboardUrl());
-    }
-
-    public function testStopResetsNativeCache(): void
-    {
-        $cacheBefore = \GoldLapel\NativeCache::getInstance();
-        $cacheBefore->setConnected(true);
-        $cacheBefore->put('SELECT * FROM users', null, [['id' => '1']], ['id']);
-
-        GoldLapel::stop();
-
-        // After stop, NativeCache singleton should be reset
-        $cacheAfter = \GoldLapel\NativeCache::getInstance();
-        $this->assertNotSame($cacheBefore, $cacheAfter);
-        $this->assertFalse($cacheAfter->isConnected());
-        $this->assertSame(0, $cacheAfter->size());
-    }
-
-    public function testStopSpecificResetsNativeCacheWhenLastInstance(): void
-    {
-        $cache = \GoldLapel\NativeCache::getInstance();
-        $cache->setConnected(true);
-        $cache->put('SELECT * FROM users', null, [['id' => '1']], ['id']);
-
-        // Stop with a specific upstream that doesn't exist — cache should NOT reset
-        // because there might be other instances still running
-        GoldLapel::stop('postgresql://nonexistent:5432/db');
-
-        $cacheSame = \GoldLapel\NativeCache::getInstance();
-        // With no instances, the stop call resets anyway
-        $this->assertNotSame($cache, $cacheSame);
-    }
-
-    public function testStartDoesNotThrowForDifferentUpstream(): void
-    {
-        // The old singleton would throw if called with a different upstream.
-        // The new multi-instance approach should not throw — it will fail
-        // because there's no binary, but it should NOT throw the old
-        // "already running for a different upstream" error.
-        GoldLapel::stop();
-
-        // We can't actually start (no binary), but we can verify the
-        // static state management doesn't reject multiple upstreams.
-        // This is validated by the absence of the old RuntimeException message.
-        $this->assertNull(GoldLapel::proxyUrl('postgresql://host1:5432/db'));
-        $this->assertNull(GoldLapel::proxyUrl('postgresql://host2:5432/db'));
-    }
-
-    public function testProxyUrlReturnsFirstWhenNoUpstreamSpecified(): void
-    {
-        // With no running instances, proxyUrl() should return null
-        GoldLapel::stop();
-        $this->assertNull(GoldLapel::proxyUrl());
+        $gl = new GoldLapel('postgresql://host:5432/db');
+        $this->assertNull($gl->pdoDsn());
     }
 
     // -- configToArgs (12 tests) --
@@ -428,7 +353,7 @@ class GoldLapelTest extends TestCase
         $this->assertFalse($gl->isRunning());
     }
 
-    // -- Dashboard URL (5 tests) --
+    // -- Dashboard URL (4 tests) --
 
     public function testDefaultDashboardPort(): void
     {
@@ -455,12 +380,6 @@ class GoldLapelTest extends TestCase
         $this->assertNull($gl->getDashboardUrl());
     }
 
-    public function testStaticDashboardUrlNullWhenNotStarted(): void
-    {
-        GoldLapel::stop();
-        $this->assertNull(GoldLapel::dashboardUrl());
-    }
-
     // -- configKeys (3 tests) --
 
     public function testConfigKeysReturnsArray(): void
@@ -483,5 +402,31 @@ class GoldLapelTest extends TestCase
     {
         $keys = GoldLapel::configKeys();
         $this->assertCount(42, $keys);
+    }
+
+    // -- urlToPdoDsn (3 tests) --
+
+    public function testUrlToPdoDsnBasic(): void
+    {
+        $this->assertSame(
+            'pgsql:host=localhost;port=7932;dbname=mydb',
+            GoldLapel::urlToPdoDsn('postgresql://user:pass@localhost:7932/mydb')
+        );
+    }
+
+    public function testUrlToPdoDsnWithQueryParams(): void
+    {
+        $this->assertSame(
+            'pgsql:host=localhost;port=7932;dbname=mydb;sslmode=require',
+            GoldLapel::urlToPdoDsn('postgresql://user:pass@localhost:7932/mydb?sslmode=require')
+        );
+    }
+
+    public function testUrlToPdoDsnMinimal(): void
+    {
+        $this->assertSame(
+            'pgsql:host=localhost;port=7932',
+            GoldLapel::urlToPdoDsn('postgresql://localhost:7932')
+        );
     }
 }

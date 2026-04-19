@@ -4,6 +4,22 @@ namespace GoldLapel;
 
 use RuntimeException;
 
+/**
+ * Gold Lapel PHP wrapper — factory API.
+ *
+ * Usage:
+ *     $gl = GoldLapel::start('postgresql://user:pass@db/mydb', [
+ *         'port' => 7932,
+ *         'log_level' => 'info',
+ *     ]);
+ *     $pdo = new PDO($gl->url());
+ *     $hits = $gl->search('articles', 'body', 'postgres tuning');
+ *     $gl->docInsert('events', ['type' => 'signup']);
+ *     $gl->using($pdo, function ($gl) {
+ *         $gl->docInsert('events', ['type' => 'order.created']);
+ *     });
+ *     $gl->stop();
+ */
 class GoldLapel
 {
     const DEFAULT_PORT = 7932;
@@ -51,10 +67,18 @@ class GoldLapel
     private ?string $url = null;
     private ?\PDO $pdo = null;
 
-    /** @var array<string, self> */
-    private static array $instances = [];
+    /** Connection set by using(); takes precedence over $pdo. */
+    private ?\PDO $scopedConn = null;
+
+    /** @var array<int, self> */
+    private static array $liveInstances = [];
     private static bool $cleanupRegistered = false;
 
+    /**
+     * Private constructor — use GoldLapel::start() to create and start an instance.
+     *
+     * Internal users (and tests) can still construct directly.
+     */
     public function __construct(string $upstream, ?int $port = null, array $config = [], array $extraArgs = [])
     {
         $this->upstream = $upstream;
@@ -62,6 +86,88 @@ class GoldLapel
         $this->dashboardPort = isset($config['dashboard_port']) ? (int) $config['dashboard_port'] : self::DEFAULT_DASHBOARD_PORT;
         $this->config = $config;
         $this->extraArgs = $extraArgs;
+    }
+
+    /**
+     * Factory — start a Gold Lapel proxy and return a ready-to-use instance.
+     *
+     * Options (all optional):
+     *   - 'port' (int): proxy port (default 7932)
+     *   - 'log_level' (string): 'trace'|'debug'|'info'|'warn'|'error' — forwarded as --log-level
+     *   - 'config' (array): per-proxy config keys (see configKeys())
+     *   - 'extra_args' (array): raw extra CLI flags
+     *
+     * The options array also accepts any of the keys from configKeys()
+     * directly at the top level — those are merged into 'config'. This makes
+     * `['port' => 7932, 'mode' => 'waiter']` work as well as
+     * `['port' => 7932, 'config' => ['mode' => 'waiter']]`.
+     *
+     * Eagerly opens a PDO connection to the proxy; raises RuntimeException
+     * if pdo_pgsql is not enabled.
+     */
+    public static function start(string $upstream, array $options = []): self
+    {
+        [$port, $config, $extraArgs] = self::parseStartOptions($options);
+
+        $instance = new self($upstream, $port, $config, $extraArgs);
+        $instance->startProxy();
+
+        self::$liveInstances[spl_object_id($instance)] = $instance;
+        if (!self::$cleanupRegistered) {
+            register_shutdown_function([self::class, 'cleanupAll']);
+            self::$cleanupRegistered = true;
+        }
+
+        return $instance;
+    }
+
+    /**
+     * Low-level factory variant: start the proxy and return just the proxy URL.
+     * Useful when you want to manage your own PDO connections, or in
+     * environments (like Laravel's service provider) where PDOs are created
+     * later by the framework.
+     */
+    public static function startProxyOnly(string $upstream, array $options = []): string
+    {
+        [$port, $config, $extraArgs] = self::parseStartOptions($options);
+
+        $instance = new self($upstream, $port, $config, $extraArgs);
+        $instance->startProxyWithoutConnect();
+
+        self::$liveInstances[spl_object_id($instance)] = $instance;
+        if (!self::$cleanupRegistered) {
+            register_shutdown_function([self::class, 'cleanupAll']);
+            self::$cleanupRegistered = true;
+        }
+
+        return $instance->url;
+    }
+
+    private static function parseStartOptions(array $options): array
+    {
+        $port = isset($options['port']) ? (int) $options['port'] : null;
+
+        // Accept either {'config' => [...]} or top-level config keys mixed
+        // into options. 'port', 'log_level', 'extra_args', 'config' are
+        // reserved option keys; everything else is treated as a config key.
+        $config = $options['config'] ?? [];
+        $extraArgs = $options['extra_args'] ?? [];
+
+        $reserved = ['port', 'log_level', 'config', 'extra_args'];
+        foreach ($options as $key => $value) {
+            if (in_array($key, $reserved, true)) {
+                continue;
+            }
+            // Implicit top-level config key
+            $config[$key] = $value;
+        }
+
+        if (isset($options['log_level'])) {
+            $level = (string) $options['log_level'];
+            $extraArgs = array_merge($extraArgs, ['--log-level', $level]);
+        }
+
+        return [$port, $config, $extraArgs];
     }
 
     public static function configToArgs(array $config): array
@@ -115,17 +221,103 @@ class GoldLapel
         return self::VALID_CONFIG_KEYS;
     }
 
+    // ------------------------------------------------------------------
+    // Connection resolution
+    // ------------------------------------------------------------------
+
+    /**
+     * The PDO this instance will use for wrapper method calls by default.
+     * Throws if the proxy hasn't been started (internal PDO not opened).
+     */
     public function pdo(): \PDO
     {
-        if ($this->pdo === null) {
+        $conn = $this->scopedConn ?? $this->pdo;
+        if ($conn === null) {
             throw new RuntimeException(
-                "Not connected. Call startProxy() before using instance methods."
+                'Not connected. Call GoldLapel::start() before using instance methods.'
             );
         }
-        return $this->pdo;
+        return $conn;
     }
 
-    public function startProxy(): string
+    /**
+     * Resolve the connection to use for a single wrapper method call.
+     *
+     * Precedence: explicit $conn argument > using() scope > internal PDO.
+     */
+    private function resolveConn(?\PDO $conn): \PDO
+    {
+        if ($conn !== null) {
+            return $conn;
+        }
+        if ($this->scopedConn !== null) {
+            return $this->scopedConn;
+        }
+        if ($this->pdo !== null) {
+            return $this->pdo;
+        }
+        throw new RuntimeException(
+            'Not connected. Pass conn: or call GoldLapel::start() before using instance methods.'
+        );
+    }
+
+    /**
+     * Run $callback with $connection scoped as the default PDO for any
+     * wrapper method called on this instance during the callback.
+     *
+     * The scope is restored in `finally`, so it survives exceptions.
+     * Supports nesting — the previous scope is restored on exit.
+     *
+     * PHP does not have thread-local storage semantics in typical
+     * synchronous usage; the scope is tracked on this instance. Concurrent
+     * access via ext-pthreads or similar is not supported.
+     *
+     * Example:
+     *     $gl->using($pdo, function ($gl) {
+     *         $pdo->beginTransaction();
+     *         $gl->docInsert('events', ['type' => 'order.created']);
+     *         $pdo->commit();
+     *     });
+     */
+    public function using(\PDO $connection, callable $callback): mixed
+    {
+        $previous = $this->scopedConn;
+        $this->scopedConn = $connection;
+        try {
+            return $callback($this);
+        } finally {
+            $this->scopedConn = $previous;
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Proxy lifecycle
+    // ------------------------------------------------------------------
+
+    private function startProxy(): string
+    {
+        $url = $this->startProxyWithoutConnect();
+
+        if (!extension_loaded('pdo_pgsql')) {
+            // Partial success — keep the proxy running and let the caller
+            // fetch the URL via url(), but raise so they know no PDO is
+            // attached.
+            throw new RuntimeException(
+                'pdo_pgsql extension is not enabled. Install it, or use '
+                . 'GoldLapel::startProxyOnly() if you only need the connection string.'
+            );
+        }
+
+        $dsn = self::urlToPdoDsn($url);
+        $parsed = parse_url($url);
+        $user = isset($parsed['user']) ? rawurldecode($parsed['user']) : null;
+        $pass = isset($parsed['pass']) ? rawurldecode($parsed['pass']) : null;
+        $this->pdo = new \PDO($dsn, $user, $pass);
+
+        return $url;
+    }
+
+    private function startProxyWithoutConnect(): string
     {
         if ($this->process !== null && $this->isRunning()) {
             return $this->url;
@@ -154,7 +346,7 @@ class GoldLapel
         $this->process = proc_open($cmd, $descriptors, $pipes, null, $env);
 
         if (!is_resource($this->process)) {
-            throw new RuntimeException("Failed to start Gold Lapel process");
+            throw new RuntimeException('Failed to start Gold Lapel process');
         }
 
         $stderr = $pipes[2];
@@ -177,14 +369,6 @@ class GoldLapel
             if (self::waitForPort('127.0.0.1', $this->port, 0.5)) {
                 fclose($stderr);
                 $this->url = self::makeProxyUrl($this->upstream, $this->port);
-
-                if (extension_loaded('pdo_pgsql')) {
-                    $dsn = self::urlToPdoDsn($this->url);
-                    $parsed = parse_url($this->url);
-                    $user = isset($parsed['user']) ? rawurldecode($parsed['user']) : null;
-                    $pass = isset($parsed['pass']) ? rawurldecode($parsed['pass']) : null;
-                    $this->pdo = new \PDO($dsn, $user, $pass);
-                }
 
                 if ($this->dashboardPort > 0) {
                     echo "goldlapel → :{$this->port} (proxy) | http://127.0.0.1:{$this->dashboardPort} (dashboard)\n";
@@ -210,21 +394,79 @@ class GoldLapel
         );
     }
 
-    public function stopProxy(): void
+    /**
+     * Stop the proxy for this instance. Idempotent.
+     */
+    public function stop(): void
     {
         $this->pdo = null;
+        $this->scopedConn = null;
 
         if ($this->process === null) {
+            unset(self::$liveInstances[spl_object_id($this)]);
             return;
         }
 
         $this->terminate();
         $this->url = null;
+        unset(self::$liveInstances[spl_object_id($this)]);
+
+        if (empty(self::$liveInstances)) {
+            NativeCache::reset();
+        }
     }
 
-    public function getUrl(): ?string
+    public function __destruct()
+    {
+        // Backup cleanup — the user should call stop() explicitly, but this
+        // prevents orphan goldlapel processes when the instance falls out
+        // of scope.
+        if ($this->process !== null) {
+            try {
+                $this->terminate();
+            } catch (\Throwable $e) {
+                // Destructors must not throw.
+            }
+        }
+    }
+
+    /**
+     * Proxy URL for use with PDO: `new PDO($gl->url())`. Note that PHP's PDO
+     * DSN format is not a postgresql:// URL — this returns the
+     * postgresql://... form, and internally we translate it to a pgsql:
+     * DSN when we open our own connection.
+     *
+     * If the caller wants the PDO DSN directly, use pdoDsn().
+     */
+    public function url(): ?string
     {
         return $this->url;
+    }
+
+    /**
+     * PDO-format DSN string (pgsql:host=...;port=...). Useful for
+     * constructing your own PDO directly.
+     */
+    public function pdoDsn(): ?string
+    {
+        return $this->url !== null ? self::urlToPdoDsn($this->url) : null;
+    }
+
+    /**
+     * Raw PDO user/password tuple parsed from the upstream URL, so callers
+     * who want to new PDO() themselves can pass them alongside pdoDsn().
+     *
+     * @return array{0:?string,1:?string}
+     */
+    public function pdoCredentials(): array
+    {
+        if ($this->url === null) {
+            return [null, null];
+        }
+        $parsed = parse_url($this->url);
+        $user = isset($parsed['user']) ? rawurldecode($parsed['user']) : null;
+        $pass = isset($parsed['pass']) ? rawurldecode($parsed['pass']) : null;
+        return [$user, $pass];
     }
 
     public function getPort(): int
@@ -255,448 +497,45 @@ class GoldLapel
         return $status['running'];
     }
 
-    // -- Instance methods (delegate to Utils with stored PDO) --
+    // ------------------------------------------------------------------
+    // Global cleanup
+    // ------------------------------------------------------------------
 
-    // Document Store
-
-    public function docInsert(string $collection, array $document): array
+    public static function cleanupAll(): void
     {
-        return Utils::docInsert($this->pdo(), $collection, $document);
-    }
-
-    public function docInsertMany(string $collection, array $documents): array
-    {
-        return Utils::docInsertMany($this->pdo(), $collection, $documents);
-    }
-
-    public function docFind(string $collection, ?array $filter = null, ?array $sort = null, ?int $limit = null, ?int $skip = null): array
-    {
-        return Utils::docFind($this->pdo(), $collection, $filter, $sort, $limit, $skip);
-    }
-
-    public function docFindOne(string $collection, ?array $filter = null): ?array
-    {
-        return Utils::docFindOne($this->pdo(), $collection, $filter);
-    }
-
-    public function docUpdate(string $collection, array $filter, array $update): int
-    {
-        return Utils::docUpdate($this->pdo(), $collection, $filter, $update);
-    }
-
-    public function docUpdateOne(string $collection, array $filter, array $update): int
-    {
-        return Utils::docUpdateOne($this->pdo(), $collection, $filter, $update);
-    }
-
-    public function docDelete(string $collection, array $filter): int
-    {
-        return Utils::docDelete($this->pdo(), $collection, $filter);
-    }
-
-    public function docDeleteOne(string $collection, array $filter): int
-    {
-        return Utils::docDeleteOne($this->pdo(), $collection, $filter);
-    }
-
-    public function docCount(string $collection, ?array $filter = null): int
-    {
-        return Utils::docCount($this->pdo(), $collection, $filter);
-    }
-
-    public function docCreateIndex(string $collection, ?array $keys = null): void
-    {
-        Utils::docCreateIndex($this->pdo(), $collection, $keys);
-    }
-
-    public function docAggregate(string $collection, array $pipeline): array
-    {
-        return Utils::docAggregate($this->pdo(), $collection, $pipeline);
-    }
-
-    public function docWatch(string $collection, ?callable $callback = null): void
-    {
-        Utils::docWatch($this->pdo(), $collection, $callback);
-    }
-
-    public function docUnwatch(string $collection): void
-    {
-        Utils::docUnwatch($this->pdo(), $collection);
-    }
-
-    public function docCreateTtlIndex(string $collection, int $expireAfterSeconds, string $field = 'created_at'): void
-    {
-        Utils::docCreateTtlIndex($this->pdo(), $collection, $expireAfterSeconds, $field);
-    }
-
-    public function docRemoveTtlIndex(string $collection): void
-    {
-        Utils::docRemoveTtlIndex($this->pdo(), $collection);
-    }
-
-    public function docCreateCollection(string $collection, bool $unlogged = false): void
-    {
-        Utils::docCreateCollection($this->pdo(), $collection, $unlogged);
-    }
-
-    public function docCreateCapped(string $collection, int $maxDocuments): void
-    {
-        Utils::docCreateCapped($this->pdo(), $collection, $maxDocuments);
-    }
-
-    public function docRemoveCap(string $collection): void
-    {
-        Utils::docRemoveCap($this->pdo(), $collection);
-    }
-
-    // Search
-
-    public function search(string $table, string|array $column, string $query, int $limit = 50, string $lang = 'english', bool $highlight = false): array
-    {
-        return Utils::search($this->pdo(), $table, $column, $query, $limit, $lang, $highlight);
-    }
-
-    public function searchFuzzy(string $table, string $column, string $query, int $limit = 50, float $threshold = 0.3): array
-    {
-        return Utils::searchFuzzy($this->pdo(), $table, $column, $query, $limit, $threshold);
-    }
-
-    public function searchPhonetic(string $table, string $column, string $query, int $limit = 50): array
-    {
-        return Utils::searchPhonetic($this->pdo(), $table, $column, $query, $limit);
-    }
-
-    public function similar(string $table, string $column, array $vector, int $limit = 10): array
-    {
-        return Utils::similar($this->pdo(), $table, $column, $vector, $limit);
-    }
-
-    public function suggest(string $table, string $column, string $prefix, int $limit = 10): array
-    {
-        return Utils::suggest($this->pdo(), $table, $column, $prefix, $limit);
-    }
-
-    public function facets(string $table, string $column, int $limit = 50, ?string $query = null, string|array|null $queryColumn = null, string $lang = 'english'): array
-    {
-        return Utils::facets($this->pdo(), $table, $column, $limit, $query, $queryColumn, $lang);
-    }
-
-    public function aggregate(string $table, string $column, string $func, ?string $groupBy = null, int $limit = 50): array
-    {
-        return Utils::aggregate($this->pdo(), $table, $column, $func, $groupBy, $limit);
-    }
-
-    public function createSearchConfig(string $name, string $copyFrom = 'english'): void
-    {
-        Utils::createSearchConfig($this->pdo(), $name, $copyFrom);
-    }
-
-    // Pub/Sub & Queue
-
-    public function publish(string $channel, string $message): void
-    {
-        Utils::publish($this->pdo(), $channel, $message);
-    }
-
-    public function subscribe(string $channel, callable $callback): void
-    {
-        Utils::subscribe($this->pdo(), $channel, $callback);
-    }
-
-    public function enqueue(string $queueTable, array $payload): void
-    {
-        Utils::enqueue($this->pdo(), $queueTable, $payload);
-    }
-
-    public function dequeue(string $queueTable): ?array
-    {
-        return Utils::dequeue($this->pdo(), $queueTable);
-    }
-
-    // Counters
-
-    public function incr(string $table, string $key, int $amount = 1): int
-    {
-        return Utils::incr($this->pdo(), $table, $key, $amount);
-    }
-
-    public function getCounter(string $table, string $key): int
-    {
-        return Utils::getCounter($this->pdo(), $table, $key);
-    }
-
-    // Hash
-
-    public function hset(string $table, string $key, string $field, mixed $value): void
-    {
-        Utils::hset($this->pdo(), $table, $key, $field, $value);
-    }
-
-    public function hget(string $table, string $key, string $field): mixed
-    {
-        return Utils::hget($this->pdo(), $table, $key, $field);
-    }
-
-    public function hgetall(string $table, string $key): array
-    {
-        return Utils::hgetall($this->pdo(), $table, $key);
-    }
-
-    public function hdel(string $table, string $key, string $field): bool
-    {
-        return Utils::hdel($this->pdo(), $table, $key, $field);
-    }
-
-    // Sorted Sets
-
-    public function zadd(string $table, string $member, float $score): void
-    {
-        Utils::zadd($this->pdo(), $table, $member, $score);
-    }
-
-    public function zincrby(string $table, string $member, float $amount = 1): float
-    {
-        return Utils::zincrby($this->pdo(), $table, $member, $amount);
-    }
-
-    public function zrange(string $table, int $start = 0, int $stop = 10, bool $desc = true): array
-    {
-        return Utils::zrange($this->pdo(), $table, $start, $stop, $desc);
-    }
-
-    public function zrank(string $table, string $member, bool $desc = true): ?int
-    {
-        return Utils::zrank($this->pdo(), $table, $member, $desc);
-    }
-
-    public function zscore(string $table, string $member): ?float
-    {
-        return Utils::zscore($this->pdo(), $table, $member);
-    }
-
-    public function zrem(string $table, string $member): bool
-    {
-        return Utils::zrem($this->pdo(), $table, $member);
-    }
-
-    // Geo
-
-    public function georadius(string $table, string $geomColumn, float $lon, float $lat, float $radiusMeters, int $limit = 50): array
-    {
-        return Utils::georadius($this->pdo(), $table, $geomColumn, $lon, $lat, $radiusMeters, $limit);
-    }
-
-    public function geoadd(string $table, string $nameColumn, string $geomColumn, string $name, float $lon, float $lat): void
-    {
-        Utils::geoadd($this->pdo(), $table, $nameColumn, $geomColumn, $name, $lon, $lat);
-    }
-
-    public function geodist(string $table, string $geomColumn, string $nameColumn, string $nameA, string $nameB): ?float
-    {
-        return Utils::geodist($this->pdo(), $table, $geomColumn, $nameColumn, $nameA, $nameB);
-    }
-
-    // Misc
-
-    public function countDistinct(string $table, string $column): int
-    {
-        return Utils::countDistinct($this->pdo(), $table, $column);
-    }
-
-    public function script(string $luaCode, mixed ...$args): ?string
-    {
-        return Utils::script($this->pdo(), $luaCode, ...$args);
-    }
-
-    // Streams
-
-    public function streamAdd(string $stream, array $payload): int
-    {
-        return Utils::streamAdd($this->pdo(), $stream, $payload);
-    }
-
-    public function streamCreateGroup(string $stream, string $group): void
-    {
-        Utils::streamCreateGroup($this->pdo(), $stream, $group);
-    }
-
-    public function streamRead(string $stream, string $group, string $consumer, int $count = 1): array
-    {
-        return Utils::streamRead($this->pdo(), $stream, $group, $consumer, $count);
-    }
-
-    public function streamAck(string $stream, string $group, int $messageId): bool
-    {
-        return Utils::streamAck($this->pdo(), $stream, $group, $messageId);
-    }
-
-    public function streamClaim(string $stream, string $group, string $consumer, int $minIdleMs = 60000): array
-    {
-        return Utils::streamClaim($this->pdo(), $stream, $group, $consumer, $minIdleMs);
-    }
-
-    // Percolate
-
-    public function percolateAdd(string $name, string $queryId, string $query, string $lang = 'english', ?array $metadata = null): void
-    {
-        Utils::percolateAdd($this->pdo(), $name, $queryId, $query, $lang, $metadata);
-    }
-
-    public function percolate(string $name, string $text, int $limit = 50, string $lang = 'english'): array
-    {
-        return Utils::percolate($this->pdo(), $name, $text, $limit, $lang);
-    }
-
-    public function percolateDelete(string $name, string $queryId): bool
-    {
-        return Utils::percolateDelete($this->pdo(), $name, $queryId);
-    }
-
-    // Debug
-
-    public function analyze(string $text, string $lang = 'english'): array
-    {
-        return Utils::analyze($this->pdo(), $text, $lang);
-    }
-
-    public function explainScore(string $table, string $column, string $query, string $idColumn, mixed $idValue, string $lang = 'english'): ?array
-    {
-        return Utils::explainScore($this->pdo(), $table, $column, $query, $idColumn, $idValue, $lang);
-    }
-
-    // -- Static instance management --
-
-    /**
-     * Start the proxy and return a CachedPDO connection.
-     *
-     * Requires the pdo_pgsql extension. Use proxyUrl() if you only need the
-     * connection string.
-     *
-     * @return CachedPDO
-     */
-    public static function start(string $upstream, ?int $port = null, array $config = [], array $extraArgs = []): CachedPDO
-    {
-        if (isset(self::$instances[$upstream]) && self::$instances[$upstream]->isRunning()) {
-            $inst = self::$instances[$upstream];
-            $url = $inst->url;
-        } else {
-            $instance = new self($upstream, $port, $config, $extraArgs);
-            self::$instances[$upstream] = $instance;
-
-            if (!self::$cleanupRegistered) {
-                register_shutdown_function([self::class, 'cleanup']);
-                self::$cleanupRegistered = true;
+        foreach (self::$liveInstances as $instance) {
+            try {
+                $instance->stop();
+            } catch (\Throwable $e) {
+                // Shutdown-time errors should not abort cleanup.
             }
-
-            $url = $instance->startProxy();
-            $inst = $instance;
         }
-
-        if (!extension_loaded('pdo_pgsql')) {
-            throw new RuntimeException(
-                'No supported database driver found. ' .
-                'Enable the pdo_pgsql extension or use proxyUrl() if you only need the connection string.'
-            );
-        }
-
-        $dsn = self::urlToPdoDsn($url);
-        $parsed = parse_url($url);
-        $user = isset($parsed['user']) ? rawurldecode($parsed['user']) : null;
-        $pass = isset($parsed['pass']) ? rawurldecode($parsed['pass']) : null;
-        $pdo = new \PDO($dsn, $user, $pass);
-        $invPort = isset($config['invalidation_port'])
-            ? (int) $config['invalidation_port']
-            : $inst->port + 2;
-        return self::wrapPDO($pdo, $invPort);
-    }
-
-    /**
-     * Start the proxy and return the proxy URL string without wrapping.
-     */
-    public static function startUrl(string $upstream, ?int $port = null, array $config = [], array $extraArgs = []): string
-    {
-        if (isset(self::$instances[$upstream]) && self::$instances[$upstream]->isRunning()) {
-            return self::$instances[$upstream]->url;
-        }
-
-        $instance = new self($upstream, $port, $config, $extraArgs);
-        self::$instances[$upstream] = $instance;
-
-        if (!self::$cleanupRegistered) {
-            register_shutdown_function([self::class, 'cleanup']);
-            self::$cleanupRegistered = true;
-        }
-
-        return $instance->startProxy();
-    }
-
-    public static function stop(?string $upstream = null): void
-    {
-        if ($upstream !== null) {
-            if (isset(self::$instances[$upstream])) {
-                self::$instances[$upstream]->stopProxy();
-                unset(self::$instances[$upstream]);
-            }
-            if (empty(self::$instances)) {
-                NativeCache::reset();
-            }
-            return;
-        }
-
-        foreach (self::$instances as $instance) {
-            $instance->stopProxy();
-        }
-        self::$instances = [];
+        self::$liveInstances = [];
         NativeCache::reset();
     }
 
-    public static function proxyUrl(?string $upstream = null): ?string
-    {
-        if ($upstream !== null) {
-            return (self::$instances[$upstream] ?? null)?->url;
-        }
+    // ------------------------------------------------------------------
+    // Integration helper: wrap a PDO with the L1 cache
+    // ------------------------------------------------------------------
 
-        if (empty(self::$instances)) {
-            return null;
-        }
-
-        return array_values(self::$instances)[0]->url;
-    }
-
-    public static function dashboardUrl(?string $upstream = null): ?string
-    {
-        if ($upstream !== null) {
-            return (self::$instances[$upstream] ?? null)?->getDashboardUrl();
-        }
-
-        if (empty(self::$instances)) {
-            return null;
-        }
-
-        return array_values(self::$instances)[0]->getDashboardUrl();
-    }
-
-    public static function cleanup(): void
-    {
-        self::stop();
-    }
-
-    public static function wrapPDO(\PDO $pdo, ?int $invalidationPort = null): CachedPDO
+    public function wrapPDO(\PDO $pdo, ?int $invalidationPort = null): CachedPDO
     {
         if ($invalidationPort === null) {
-            // Auto-detect from the most recently started instance
-            $port = self::DEFAULT_PORT;
-            if (!empty(self::$instances)) {
-                $inst = array_values(self::$instances)[0];
-                $port = $inst->port;
-                $invalidationPort = isset($inst->config['invalidation_port'])
-                    ? (int) $inst->config['invalidation_port']
-                    : $port + 2;
-            } else {
-                $invalidationPort = $port + 2;
-            }
+            $invalidationPort = isset($this->config['invalidation_port'])
+                ? (int) $this->config['invalidation_port']
+                : $this->port + 2;
         }
 
+        return self::wrapPDOStatic($pdo, $invalidationPort);
+    }
+
+    /**
+     * Low-level helper: wrap a PDO with the L1 cache, connecting the cache
+     * to the given invalidation port. Used by the Laravel integration where
+     * PDOs are constructed by the framework outside the factory lifecycle.
+     */
+    public static function wrapPDOStatic(\PDO $pdo, int $invalidationPort): CachedPDO
+    {
         $cache = NativeCache::getInstance();
         if (!$cache->isConnected()) {
             $cache->connectInvalidation($invalidationPort);
@@ -705,7 +544,449 @@ class GoldLapel
         return new CachedPDO($pdo, $cache);
     }
 
-    // -- Static helpers --
+    /**
+     * Convenience: return a CachedPDO wrapping this instance's internal PDO.
+     * Useful when you want the L1 cache on the factory-managed connection.
+     */
+    public function cached(): CachedPDO
+    {
+        if ($this->pdo === null) {
+            throw new RuntimeException(
+                'Not connected. cached() requires the internal PDO opened by start().'
+            );
+        }
+        return $this->wrapPDO($this->pdo);
+    }
+
+    // ------------------------------------------------------------------
+    // Instance wrapper methods — all accept an optional `conn:` override.
+    // ------------------------------------------------------------------
+
+    // Document Store
+
+    public function docInsert(string $collection, array $document, ?\PDO $conn = null): array
+    {
+        return Utils::docInsert($this->resolveConn($conn), $collection, $document);
+    }
+
+    public function docInsertMany(string $collection, array $documents, ?\PDO $conn = null): array
+    {
+        return Utils::docInsertMany($this->resolveConn($conn), $collection, $documents);
+    }
+
+    public function docFind(
+        string $collection,
+        ?array $filter = null,
+        ?array $sort = null,
+        ?int $limit = null,
+        ?int $skip = null,
+        ?\PDO $conn = null,
+    ): array {
+        return Utils::docFind($this->resolveConn($conn), $collection, $filter, $sort, $limit, $skip);
+    }
+
+    public function docFindOne(string $collection, ?array $filter = null, ?\PDO $conn = null): ?array
+    {
+        return Utils::docFindOne($this->resolveConn($conn), $collection, $filter);
+    }
+
+    public function docUpdate(string $collection, array $filter, array $update, ?\PDO $conn = null): int
+    {
+        return Utils::docUpdate($this->resolveConn($conn), $collection, $filter, $update);
+    }
+
+    public function docUpdateOne(string $collection, array $filter, array $update, ?\PDO $conn = null): int
+    {
+        return Utils::docUpdateOne($this->resolveConn($conn), $collection, $filter, $update);
+    }
+
+    public function docDelete(string $collection, array $filter, ?\PDO $conn = null): int
+    {
+        return Utils::docDelete($this->resolveConn($conn), $collection, $filter);
+    }
+
+    public function docDeleteOne(string $collection, array $filter, ?\PDO $conn = null): int
+    {
+        return Utils::docDeleteOne($this->resolveConn($conn), $collection, $filter);
+    }
+
+    public function docCount(string $collection, ?array $filter = null, ?\PDO $conn = null): int
+    {
+        return Utils::docCount($this->resolveConn($conn), $collection, $filter);
+    }
+
+    public function docCreateIndex(string $collection, ?array $keys = null, ?\PDO $conn = null): void
+    {
+        Utils::docCreateIndex($this->resolveConn($conn), $collection, $keys);
+    }
+
+    public function docAggregate(string $collection, array $pipeline, ?\PDO $conn = null): array
+    {
+        return Utils::docAggregate($this->resolveConn($conn), $collection, $pipeline);
+    }
+
+    public function docWatch(string $collection, ?callable $callback = null, ?\PDO $conn = null): void
+    {
+        Utils::docWatch($this->resolveConn($conn), $collection, $callback);
+    }
+
+    public function docUnwatch(string $collection, ?\PDO $conn = null): void
+    {
+        Utils::docUnwatch($this->resolveConn($conn), $collection);
+    }
+
+    public function docCreateTtlIndex(
+        string $collection,
+        int $expireAfterSeconds,
+        string $field = 'created_at',
+        ?\PDO $conn = null,
+    ): void {
+        Utils::docCreateTtlIndex($this->resolveConn($conn), $collection, $expireAfterSeconds, $field);
+    }
+
+    public function docRemoveTtlIndex(string $collection, ?\PDO $conn = null): void
+    {
+        Utils::docRemoveTtlIndex($this->resolveConn($conn), $collection);
+    }
+
+    public function docCreateCollection(string $collection, bool $unlogged = false, ?\PDO $conn = null): void
+    {
+        Utils::docCreateCollection($this->resolveConn($conn), $collection, $unlogged);
+    }
+
+    public function docCreateCapped(string $collection, int $maxDocuments, ?\PDO $conn = null): void
+    {
+        Utils::docCreateCapped($this->resolveConn($conn), $collection, $maxDocuments);
+    }
+
+    public function docRemoveCap(string $collection, ?\PDO $conn = null): void
+    {
+        Utils::docRemoveCap($this->resolveConn($conn), $collection);
+    }
+
+    // Search
+
+    public function search(
+        string $table,
+        string|array $column,
+        string $query,
+        int $limit = 50,
+        string $lang = 'english',
+        bool $highlight = false,
+        ?\PDO $conn = null,
+    ): array {
+        return Utils::search($this->resolveConn($conn), $table, $column, $query, $limit, $lang, $highlight);
+    }
+
+    public function searchFuzzy(
+        string $table,
+        string $column,
+        string $query,
+        int $limit = 50,
+        float $threshold = 0.3,
+        ?\PDO $conn = null,
+    ): array {
+        return Utils::searchFuzzy($this->resolveConn($conn), $table, $column, $query, $limit, $threshold);
+    }
+
+    public function searchPhonetic(
+        string $table,
+        string $column,
+        string $query,
+        int $limit = 50,
+        ?\PDO $conn = null,
+    ): array {
+        return Utils::searchPhonetic($this->resolveConn($conn), $table, $column, $query, $limit);
+    }
+
+    public function similar(
+        string $table,
+        string $column,
+        array $vector,
+        int $limit = 10,
+        ?\PDO $conn = null,
+    ): array {
+        return Utils::similar($this->resolveConn($conn), $table, $column, $vector, $limit);
+    }
+
+    public function suggest(
+        string $table,
+        string $column,
+        string $prefix,
+        int $limit = 10,
+        ?\PDO $conn = null,
+    ): array {
+        return Utils::suggest($this->resolveConn($conn), $table, $column, $prefix, $limit);
+    }
+
+    public function facets(
+        string $table,
+        string $column,
+        int $limit = 50,
+        ?string $query = null,
+        string|array|null $queryColumn = null,
+        string $lang = 'english',
+        ?\PDO $conn = null,
+    ): array {
+        return Utils::facets($this->resolveConn($conn), $table, $column, $limit, $query, $queryColumn, $lang);
+    }
+
+    public function aggregate(
+        string $table,
+        string $column,
+        string $func,
+        ?string $groupBy = null,
+        int $limit = 50,
+        ?\PDO $conn = null,
+    ): array {
+        return Utils::aggregate($this->resolveConn($conn), $table, $column, $func, $groupBy, $limit);
+    }
+
+    public function createSearchConfig(string $name, string $copyFrom = 'english', ?\PDO $conn = null): void
+    {
+        Utils::createSearchConfig($this->resolveConn($conn), $name, $copyFrom);
+    }
+
+    // Pub/Sub & Queue
+
+    public function publish(string $channel, string $message, ?\PDO $conn = null): void
+    {
+        Utils::publish($this->resolveConn($conn), $channel, $message);
+    }
+
+    public function subscribe(string $channel, callable $callback, ?\PDO $conn = null): void
+    {
+        Utils::subscribe($this->resolveConn($conn), $channel, $callback);
+    }
+
+    public function enqueue(string $queueTable, array $payload, ?\PDO $conn = null): void
+    {
+        Utils::enqueue($this->resolveConn($conn), $queueTable, $payload);
+    }
+
+    public function dequeue(string $queueTable, ?\PDO $conn = null): ?array
+    {
+        return Utils::dequeue($this->resolveConn($conn), $queueTable);
+    }
+
+    // Counters
+
+    public function incr(string $table, string $key, int $amount = 1, ?\PDO $conn = null): int
+    {
+        return Utils::incr($this->resolveConn($conn), $table, $key, $amount);
+    }
+
+    public function getCounter(string $table, string $key, ?\PDO $conn = null): int
+    {
+        return Utils::getCounter($this->resolveConn($conn), $table, $key);
+    }
+
+    // Hash
+
+    public function hset(string $table, string $key, string $field, mixed $value, ?\PDO $conn = null): void
+    {
+        Utils::hset($this->resolveConn($conn), $table, $key, $field, $value);
+    }
+
+    public function hget(string $table, string $key, string $field, ?\PDO $conn = null): mixed
+    {
+        return Utils::hget($this->resolveConn($conn), $table, $key, $field);
+    }
+
+    public function hgetall(string $table, string $key, ?\PDO $conn = null): array
+    {
+        return Utils::hgetall($this->resolveConn($conn), $table, $key);
+    }
+
+    public function hdel(string $table, string $key, string $field, ?\PDO $conn = null): bool
+    {
+        return Utils::hdel($this->resolveConn($conn), $table, $key, $field);
+    }
+
+    // Sorted Sets
+
+    public function zadd(string $table, string $member, float $score, ?\PDO $conn = null): void
+    {
+        Utils::zadd($this->resolveConn($conn), $table, $member, $score);
+    }
+
+    public function zincrby(string $table, string $member, float $amount = 1, ?\PDO $conn = null): float
+    {
+        return Utils::zincrby($this->resolveConn($conn), $table, $member, $amount);
+    }
+
+    public function zrange(
+        string $table,
+        int $start = 0,
+        int $stop = 10,
+        bool $desc = true,
+        ?\PDO $conn = null,
+    ): array {
+        return Utils::zrange($this->resolveConn($conn), $table, $start, $stop, $desc);
+    }
+
+    public function zrank(string $table, string $member, bool $desc = true, ?\PDO $conn = null): ?int
+    {
+        return Utils::zrank($this->resolveConn($conn), $table, $member, $desc);
+    }
+
+    public function zscore(string $table, string $member, ?\PDO $conn = null): ?float
+    {
+        return Utils::zscore($this->resolveConn($conn), $table, $member);
+    }
+
+    public function zrem(string $table, string $member, ?\PDO $conn = null): bool
+    {
+        return Utils::zrem($this->resolveConn($conn), $table, $member);
+    }
+
+    // Geo
+
+    public function georadius(
+        string $table,
+        string $geomColumn,
+        float $lon,
+        float $lat,
+        float $radiusMeters,
+        int $limit = 50,
+        ?\PDO $conn = null,
+    ): array {
+        return Utils::georadius($this->resolveConn($conn), $table, $geomColumn, $lon, $lat, $radiusMeters, $limit);
+    }
+
+    public function geoadd(
+        string $table,
+        string $nameColumn,
+        string $geomColumn,
+        string $name,
+        float $lon,
+        float $lat,
+        ?\PDO $conn = null,
+    ): void {
+        Utils::geoadd($this->resolveConn($conn), $table, $nameColumn, $geomColumn, $name, $lon, $lat);
+    }
+
+    public function geodist(
+        string $table,
+        string $geomColumn,
+        string $nameColumn,
+        string $nameA,
+        string $nameB,
+        ?\PDO $conn = null,
+    ): ?float {
+        return Utils::geodist($this->resolveConn($conn), $table, $geomColumn, $nameColumn, $nameA, $nameB);
+    }
+
+    // Misc
+
+    public function countDistinct(string $table, string $column, ?\PDO $conn = null): int
+    {
+        return Utils::countDistinct($this->resolveConn($conn), $table, $column);
+    }
+
+    public function script(string $luaCode, mixed ...$args): ?string
+    {
+        // `script` takes variadic positional args for the script; use the
+        // ambient connection (no conn: override). Callers who need per-call
+        // conn control should fall back to Utils::script() directly.
+        return Utils::script($this->resolveConn(null), $luaCode, ...$args);
+    }
+
+    // Streams
+
+    public function streamAdd(string $stream, array $payload, ?\PDO $conn = null): int
+    {
+        return Utils::streamAdd($this->resolveConn($conn), $stream, $payload);
+    }
+
+    public function streamCreateGroup(string $stream, string $group, ?\PDO $conn = null): void
+    {
+        Utils::streamCreateGroup($this->resolveConn($conn), $stream, $group);
+    }
+
+    public function streamRead(
+        string $stream,
+        string $group,
+        string $consumer,
+        int $count = 1,
+        ?\PDO $conn = null,
+    ): array {
+        return Utils::streamRead($this->resolveConn($conn), $stream, $group, $consumer, $count);
+    }
+
+    public function streamAck(string $stream, string $group, int $messageId, ?\PDO $conn = null): bool
+    {
+        return Utils::streamAck($this->resolveConn($conn), $stream, $group, $messageId);
+    }
+
+    public function streamClaim(
+        string $stream,
+        string $group,
+        string $consumer,
+        int $minIdleMs = 60000,
+        ?\PDO $conn = null,
+    ): array {
+        return Utils::streamClaim($this->resolveConn($conn), $stream, $group, $consumer, $minIdleMs);
+    }
+
+    // Percolate
+
+    public function percolateAdd(
+        string $name,
+        string $queryId,
+        string $query,
+        string $lang = 'english',
+        ?array $metadata = null,
+        ?\PDO $conn = null,
+    ): void {
+        Utils::percolateAdd($this->resolveConn($conn), $name, $queryId, $query, $lang, $metadata);
+    }
+
+    public function percolate(
+        string $name,
+        string $text,
+        int $limit = 50,
+        string $lang = 'english',
+        ?\PDO $conn = null,
+    ): array {
+        return Utils::percolate($this->resolveConn($conn), $name, $text, $limit, $lang);
+    }
+
+    public function percolateDelete(string $name, string $queryId, ?\PDO $conn = null): bool
+    {
+        return Utils::percolateDelete($this->resolveConn($conn), $name, $queryId);
+    }
+
+    // Debug
+
+    public function analyze(string $text, string $lang = 'english', ?\PDO $conn = null): array
+    {
+        return Utils::analyze($this->resolveConn($conn), $text, $lang);
+    }
+
+    public function explainScore(
+        string $table,
+        string $column,
+        string $query,
+        string $idColumn,
+        mixed $idValue,
+        string $lang = 'english',
+        ?\PDO $conn = null,
+    ): ?array {
+        return Utils::explainScore(
+            $this->resolveConn($conn),
+            $table,
+            $column,
+            $query,
+            $idColumn,
+            $idValue,
+            $lang,
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Static helpers — kept for binary/URL/port utilities
+    // ------------------------------------------------------------------
 
     public static function findBinary(): string
     {
@@ -787,7 +1068,33 @@ class GoldLapel
         return false;
     }
 
-    // -- Private helpers --
+    public static function urlToPdoDsn(string $url): string
+    {
+        $parsed = parse_url($url);
+        $params = [];
+
+        if (isset($parsed['host'])) {
+            $params[] = 'host=' . $parsed['host'];
+        }
+        if (isset($parsed['port'])) {
+            $params[] = 'port=' . $parsed['port'];
+        }
+        if (isset($parsed['path']) && $parsed['path'] !== '/') {
+            $params[] = 'dbname=' . ltrim($parsed['path'], '/');
+        }
+        if (isset($parsed['query'])) {
+            parse_str($parsed['query'], $queryParams);
+            foreach ($queryParams as $k => $v) {
+                $params[] = $k . '=' . $v;
+            }
+        }
+
+        return 'pgsql:' . implode(';', $params);
+    }
+
+    // ------------------------------------------------------------------
+    // Private helpers
+    // ------------------------------------------------------------------
 
     private function terminate(): void
     {
@@ -816,36 +1123,6 @@ class GoldLapel
 
         proc_close($this->process);
         $this->process = null;
-    }
-
-    /**
-     * Convert a PostgreSQL connection URL to a PDO DSN string.
-     *
-     * Input:  postgresql://user:pass@localhost:7932/mydb?sslmode=require
-     * Output: pgsql:host=localhost;port=7932;dbname=mydb;sslmode=require
-     */
-    private static function urlToPdoDsn(string $url): string
-    {
-        $parsed = parse_url($url);
-        $params = [];
-
-        if (isset($parsed['host'])) {
-            $params[] = 'host=' . $parsed['host'];
-        }
-        if (isset($parsed['port'])) {
-            $params[] = 'port=' . $parsed['port'];
-        }
-        if (isset($parsed['path']) && $parsed['path'] !== '/') {
-            $params[] = 'dbname=' . ltrim($parsed['path'], '/');
-        }
-        if (isset($parsed['query'])) {
-            parse_str($parsed['query'], $queryParams);
-            foreach ($queryParams as $k => $v) {
-                $params[] = $k . '=' . $v;
-            }
-        }
-
-        return 'pgsql:' . implode(';', $params);
     }
 
     private static function isMusl(string $arch): bool

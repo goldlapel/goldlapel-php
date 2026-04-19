@@ -13,6 +13,8 @@ class InstanceMethodsTest extends TestCase
         $gl = new GoldLapel('postgresql://user:pass@host:5432/db');
         $pdo = $this->createMock(\PDO::class);
 
+        // Inject the mock PDO via reflection — the real factory goes
+        // through proc_open/PDO construction which we can't do in unit tests.
         $ref = new \ReflectionProperty(GoldLapel::class, 'pdo');
         $ref->setAccessible(true);
         $ref->setValue($gl, $pdo);
@@ -50,15 +52,15 @@ class InstanceMethodsTest extends TestCase
     }
 
     // ========================================================================
-    // stopProxy() clears PDO
+    // stop() clears PDO
     // ========================================================================
 
-    public function testStopProxyClearsPdo(): void
+    public function testStopClearsPdo(): void
     {
         [$gl, $pdo] = $this->makeGlWithMockPDO();
         $this->assertSame($pdo, $gl->pdo());
 
-        $gl->stopProxy();
+        $gl->stop();
 
         $this->expectException(RuntimeException::class);
         $this->expectExceptionMessage('Not connected');
