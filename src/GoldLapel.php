@@ -664,6 +664,49 @@ class GoldLapel
         Utils::docRemoveCap($this->resolveConn($conn), $collection);
     }
 
+    public function docFindCursor(
+        string $collection,
+        ?array $filter = null,
+        ?array $sort = null,
+        ?int $limit = null,
+        ?int $skip = null,
+        int $batchSize = 100,
+        ?\PDO $conn = null,
+    ): \Generator {
+        return Utils::docFindCursor(
+            $this->resolveConn($conn),
+            $collection,
+            $filter,
+            $sort,
+            $limit,
+            $skip,
+            $batchSize,
+        );
+    }
+
+    public function docFindOneAndUpdate(
+        string $collection,
+        array $filter,
+        array $update,
+        ?\PDO $conn = null,
+    ): ?array {
+        return Utils::docFindOneAndUpdate($this->resolveConn($conn), $collection, $filter, $update);
+    }
+
+    public function docFindOneAndDelete(string $collection, array $filter, ?\PDO $conn = null): ?array
+    {
+        return Utils::docFindOneAndDelete($this->resolveConn($conn), $collection, $filter);
+    }
+
+    public function docDistinct(
+        string $collection,
+        string $field,
+        ?array $filter = null,
+        ?\PDO $conn = null,
+    ): array {
+        return Utils::docDistinct($this->resolveConn($conn), $collection, $field, $filter);
+    }
+
     // Search
 
     public function search(
