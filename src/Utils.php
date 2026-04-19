@@ -4,7 +4,8 @@ namespace GoldLapel;
 
 class Utils
 {
-    private static function validateIdentifier(string $name): string
+    /** @internal Shared with GoldLapel\Amp\Utils. */
+    public static function validateIdentifier(string $name): string
     {
         if ($name === '' || !preg_match('/^[a-zA-Z_][a-zA-Z0-9_]*$/', $name)) {
             throw new \InvalidArgumentException("Invalid identifier: {$name}");
@@ -734,7 +735,8 @@ class Utils
         '$eq' => '=', '$ne' => '!=',
     ];
 
-    private static function fieldPath(string $key): string
+    /** @internal */
+    public static function fieldPath(string $key): string
     {
         $parts = explode('.', $key);
         foreach ($parts as $part) {
@@ -753,7 +755,8 @@ class Utils
         return $path;
     }
 
-    private static function resolveFieldRef(string $ref, array $unwindMap = []): string
+    /** @internal */
+    public static function resolveFieldRef(string $ref, array $unwindMap = []): string
     {
         $field = str_starts_with($ref, '$') ? substr($ref, 1) : $ref;
         if (!preg_match('/^[a-zA-Z_][a-zA-Z0-9_.]*$/', $field)) {
@@ -783,7 +786,8 @@ class Utils
         return $result;
     }
 
-    private static function buildFilter(?array $filter): array
+    /** @internal */
+    public static function buildFilter(?array $filter): array
     {
         if ($filter === null || count($filter) === 0) {
             return ['', []];
@@ -929,7 +933,8 @@ class Utils
         return [implode(' AND ', $allClauses), $allParams];
     }
 
-    private static function hasOperators(array $value): bool
+    /** @internal */
+    public static function hasOperators(array $value): bool
     {
         foreach (array_keys($value) as $k) {
             if (is_string($k) && str_starts_with($k, '$')) {
@@ -939,7 +944,8 @@ class Utils
         return false;
     }
 
-    private static function fieldPathJson(string $key): string
+    /** @internal */
+    public static function fieldPathJson(string $key): string
     {
         $parts = explode('.', $key);
         foreach ($parts as $part) {
@@ -954,7 +960,8 @@ class Utils
         return $chain;
     }
 
-    private static function jsonbPath(string $key): string
+    /** @internal */
+    public static function jsonbPath(string $key): string
     {
         $parts = explode('.', $key);
         foreach ($parts as $part) {
@@ -965,7 +972,8 @@ class Utils
         return '{' . implode(',', $parts) . '}';
     }
 
-    private static function toJsonbExpr($value): array
+    /** @internal */
+    public static function toJsonbExpr($value): array
     {
         if (is_bool($value)) {
             return ['to_jsonb(?::boolean)', $value ? 'true' : 'false'];
@@ -978,7 +986,8 @@ class Utils
         }
     }
 
-    private static function buildUpdate(array $update): array
+    /** @internal */
+    public static function buildUpdate(array $update): array
     {
         if (!self::hasOperators($update)) {
             return ['data || ?::jsonb', [json_encode($update)]];

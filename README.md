@@ -192,6 +192,115 @@ script's text parameters.
 > GoldLapel\Utils::script($myPdo, $lua, 'arg1', 'arg2');
 > ```
 
+## Async usage (Amp)
+
+This package also ships a **native async** layer built on
+[`amphp/postgres`](https://github.com/amphp/postgres). Existing sync code is
+unaffected — the async classes live under `GoldLapel\Amp\` and are only
+loaded if you opt in.
+
+### Install
+
+```bash
+composer require goldlapel/goldlapel amphp/postgres
+```
+
+`amphp/postgres` is a `suggest` dependency, not a hard requirement, so the
+sync path stays lean for users who don't want it.
+
+### Quick Start
+
+```php
+use GoldLapel\Amp\GoldLapel;
+
+// Inside a Revolt / Amp event-loop context (any fiber):
+$gl = GoldLapel::start('postgresql://user:pass@localhost/mydb', [
+    'port' => 7932,
+])->await();
+
+// Every wrapper method returns Amp\Future<T>.
+$hits = $gl->search('articles', 'body', 'postgres tuning')->await();
+$gl->docInsert('events', ['type' => 'signup'])->await();
+
+$gl->stop()->await();
+```
+
+The async API mirrors the sync API 1:1 — every sync method has an async
+sibling returning `Amp\Future<T>` from the same facade. Internally it uses
+amphp/postgres's native Postgres driver (no PDO), so nothing blocks the
+event loop.
+
+### Transactional scope with `using()`
+
+```php
+$tx = $gl->connection()->beginTransaction();
+$gl->using($tx, function ($gl) {
+    $gl->docInsert('events', ['type' => 'order.created'])->await();
+    $gl->incr('counters', 'orders')->await();
+})->await();
+$tx->commit();
+```
+
+The scope is per-instance (matches sync semantics). For per-fiber
+isolation, construct separate `GoldLapel` instances or pass the
+connection/transaction explicitly via the trailing `$conn` argument on
+each method call.
+
+### Streaming cursors
+
+`docFindCursor()` returns an `Amp\Pipeline\ConcurrentIterator<array>` —
+iterate with `foreach` inside a fiber. Each batch is tagged with the
+`goldlapel:skip` annotation so the proxy's result cache doesn't replay a
+stale batch:
+
+```php
+$iter = $gl->docFindCursor('events', null, ['created_at' => -1], null, null, 500);
+foreach ($iter as $row) {
+    process($row);
+}
+```
+
+### L1 cache
+
+`$gl->cached()` returns a `GoldLapel\Amp\CachedConnection` wrapping the
+async connection with the same `NativeCache` instance used by the sync
+`CachedPDO`. Writes through either path cross-invalidate.
+
+```php
+$cached = $gl->cached();
+// Reads go through the cache; writes invalidate
+foreach ($cached->query("SELECT * FROM users WHERE active = true") as $row) {
+    // ...
+}
+```
+
+### Subscribing to changes
+
+`subscribe()` and `docWatch()` require a `PostgresConnection` (LISTEN
+doesn't run on transactions). The sync variant polls; the async variant
+uses amphp's native `$conn->listen($channel)` iterator:
+
+```php
+// Run the listener until it's unlistened or the connection closes
+$gl->subscribe('my_channel', function (string $channel, string $payload) {
+    echo "got: {$payload}\n";
+})->await();
+```
+
+For long-running listeners you'll typically want a dedicated connection
+rather than the factory's primary connection — `amphp/postgres`'s
+`connect()` function opens additional connections against the same proxy.
+
+### Notes
+
+- **Amp only.** Swoole and ReactPHP aren't supported today. Demand may
+  produce parallel packages; the structure here (separate namespace,
+  shared SQL builders) is designed to accommodate them.
+- **PHP 8.1+ required** (Amp 3.x uses native Fibers).
+- The subprocess is still started via `proc_open` — fast enough inside a
+  fiber. Async cleanup on `stop()` closes the amphp connection first,
+  then terminates the Rust subprocess.
+
 ## Upgrading from 0.1.x
 
 v0.2.0 is a breaking change — there is no compatibility shim.
