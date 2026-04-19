@@ -23,7 +23,6 @@ use RuntimeException;
 class GoldLapel
 {
     const DEFAULT_PORT = 7932;
-    const DEFAULT_DASHBOARD_PORT = 7933;
     const STARTUP_TIMEOUT = 10.0;
     const STARTUP_POLL_INTERVAL = 0.05;
 
@@ -83,7 +82,9 @@ class GoldLapel
     {
         $this->upstream = $upstream;
         $this->port = $port ?? self::DEFAULT_PORT;
-        $this->dashboardPort = isset($config['dashboard_port']) ? (int) $config['dashboard_port'] : self::DEFAULT_DASHBOARD_PORT;
+        $this->dashboardPort = array_key_exists('dashboard_port', $config)
+            ? (int) $config['dashboard_port']
+            : $this->port + 1;
         $this->config = $config;
         $this->extraArgs = $extraArgs;
     }

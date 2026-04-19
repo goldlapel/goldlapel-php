@@ -380,6 +380,18 @@ class GoldLapelTest extends TestCase
         $this->assertNull($gl->getDashboardUrl());
     }
 
+    public function testDashboardPortDerivesFromCustomProxyPort(): void
+    {
+        $gl = new GoldLapel('postgresql://host:5432/db', 17932);
+        $this->assertSame(17933, $gl->getDashboardPort());
+    }
+
+    public function testExplicitDashboardPortOverridesDerivation(): void
+    {
+        $gl = new GoldLapel('postgresql://host:5432/db', 17932, ['dashboard_port' => 9999]);
+        $this->assertSame(9999, $gl->getDashboardPort());
+    }
+
     // -- configKeys (3 tests) --
 
     public function testConfigKeysReturnsArray(): void
