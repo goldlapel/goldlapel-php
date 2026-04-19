@@ -576,7 +576,41 @@ class GoldLapel
         }
 
         $status = proc_get_status($this->process);
-        return $status['running'];
+        if (!$status['running']) {
+            return false;
+        }
+
+        // Zombie detection. On some systems `proc_get_status()` returns
+        // `running => true` for a child that has already exited but hasn't
+        // been `wait()`ed on yet. Two cross-checks catch that:
+        //
+        //   1. If `exitcode` is anything other than -1, the process has been
+        //      reaped by a prior `proc_get_status()` call and the cached
+        //      exit status is being replayed — it's definitively not
+        //      running anymore. PHP contractually reports exitcode = -1
+        //      while the child is alive.
+        //
+        //   2. On POSIX hosts, `posix_kill($pid, 0)` returns false when the
+        //      kernel has no such pid at all (reaped zombie or never
+        //      existed). A live-or-zombie process returns true. Combined
+        //      with check #1, a false here means the process is truly gone.
+        //
+        // Either check alone can have false negatives (check #1 during the
+        // race window before exitcode is cached; check #2 for a zombie that
+        // hasn't been reaped yet), so we treat a positive signal from
+        // either as "not running".
+        if (isset($status['exitcode']) && $status['exitcode'] !== -1) {
+            return false;
+        }
+
+        if (function_exists('posix_kill') && isset($status['pid'])) {
+            $pid = (int) $status['pid'];
+            if ($pid > 0 && !@posix_kill($pid, 0)) {
+                return false;
+            }
+        }
+
+        return true;
     }
 
     // ------------------------------------------------------------------

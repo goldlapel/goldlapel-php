@@ -718,4 +718,128 @@ class FactoryApiTest extends TestCase
             }
         }
     }
+
+    // ------------------------------------------------------------------
+    // Shutdown path / zombie detection.
+    //
+    // Regression guard for the isRunning() zombie-false-positive fix. On
+    // some systems `proc_get_status()` can report `running => true` for a
+    // child that has already exited but hasn't been `wait()`ed on yet.
+    // isRunning() now cross-checks with the exitcode field and
+    // `posix_kill($pid, 0)` so callers get a correct answer after the
+    // subprocess has actually died.
+    // ------------------------------------------------------------------
+
+    public function testIsRunningReflectsCleanShutdown(): void
+    {
+        // Spawn a fake binary that listens long enough for start(), then
+        // stop() it and assert isRunning() returns false — exercising the
+        // SIGTERM → proc_close path end to end.
+        $port = $this->findFreePort();
+
+        $fake = $this->makeFakeBinary(
+            "#!/bin/sh\n"
+            . "exec python3 -c \"import socket,time\n"
+            . "s=socket.socket()\n"
+            . "s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)\n"
+            . "s.bind(('127.0.0.1',{$port}))\n"
+            . "s.listen(5)\n"
+            . "time.sleep(30)\"\n"
+        );
+
+        $origBinary = getenv('GOLDLAPEL_BINARY');
+
+        try {
+            putenv("GOLDLAPEL_BINARY={$fake}");
+
+            GoldLapel::startProxyOnly(
+                'postgresql://user:pass@localhost:5432/db',
+                ['port' => $port, 'dashboard_port' => 0]
+            );
+
+            $ref = new \ReflectionProperty(GoldLapel::class, 'liveInstances');
+            $ref->setAccessible(true);
+            /** @var array<int, GoldLapel> $live */
+            $live = $ref->getValue();
+            $this->assertCount(1, $live, 'Instance should be tracked after startProxyOnly.');
+            $gl = array_values($live)[0];
+
+            $this->assertTrue($gl->isRunning(), 'isRunning() must be true before stop().');
+
+            $gl->stop();
+
+            $this->assertFalse(
+                $gl->isRunning(),
+                'isRunning() must be false after stop() — no zombie false-positive.'
+            );
+        } finally {
+            GoldLapel::cleanupAll();
+            if ($origBinary === false) {
+                putenv('GOLDLAPEL_BINARY');
+            } else {
+                putenv("GOLDLAPEL_BINARY={$origBinary}");
+            }
+        }
+    }
+
+    public function testIsRunningReflectsSubprocessSelfExit(): void
+    {
+        // Start a fake binary that listens long enough to let start()
+        // succeed, then self-exits. After the child has died but before
+        // stop() is called, isRunning() must return false. This is the
+        // zombie-false-positive path the fix guards.
+        $port = $this->findFreePort();
+
+        // Listen for 1 second, then exit. Long enough for waitForPort() in
+        // startProxyOnly() to succeed, short enough that the test finishes
+        // quickly after the exit.
+        $fake = $this->makeFakeBinary(
+            "#!/bin/sh\n"
+            . "exec python3 -c \"import socket,time\n"
+            . "s=socket.socket()\n"
+            . "s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)\n"
+            . "s.bind(('127.0.0.1',{$port}))\n"
+            . "s.listen(5)\n"
+            . "time.sleep(1)\"\n"
+        );
+
+        $origBinary = getenv('GOLDLAPEL_BINARY');
+
+        try {
+            putenv("GOLDLAPEL_BINARY={$fake}");
+
+            GoldLapel::startProxyOnly(
+                'postgresql://user:pass@localhost:5432/db',
+                ['port' => $port, 'dashboard_port' => 0]
+            );
+
+            $ref = new \ReflectionProperty(GoldLapel::class, 'liveInstances');
+            $ref->setAccessible(true);
+            /** @var array<int, GoldLapel> $live */
+            $live = $ref->getValue();
+            $gl = array_values($live)[0];
+
+            // Wait up to 5s for the child to self-exit and the pipe to
+            // close, then assert isRunning() flips false.
+            $deadline = hrtime(true) + (int) (5 * 1e9);
+            while (hrtime(true) < $deadline) {
+                if (!$gl->isRunning()) {
+                    break;
+                }
+                usleep(100000);
+            }
+
+            $this->assertFalse(
+                $gl->isRunning(),
+                'isRunning() must return false once the subprocess has actually exited, even if proc_get_status still reports running=true for an unreaped zombie.'
+            );
+        } finally {
+            GoldLapel::cleanupAll();
+            if ($origBinary === false) {
+                putenv('GOLDLAPEL_BINARY');
+            } else {
+                putenv("GOLDLAPEL_BINARY={$origBinary}");
+            }
+        }
+    }
 }
