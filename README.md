@@ -10,7 +10,7 @@ Gold Lapel sits between your app and Postgres, watches query patterns, and autom
 composer require goldlapel/goldlapel
 ```
 
-Requires PHP 8.0+ and the `pdo_pgsql` extension.
+Requires PHP 8.1+ and the `pdo_pgsql` extension.
 
 ## Quick Start
 
