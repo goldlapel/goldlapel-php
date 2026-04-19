@@ -485,4 +485,175 @@ class FactoryApiTest extends TestCase
         unset($gl);
         $this->assertTrue(true); // No exception = pass
     }
+
+    // ------------------------------------------------------------------
+    // Regression: instance registration must happen before PDO is opened
+    // so that a partial-init failure (spawn succeeds, PDO throws) still
+    // results in the subprocess being cleaned up.
+    // ------------------------------------------------------------------
+
+    public function testInstanceRegisteredBeforePdoOpens(): void
+    {
+        // Verifies the fix for the "leak on partial-init failure" bug.
+        // After startProxyWithoutConnect() returns, the instance must
+        // already be in $liveInstances — so that if the subsequent PDO
+        // construction in startProxy() raises, cleanupAll() can still
+        // terminate the subprocess.
+        $port = $this->findFreePort();
+
+        $fake = $this->makeFakeBinary(
+            "#!/bin/sh\n"
+            . "exec python3 -c \"import socket,time\n"
+            . "s=socket.socket()\n"
+            . "s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)\n"
+            . "s.bind(('127.0.0.1',{$port}))\n"
+            . "s.listen(5)\n"
+            . "time.sleep(30)\"\n"
+        );
+
+        $origBinary = getenv('GOLDLAPEL_BINARY');
+
+        try {
+            putenv("GOLDLAPEL_BINARY={$fake}");
+
+            GoldLapel::startProxyOnly(
+                'postgresql://user:pass@localhost:5432/db',
+                ['port' => $port, 'dashboard_port' => 0]
+            );
+
+            // Immediately after the proxy is started, the instance should
+            // already be in $liveInstances — registered from inside
+            // startProxyWithoutConnect(), not after it returned.
+            $ref = new \ReflectionProperty(GoldLapel::class, 'liveInstances');
+            $ref->setAccessible(true);
+            $live = $ref->getValue();
+            $this->assertCount(
+                1,
+                $live,
+                'Instance must be registered with liveInstances as soon as the subprocess spawns.'
+            );
+
+            // Shutdown hook should also be registered (one-time guard).
+            $regRef = new \ReflectionProperty(GoldLapel::class, 'cleanupRegistered');
+            $regRef->setAccessible(true);
+            $this->assertTrue($regRef->getValue(), 'Shutdown hook must be registered with liveInstances.');
+        } finally {
+            GoldLapel::cleanupAll();
+            if ($origBinary === false) {
+                putenv('GOLDLAPEL_BINARY');
+            } else {
+                putenv("GOLDLAPEL_BINARY={$origBinary}");
+            }
+        }
+    }
+
+    public function testSpawnSuccessButPdoFailsStillCleansUpSubprocess(): void
+    {
+        // End-to-end regression: use a fake binary that listens on the
+        // requested port (so startProxyWithoutConnect() succeeds) but does
+        // not speak Postgres. PDO construction in start() will fail.
+        // After the PDOException propagates, cleanupAll() must find and
+        // terminate the subprocess.
+        if (!extension_loaded('pdo_pgsql')) {
+            $this->markTestSkipped('pdo_pgsql not loaded');
+        }
+
+        $port = $this->findFreePort();
+
+        // Fake binary forks a python process that writes its PID to a
+        // temp file, accepts connections, then immediately closes them
+        // (so PDO construction fails). We use the PID file to assert the
+        // subprocess was terminated after cleanup.
+        $pidFile = tempnam(sys_get_temp_dir(), 'gl_fake_pid_');
+        register_shutdown_function(fn() => @unlink($pidFile));
+
+        $fake = $this->makeFakeBinary(
+            "#!/bin/sh\n"
+            . "exec python3 -c \"import socket,os,time\n"
+            . "open('{$pidFile}','w').write(str(os.getpid()))\n"
+            . "s=socket.socket()\n"
+            . "s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)\n"
+            . "s.bind(('127.0.0.1',{$port}))\n"
+            . "s.listen(5)\n"
+            . "while True:\n"
+            . "    c,_=s.accept()\n"
+            . "    c.close()\"\n"
+        );
+
+        $origBinary = getenv('GOLDLAPEL_BINARY');
+        $caught = false;
+
+        try {
+            putenv("GOLDLAPEL_BINARY={$fake}");
+
+            try {
+                GoldLapel::start(
+                    'postgresql://user:pass@localhost:5432/testdb',
+                    ['port' => $port, 'dashboard_port' => 0]
+                );
+                $this->fail('Expected PDOException from start() when fake server does not speak Postgres.');
+            } catch (\PDOException $e) {
+                $caught = true;
+            } catch (\RuntimeException $e) {
+                // Some environments surface this as a RuntimeException
+                // instead; still a valid partial-init failure.
+                $caught = true;
+            }
+
+            $this->assertTrue($caught, 'start() must throw when PDO construction fails.');
+
+            // Read the subprocess PID (wait briefly for the python process
+            // to write it).
+            $deadline = hrtime(true) + (int) (2 * 1e9);
+            $pid = null;
+            while (hrtime(true) < $deadline) {
+                $contents = @file_get_contents($pidFile);
+                if ($contents !== false && $contents !== '') {
+                    $pid = (int) trim($contents);
+                    break;
+                }
+                usleep(50000);
+            }
+            $this->assertNotNull($pid, 'Fake subprocess should have written its PID.');
+
+            // Instance should still be tracked in $liveInstances even
+            // though the user never received a reference — the fix
+            // registers during startProxyWithoutConnect(), before PDO.
+            $ref = new \ReflectionProperty(GoldLapel::class, 'liveInstances');
+            $ref->setAccessible(true);
+            $live = $ref->getValue();
+            $this->assertCount(
+                1,
+                $live,
+                'Subprocess must remain tracked after partial-init failure so cleanupAll can find it.'
+            );
+
+            // cleanupAll() must terminate the subprocess.
+            GoldLapel::cleanupAll();
+
+            // Allow the OS a moment to reap the process.
+            $deadline = hrtime(true) + (int) (3 * 1e9);
+            $alive = true;
+            while (hrtime(true) < $deadline) {
+                // posix_kill with signal 0 checks existence without sending.
+                if (function_exists('posix_kill')) {
+                    $alive = @posix_kill($pid, 0);
+                } else {
+                    $alive = file_exists("/proc/{$pid}");
+                }
+                if (!$alive) {
+                    break;
+                }
+                usleep(50000);
+            }
+            $this->assertFalse($alive, "Subprocess PID {$pid} should have been terminated by cleanupAll().");
+        } finally {
+            GoldLapel::cleanupAll();
+            if ($origBinary === false) {
+                putenv('GOLDLAPEL_BINARY');
+            } else {
+                putenv("GOLDLAPEL_BINARY={$origBinary}");
+            }
+        }
+    }
 }

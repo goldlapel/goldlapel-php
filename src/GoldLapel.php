@@ -110,13 +110,11 @@ class GoldLapel
         [$port, $config, $extraArgs] = self::parseStartOptions($options);
 
         $instance = new self($upstream, $port, $config, $extraArgs);
+        // startProxyWithoutConnect() (invoked via startProxy) registers the
+        // instance with cleanupAll as soon as the subprocess spawns, before
+        // the PDO is opened — so a PDO failure here still leaves the
+        // subprocess cleanable via __destruct or the shutdown hook.
         $instance->startProxy();
-
-        self::$liveInstances[spl_object_id($instance)] = $instance;
-        if (!self::$cleanupRegistered) {
-            register_shutdown_function([self::class, 'cleanupAll']);
-            self::$cleanupRegistered = true;
-        }
 
         return $instance;
     }
@@ -133,12 +131,6 @@ class GoldLapel
 
         $instance = new self($upstream, $port, $config, $extraArgs);
         $instance->startProxyWithoutConnect();
-
-        self::$liveInstances[spl_object_id($instance)] = $instance;
-        if (!self::$cleanupRegistered) {
-            register_shutdown_function([self::class, 'cleanupAll']);
-            self::$cleanupRegistered = true;
-        }
 
         return $instance->url;
     }
@@ -370,6 +362,11 @@ class GoldLapel
                 fclose($stderr);
                 $this->url = self::makeProxyUrl($this->upstream, $this->port);
 
+                // Register the instance for global cleanup immediately so
+                // that any subsequent init step (e.g. PDO construction in
+                // startProxy()) can throw without leaking the subprocess.
+                self::registerForCleanup($this);
+
                 if ($this->dashboardPort > 0) {
                     echo "goldlapel → :{$this->port} (proxy) | http://127.0.0.1:{$this->dashboardPort} (dashboard)\n";
                 } else {
@@ -500,6 +497,21 @@ class GoldLapel
     // ------------------------------------------------------------------
     // Global cleanup
     // ------------------------------------------------------------------
+
+    /**
+     * Register an instance with the global live-instance tracker and ensure
+     * the one-time shutdown hook is installed. Called as soon as the
+     * subprocess is known to be running, so any later init failure (PDO,
+     * etc.) still results in the subprocess being cleaned up.
+     */
+    private static function registerForCleanup(self $instance): void
+    {
+        self::$liveInstances[spl_object_id($instance)] = $instance;
+        if (!self::$cleanupRegistered) {
+            register_shutdown_function([self::class, 'cleanupAll']);
+            self::$cleanupRegistered = true;
+        }
+    }
 
     public static function cleanupAll(): void
     {
