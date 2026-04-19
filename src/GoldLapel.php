@@ -56,9 +56,28 @@ class GoldLapel
         'replica', 'exclude_tables',
     ];
 
+    /**
+     * Option keys consumed by the wrapper itself — never forwarded to the
+     * Rust binary as CLI flags. Keep in sync with the reserved keys handled
+     * in parseStartOptions().
+     */
+    private const WRAPPER_ONLY_KEYS = [
+        'silent',
+    ];
+
+    /**
+     * Stream the startup banner is written to. Defaults to STDERR; tests
+     * can swap this for a php://memory stream to capture output without
+     * depending on the real stderr file descriptor.
+     *
+     * @var resource
+     */
+    private static $bannerStream;
+
     private string $upstream;
     private int $port;
     private int $dashboardPort;
+    private bool $silent;
     private array $config;
     private array $extraArgs;
     /** @var resource|null */
@@ -78,13 +97,19 @@ class GoldLapel
      *
      * Internal users (and tests) can still construct directly.
      */
-    public function __construct(string $upstream, ?int $port = null, array $config = [], array $extraArgs = [])
-    {
+    public function __construct(
+        string $upstream,
+        ?int $port = null,
+        array $config = [],
+        array $extraArgs = [],
+        bool $silent = false
+    ) {
         $this->upstream = $upstream;
         $this->port = $port ?? self::DEFAULT_PORT;
         $this->dashboardPort = array_key_exists('dashboard_port', $config)
             ? (int) $config['dashboard_port']
             : $this->port + 1;
+        $this->silent = $silent;
         $this->config = $config;
         $this->extraArgs = $extraArgs;
     }
@@ -108,9 +133,9 @@ class GoldLapel
      */
     public static function start(string $upstream, array $options = []): self
     {
-        [$port, $config, $extraArgs] = self::parseStartOptions($options);
+        [$port, $config, $extraArgs, $silent] = self::parseStartOptions($options);
 
-        $instance = new self($upstream, $port, $config, $extraArgs);
+        $instance = new self($upstream, $port, $config, $extraArgs, $silent);
         // startProxyWithoutConnect() (invoked via startProxy) registers the
         // instance with cleanupAll as soon as the subprocess spawns, before
         // the PDO is opened — so a PDO failure here still leaves the
@@ -128,9 +153,9 @@ class GoldLapel
      */
     public static function startProxyOnly(string $upstream, array $options = []): string
     {
-        [$port, $config, $extraArgs] = self::parseStartOptions($options);
+        [$port, $config, $extraArgs, $silent] = self::parseStartOptions($options);
 
-        $instance = new self($upstream, $port, $config, $extraArgs);
+        $instance = new self($upstream, $port, $config, $extraArgs, $silent);
         $instance->startProxyWithoutConnect();
 
         return $instance->url;
@@ -139,14 +164,20 @@ class GoldLapel
     private static function parseStartOptions(array $options): array
     {
         $port = isset($options['port']) ? (int) $options['port'] : null;
+        $silent = !empty($options['silent']);
 
         // Accept either {'config' => [...]} or top-level config keys mixed
         // into options. 'port', 'log_level', 'extra_args', 'config' are
-        // reserved option keys; everything else is treated as a config key.
+        // reserved option keys; wrapper-only keys (e.g. 'silent') are also
+        // reserved and must never be forwarded to the Rust binary as CLI
+        // flags. Everything else is treated as a config key.
         $config = $options['config'] ?? [];
         $extraArgs = $options['extra_args'] ?? [];
 
-        $reserved = ['port', 'log_level', 'config', 'extra_args'];
+        $reserved = array_merge(
+            ['port', 'log_level', 'config', 'extra_args'],
+            self::WRAPPER_ONLY_KEYS
+        );
         foreach ($options as $key => $value) {
             if (in_array($key, $reserved, true)) {
                 continue;
@@ -162,7 +193,7 @@ class GoldLapel
             }
         }
 
-        return [$port, $config, $extraArgs];
+        return [$port, $config, $extraArgs, $silent];
     }
 
     /**
@@ -403,11 +434,7 @@ class GoldLapel
                 // startProxy()) can throw without leaking the subprocess.
                 self::registerForCleanup($this);
 
-                if ($this->dashboardPort > 0) {
-                    echo "goldlapel → :{$this->port} (proxy) | http://127.0.0.1:{$this->dashboardPort} (dashboard)\n";
-                } else {
-                    echo "goldlapel → :{$this->port} (proxy)\n";
-                }
+                self::printBanner($this->port, $this->dashboardPort, $this->silent);
 
                 return $this->url;
             }
@@ -425,6 +452,29 @@ class GoldLapel
         throw new RuntimeException(
             "Gold Lapel failed to start on port {$this->port} within " . self::STARTUP_TIMEOUT . "s.\nstderr: {$stderrOutput}"
         );
+    }
+
+    /**
+     * Emit the startup banner to stderr. In a PHP-FPM / web SAPI context
+     * stdout becomes the HTTP response body, so we route this to stderr to
+     * avoid corrupting JSON output, injecting whitespace before a <!doctype>,
+     * or triggering "headers already sent" errors. Respects the `silent`
+     * wrapper option — default false (banner prints to stderr).
+     */
+    private static function printBanner(int $port, int $dashboardPort, bool $silent): void
+    {
+        if ($silent) {
+            return;
+        }
+
+        $message = $dashboardPort > 0
+            ? "goldlapel → :{$port} (proxy) | http://127.0.0.1:{$dashboardPort} (dashboard)\n"
+            : "goldlapel → :{$port} (proxy)\n";
+
+        $stream = self::$bannerStream ?? (defined('STDERR') ? STDERR : null);
+        if (is_resource($stream)) {
+            fwrite($stream, $message);
+        }
     }
 
     /**
