@@ -93,7 +93,7 @@ class GoldLapel
      *
      * Options (all optional):
      *   - 'port' (int): proxy port (default 7932)
-     *   - 'log_level' (string): 'trace'|'debug'|'info'|'warn'|'error' — forwarded as --log-level
+     *   - 'log_level' (string): 'trace'|'debug'|'info'|'warn'|'error' — translated to the proxy's -v/-vv/-vvv verbosity flag
      *   - 'config' (array): per-proxy config keys (see configKeys())
      *   - 'extra_args' (array): raw extra CLI flags
      *
@@ -154,12 +154,47 @@ class GoldLapel
             $config[$key] = $value;
         }
 
-        if (isset($options['log_level'])) {
-            $level = (string) $options['log_level'];
-            $extraArgs = array_merge($extraArgs, ['--log-level', $level]);
+        if (array_key_exists('log_level', $options) && $options['log_level'] !== null) {
+            $verboseFlag = self::translateLogLevel($options['log_level']);
+            if ($verboseFlag !== null) {
+                $extraArgs[] = $verboseFlag;
+            }
         }
 
         return [$port, $config, $extraArgs];
+    }
+
+    /**
+     * Translate a log level string to the proxy's count-based verbosity flag.
+     * The Rust binary exposes verbosity as -v / -vv / -vvv (count flag) rather
+     * than --log-level <level>, so wrappers translate on the spawn side.
+     *
+     * @return string|null "-v"/"-vv"/"-vvv" for info/debug/trace, null for warn/error
+     * @throws \InvalidArgumentException if the value is not a recognized level
+     */
+    private static function translateLogLevel($level): ?string
+    {
+        if (!is_string($level)) {
+            throw new \InvalidArgumentException(
+                'log_level must be a string (one of: trace, debug, info, warn, error)'
+            );
+        }
+        switch (strtolower($level)) {
+            case 'trace':
+                return '-vvv';
+            case 'debug':
+                return '-vv';
+            case 'info':
+                return '-v';
+            case 'warn':
+            case 'warning':
+            case 'error':
+                return null;
+            default:
+                throw new \InvalidArgumentException(
+                    'log_level must be one of: trace, debug, info, warn, error'
+                );
+        }
     }
 
     public static function configToArgs(array $config): array

@@ -64,12 +64,74 @@ class FactoryApiTest extends TestCase
         $this->assertSame(['mode' => 'waiter', 'pool_size' => 30], $config);
     }
 
-    public function testParseOptionsLogLevelForwarded(): void
+    public function testParseOptionsLogLevelDebugTranslatesToDoubleVerbose(): void
     {
         [$port, $config, $extraArgs] = $this->invokeParseOptions([
             'log_level' => 'debug',
         ]);
-        $this->assertSame(['--log-level', 'debug'], $extraArgs);
+        $this->assertSame(['-vv'], $extraArgs);
+    }
+
+    public function testParseOptionsLogLevelTraceTranslatesToTripleVerbose(): void
+    {
+        [$port, $config, $extraArgs] = $this->invokeParseOptions([
+            'log_level' => 'trace',
+        ]);
+        $this->assertSame(['-vvv'], $extraArgs);
+    }
+
+    public function testParseOptionsLogLevelInfoTranslatesToSingleVerbose(): void
+    {
+        [$port, $config, $extraArgs] = $this->invokeParseOptions([
+            'log_level' => 'info',
+        ]);
+        $this->assertSame(['-v'], $extraArgs);
+    }
+
+    public function testParseOptionsLogLevelWarnOmitted(): void
+    {
+        [$port, $config, $extraArgs] = $this->invokeParseOptions([
+            'log_level' => 'warn',
+        ]);
+        $this->assertSame([], $extraArgs);
+    }
+
+    public function testParseOptionsLogLevelErrorOmitted(): void
+    {
+        [$port, $config, $extraArgs] = $this->invokeParseOptions([
+            'log_level' => 'error',
+        ]);
+        $this->assertSame([], $extraArgs);
+    }
+
+    public function testParseOptionsLogLevelNullOmitted(): void
+    {
+        [$port, $config, $extraArgs] = $this->invokeParseOptions([
+            'log_level' => null,
+        ]);
+        $this->assertSame([], $extraArgs);
+    }
+
+    public function testParseOptionsLogLevelCaseInsensitive(): void
+    {
+        [$port, $config, $extraArgs] = $this->invokeParseOptions([
+            'log_level' => 'DEBUG',
+        ]);
+        $this->assertSame(['-vv'], $extraArgs);
+    }
+
+    public function testParseOptionsLogLevelInvalidThrows(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('log_level must be one of');
+        $this->invokeParseOptions(['log_level' => 'verbose']);
+    }
+
+    public function testParseOptionsLogLevelNonStringThrows(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('log_level must be a string');
+        $this->invokeParseOptions(['log_level' => 2]);
     }
 
     public function testParseOptionsExtraArgsPreserved(): void
@@ -86,7 +148,7 @@ class FactoryApiTest extends TestCase
             'extra_args' => ['--some-flag', 'val'],
             'log_level' => 'info',
         ]);
-        $this->assertSame(['--some-flag', 'val', '--log-level', 'info'], $extraArgs);
+        $this->assertSame(['--some-flag', 'val', '-v'], $extraArgs);
     }
 
     public function testParseOptionsMergesInlineWithExplicitConfig(): void
