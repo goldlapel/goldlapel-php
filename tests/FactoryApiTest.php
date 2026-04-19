@@ -723,6 +723,108 @@ class FactoryApiTest extends TestCase
         }
     }
 
+    public function testProcGetStatusConfirmsNoOrphanAfterPartialInitFailure(): void
+    {
+        // Complementary regression for the same CRITICAL bug #3 — resource
+        // precedence where start()'s PDO-construction path fails after the
+        // subprocess is already spawned. Unlike
+        // testSpawnSuccessButPdoFailsStillCleansUpSubprocess, this one:
+        //
+        //   1. Grabs the live GoldLapel instance directly out of
+        //      $liveInstances (the user never saw it — start() threw
+        //      before returning) and asserts isRunning() is true, i.e.
+        //      the fix really does register the instance before PDO.
+        //   2. Uses proc_get_status() via isRunning() to confirm the
+        //      process has actually been terminated after cleanupAll(),
+        //      not just absent from the pid table — this catches the
+        //      zombie case where the PID is reaped but the resource
+        //      handle leaks.
+        //   3. Asserts $liveInstances is emptied post-cleanup, proving
+        //      there's no lingering reference that would prevent the
+        //      next start() from reusing the same tracker slot.
+        //
+        // If the fix ever regresses — if someone moves
+        // registerForCleanup() back after the PDO construction — this
+        // test fails on the "instance should be tracked" assertion
+        // below because $liveInstances stays empty when start() throws.
+        if (!extension_loaded('pdo_pgsql')) {
+            $this->markTestSkipped('pdo_pgsql not loaded');
+        }
+
+        $port = $this->findFreePort();
+
+        // Fake binary binds the port + accepts connections but closes them
+        // immediately without speaking Postgres — PDO construction fails.
+        $fake = $this->makeFakeBinary(
+            "#!/bin/sh\n"
+            . "exec python3 -c \"import socket\n"
+            . "s=socket.socket()\n"
+            . "s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)\n"
+            . "s.bind(('127.0.0.1',{$port}))\n"
+            . "s.listen(5)\n"
+            . "while True:\n"
+            . "    c,_=s.accept()\n"
+            . "    c.close()\"\n"
+        );
+
+        $origBinary = getenv('GOLDLAPEL_BINARY');
+
+        try {
+            putenv("GOLDLAPEL_BINARY={$fake}");
+
+            $threw = false;
+            try {
+                GoldLapel::start(
+                    'postgresql://user:pass@localhost:5432/testdb',
+                    ['port' => $port, 'dashboard_port' => 0]
+                );
+            } catch (\Throwable $e) {
+                $threw = true;
+            }
+
+            $this->assertTrue($threw, 'start() must throw when PDO construction fails against a fake listener.');
+
+            // Pull the orphaned instance out of $liveInstances — the user
+            // has no reference to it since start() threw before returning,
+            // but the fix registers it during startProxyWithoutConnect().
+            $ref = new \ReflectionProperty(GoldLapel::class, 'liveInstances');
+            $ref->setAccessible(true);
+            /** @var array<int, GoldLapel> $live */
+            $live = $ref->getValue();
+            $this->assertCount(1, $live, 'Instance must be tracked despite PDO failure.');
+
+            /** @var GoldLapel $orphan */
+            $orphan = array_values($live)[0];
+
+            // proc_get_status (via isRunning()) must confirm the subprocess
+            // is actually running — this is the invariant the fix preserves.
+            $this->assertTrue(
+                $orphan->isRunning(),
+                'Subprocess must still be alive after PDO failure so cleanupAll has something to kill.'
+            );
+
+            // cleanupAll terminates the subprocess. isRunning() must then
+            // flip to false — which exercises both proc_get_status and the
+            // zombie-detection cross-checks added in commit 07ba012.
+            GoldLapel::cleanupAll();
+
+            $this->assertFalse(
+                $orphan->isRunning(),
+                'isRunning() (proc_get_status) must report the subprocess stopped after cleanupAll.'
+            );
+
+            $live = $ref->getValue();
+            $this->assertCount(0, $live, 'cleanupAll must drain $liveInstances.');
+        } finally {
+            GoldLapel::cleanupAll();
+            if ($origBinary === false) {
+                putenv('GOLDLAPEL_BINARY');
+            } else {
+                putenv("GOLDLAPEL_BINARY={$origBinary}");
+            }
+        }
+    }
+
     // ------------------------------------------------------------------
     // Shutdown path / zombie detection.
     //
