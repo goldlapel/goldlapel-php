@@ -424,6 +424,39 @@ class GoldLapel
         return $this->connection;
     }
 
+    /**
+     * Return a CachedConnection wrapping the given executor. Uses the
+     * shared NativeCache (same instance the sync CachedPDO talks to), so
+     * writes through either path invalidate the other's cache entries.
+     *
+     * Pass $invalidationPort to override the derived port (default is
+     * proxy port + 2, or the `invalidation_port` config key).
+     */
+    public function wrapCached(
+        PostgresExecutor $conn,
+        ?int $invalidationPort = null,
+    ): CachedConnection {
+        if ($invalidationPort === null) {
+            $invalidationPort = isset($this->config['invalidation_port'])
+                ? (int) $this->config['invalidation_port']
+                : $this->port + 2;
+        }
+        $cache = \GoldLapel\NativeCache::getInstance();
+        if (!$cache->isConnected()) {
+            $cache->connectInvalidation($invalidationPort);
+        }
+        return new CachedConnection($conn, $cache);
+    }
+
+    /**
+     * Convenience: return a CachedConnection wrapping this instance's
+     * async connection. Shortcut for wrapCached($this->connection()).
+     */
+    public function cached(): CachedConnection
+    {
+        return $this->wrapCached($this->connection());
+    }
+
     private function resolveConn(?PostgresExecutor $conn): PostgresExecutor
     {
         if ($conn !== null) {

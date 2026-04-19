@@ -463,6 +463,54 @@ class IntegrationTest extends TestCase
         $this->assertTrue($dead, "subprocess pid {$pid} should exit after stop()");
     }
 
+    public function testCachedConnectionHitsL1OnRepeatRead(): void
+    {
+        $port = $this->uniqPort();
+        $gl = GoldLapel::start(self::$upstream, ['port' => $port, 'silent' => true])->await();
+        $table = 'amp_cache_' . bin2hex(random_bytes(4));
+        try {
+            $conn = $gl->connection();
+            $conn->query("CREATE TABLE {$table} (id INT PRIMARY KEY, v TEXT)");
+            $conn->execute("INSERT INTO {$table} VALUES (\$1, \$2)", [1, 'alice']);
+            $conn->execute("INSERT INTO {$table} VALUES (\$1, \$2)", [2, 'bob']);
+
+            $cached = $gl->cached();
+            $cache = $cached->getCache();
+            $before = $cache->statsMisses;
+
+            // First read — miss
+            $rows1 = [];
+            foreach ($cached->query("SELECT * FROM {$table} ORDER BY id") as $r) {
+                $rows1[] = $r;
+            }
+            $this->assertCount(2, $rows1);
+
+            // Second identical read — cache hit (if invalidation is connected)
+            $hitsBefore = $cache->statsHits;
+            $rows2 = [];
+            foreach ($cached->query("SELECT * FROM {$table} ORDER BY id") as $r) {
+                $rows2[] = $r;
+            }
+            $this->assertSame($rows1, $rows2);
+            // Only assert on cache stats if the invalidation socket is up —
+            // without it, put() short-circuits and every read is a miss.
+            if ($cache->isConnected()) {
+                $this->assertGreaterThan($hitsBefore, $cache->statsHits);
+            }
+
+            // Write via cached wrapper invalidates
+            $cached->execute("UPDATE {$table} SET v = \$1 WHERE id = \$2", ['carol', 1]);
+            $rows3 = [];
+            foreach ($cached->query("SELECT * FROM {$table} ORDER BY id") as $r) {
+                $rows3[] = $r;
+            }
+            $this->assertSame('carol', $rows3[0]['v']);
+        } finally {
+            $this->cleanup($table, $gl);
+            $gl->stop()->await();
+        }
+    }
+
     public function testStartProxyOnlyAllowsDeferredConnect(): void
     {
         $port = $this->uniqPort();
