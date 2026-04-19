@@ -147,19 +147,24 @@ class GoldLapel
     }
 
     /**
-     * Low-level factory variant: start the proxy and return just the proxy URL.
-     * Useful when you want to manage your own PDO connections, or in
-     * environments (like Laravel's service provider) where PDOs are created
-     * later by the framework.
+     * Low-level factory variant: start the proxy and return the instance
+     * without opening an internal PDO. Useful when you want to manage your
+     * own PDO connections, or in environments (like Laravel's service
+     * provider) where PDOs are created later by the framework.
+     *
+     * The instance's URL is available via `$gl->url()`. Callers that hold
+     * onto the returned instance can call `$gl->stop()` at worker shutdown
+     * (Octane, Swoole, RoadRunner) to release the subprocess deterministically
+     * rather than relying on `__destruct` or the process-wide shutdown hook.
      */
-    public static function startProxyOnly(string $upstream, array $options = []): string
+    public static function startProxyOnly(string $upstream, array $options = []): self
     {
         [$port, $config, $extraArgs, $silent] = self::parseStartOptions($options);
 
         $instance = new self($upstream, $port, $config, $extraArgs, $silent);
         $instance->startProxyWithoutConnect();
 
-        return $instance->url;
+        return $instance;
     }
 
     private static function parseStartOptions(array $options): array

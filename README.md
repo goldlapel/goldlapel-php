@@ -149,11 +149,14 @@ as a `config` entry and merged into `config`. So
 `['port' => 7932, 'mode' => 'waiter']` is equivalent to
 `['port' => 7932, 'config' => ['mode' => 'waiter']]`.
 
-### `GoldLapel::startProxyOnly(string $url, array $options = []): string`
+### `GoldLapel::startProxyOnly(string $url, array $options = []): GoldLapel`
 
-Low-level variant. Starts the proxy and returns just the URL string — no
-internal PDO is opened. Useful when the framework manages PDO
-construction (e.g. Laravel's service provider).
+Low-level variant. Starts the proxy and returns the instance without
+opening an internal PDO. Useful when the framework manages PDO
+construction (e.g. Laravel's service provider). Fetch the proxy URL
+with `$gl->url()`. Hold onto the returned instance and call
+`$gl->stop()` at worker shutdown (Octane, Swoole, RoadRunner) to
+release the subprocess deterministically.
 
 ### Instance methods
 

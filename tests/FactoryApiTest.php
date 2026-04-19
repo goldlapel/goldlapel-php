@@ -223,11 +223,13 @@ class FactoryApiTest extends TestCase
             // protocol). We bypass PDO by using startProxyOnly instead —
             // that still returns through the factory registration code
             // path, so it's a valid smoke test of the public API.
-            $url = GoldLapel::startProxyOnly(
+            $gl = GoldLapel::startProxyOnly(
                 'postgresql://user:pass@localhost:5432/db',
                 ['port' => $port, 'dashboard_port' => 0]
             );
 
+            $this->assertInstanceOf(GoldLapel::class, $gl);
+            $url = $gl->url();
             $this->assertIsString($url);
             $this->assertStringContainsString("localhost:{$port}", $url);
         } finally {

@@ -190,10 +190,17 @@ namespace GoldLapel {
         public static array $calls = [];
         public static array $wrapCalls = [];
 
+        /** @var array<int, self> */
+        public static array $liveInstances = [];
+
+        public int $stopCalls = 0;
+        private ?string $url = null;
+
         public static function reset(): void
         {
             self::$calls = [];
             self::$wrapCalls = [];
+            self::$liveInstances = [];
             NativeCache::reset();
         }
 
@@ -205,10 +212,14 @@ namespace GoldLapel {
                 'config' => $options['config'] ?? [],
                 'extraArgs' => $options['extra_args'] ?? [],
             ];
-            return new self();
+            $instance = new self();
+            $port = $options['port'] ?? self::DEFAULT_PORT;
+            $instance->url = "postgresql://localhost:{$port}/db";
+            self::$liveInstances[spl_object_id($instance)] = $instance;
+            return $instance;
         }
 
-        public static function startProxyOnly(string $upstream, array $options = []): string
+        public static function startProxyOnly(string $upstream, array $options = []): self
         {
             $port = $options['port'] ?? self::DEFAULT_PORT;
             self::$calls[] = [
@@ -217,7 +228,10 @@ namespace GoldLapel {
                 'config' => $options['config'] ?? [],
                 'extraArgs' => $options['extra_args'] ?? [],
             ];
-            return "postgresql://localhost:{$port}/db";
+            $instance = new self();
+            $instance->url = "postgresql://localhost:{$port}/db";
+            self::$liveInstances[spl_object_id($instance)] = $instance;
+            return $instance;
         }
 
         public static function wrapPDOStatic(\PDO $pdo, int $invalidationPort): CachedPDO
@@ -232,8 +246,13 @@ namespace GoldLapel {
             return new CachedPDO($pdo, $cache);
         }
 
-        public function stop(): void {}
-        public function url(): ?string { return null; }
+        public function stop(): void
+        {
+            $this->stopCalls++;
+            unset(self::$liveInstances[spl_object_id($this)]);
+        }
+
+        public function url(): ?string { return $this->url; }
         public static function cleanupAll(): void {}
     }
 }
