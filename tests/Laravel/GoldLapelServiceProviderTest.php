@@ -173,6 +173,83 @@ class GoldLapelServiceProviderTest extends TestCase
         $this->assertSame(9000, config('database.connections.pgsql.port'));
     }
 
+    public function testLogLevelForwardedToStartProxyOnly(): void
+    {
+        // Regression: `log_level` under the per-connection `goldlapel`
+        // block was silently dropped by boot() — the provider read it into
+        // a local but never passed it to startProxyOnly(). The result: a
+        // `log_level: debug` setting in config/database.php had zero
+        // effect on the spawned subprocess's -v/-vv/-vvv verbosity. The
+        // real translation (string -> -v count) is covered by
+        // FactoryApiTest::testParseOptionsLogLevel*; this test pins the
+        // provider-level forwarding.
+        $this->bootProvider([
+            'pgsql' => [
+                'driver' => 'pgsql',
+                'host' => 'h',
+                'port' => '5432',
+                'database' => 'db',
+                'username' => 'u',
+                'password' => 'p',
+                'goldlapel' => [
+                    'log_level' => 'debug',
+                ],
+            ],
+        ]);
+
+        $this->assertCount(1, GoldLapel::$calls);
+        $this->assertSame('debug', GoldLapel::$calls[0]['logLevel']);
+    }
+
+    public function testLogLevelOmittedWhenNotConfigured(): void
+    {
+        // When log_level is not set we must NOT forward a null — that
+        // would trigger the wrapper's validation ("must be a string")
+        // and abort boot. Keep the options dict slim.
+        $this->bootProvider([
+            'pgsql' => [
+                'driver' => 'pgsql',
+                'host' => 'h',
+                'port' => '5432',
+                'database' => 'db',
+                'username' => 'u',
+                'password' => 'p',
+            ],
+        ]);
+
+        $this->assertCount(1, GoldLapel::$calls);
+        $this->assertNull(GoldLapel::$calls[0]['logLevel']);
+    }
+
+    public function testLogLevelForwardedAlongsideOtherOptions(): void
+    {
+        // Verify log_level coexists cleanly with port / config / extra_args
+        // — the provider builds the options dict in one pass.
+        $this->bootProvider([
+            'pgsql' => [
+                'driver' => 'pgsql',
+                'host' => 'h',
+                'port' => '5432',
+                'database' => 'db',
+                'username' => 'u',
+                'password' => 'p',
+                'goldlapel' => [
+                    'port' => 9001,
+                    'log_level' => 'trace',
+                    'config' => ['mode' => 'waiter'],
+                    'extra_args' => ['--flag'],
+                ],
+            ],
+        ]);
+
+        $this->assertCount(1, GoldLapel::$calls);
+        $call = GoldLapel::$calls[0];
+        $this->assertSame(9001, $call['port']);
+        $this->assertSame('trace', $call['logLevel']);
+        $this->assertSame(['mode' => 'waiter'], $call['config']);
+        $this->assertSame(['--flag'], $call['extraArgs']);
+    }
+
     public function testEmptyConfigArray(): void
     {
         $this->bootProvider([

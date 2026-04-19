@@ -211,6 +211,7 @@ namespace GoldLapel {
                 'port' => $options['port'] ?? self::DEFAULT_PORT,
                 'config' => $options['config'] ?? [],
                 'extraArgs' => $options['extra_args'] ?? [],
+                'logLevel' => $options['log_level'] ?? null,
             ];
             $instance = new self();
             $port = $options['port'] ?? self::DEFAULT_PORT;
@@ -227,6 +228,7 @@ namespace GoldLapel {
                 'port' => $port,
                 'config' => $options['config'] ?? [],
                 'extraArgs' => $options['extra_args'] ?? [],
+                'logLevel' => $options['log_level'] ?? null,
             ];
             $instance = new self();
             $instance->url = "postgresql://localhost:{$port}/db";
