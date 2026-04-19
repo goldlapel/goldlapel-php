@@ -169,6 +169,26 @@ Plus the full wrapper surface (~61 methods): `docInsert`, `docFind`,
 `zadd`, `hset`, `streamAdd`, `percolate`, `analyze`, etc. Every method
 accepts an optional `conn:` named argument.
 
+#### `$gl->script(string $luaCode, mixed ...$args): ?string`
+
+Run a Lua script via `pllua`. The trailing `...$args` are forwarded as the
+script's text parameters.
+
+> **No `conn:` override on `script()`.** The variadic `...$args` signature
+> would swallow any trailing `\PDO` rather than treat it as the
+> per-call connection. To run `script()` on a specific connection, wrap
+> the call in `using()`:
+>
+> ```php
+> $gl->using($myPdo, fn ($gl) => $gl->script($lua, 'arg1', 'arg2'));
+> ```
+>
+> Or call the underlying static helper directly for one-off use:
+>
+> ```php
+> GoldLapel\Utils::script($myPdo, $lua, 'arg1', 'arg2');
+> ```
+
 ## Upgrading from 0.1.x
 
 v0.2.0 is a breaking change — there is no compatibility shim.

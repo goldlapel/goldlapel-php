@@ -1024,11 +1024,27 @@ class GoldLapel
         return Utils::countDistinct($this->resolveConn($conn), $table, $column);
     }
 
+    /**
+     * Run a Lua script via `pllua`. Positional `$args` are forwarded as the
+     * script's text parameters.
+     *
+     * **No `conn:` override.** Every other wrapper method accepts an optional
+     * trailing `?\PDO $conn = null`, but `script()`'s variadic `...$args`
+     * would swallow any trailing `\PDO` instead of treating it as the
+     * override, so the signature intentionally omits it. The script always
+     * runs on the resolved ambient connection — either the `using()` scope
+     * (if set) or the factory-managed internal PDO.
+     *
+     * To run `script()` on a specific connection, wrap the call in `using()`:
+     *
+     *     $gl->using($myPdo, fn ($gl) => $gl->script($lua, 'arg1', 'arg2'));
+     *
+     * Or call the underlying static helper directly for one-off use:
+     *
+     *     Utils::script($myPdo, $lua, 'arg1', 'arg2');
+     */
     public function script(string $luaCode, mixed ...$args): ?string
     {
-        // `script` takes variadic positional args for the script; use the
-        // ambient connection (no conn: override). Callers who need per-call
-        // conn control should fall back to Utils::script() directly.
         return Utils::script($this->resolveConn(null), $luaCode, ...$args);
     }
 
