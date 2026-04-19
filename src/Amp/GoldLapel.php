@@ -442,16 +442,34 @@ class GoldLapel
 
     /**
      * Convert a `postgres://user:pass@host:port/db` URL to the
-     * space-separated keyword form expected by PostgresConfig::fromString().
-     * amphp's parser accepts keyword form OR URL form, but URL form with
-     * percent-encoded characters trips the sync URL parser — stick with
-     * the URL directly since parseConnectionString understands it.
+     * space-separated `host=... port=... user=... password=... dbname=...`
+     * keyword form that Amp\Postgres\PostgresConfig::fromString() expects.
+     * amphp does NOT accept URL form; its parser errors with "Trailing
+     * characters in connection string".
      */
     private static function urlToAmphpConnString(string $url): string
     {
-        // PostgresConfig::fromString delegates to SqlConfig::parseConnectionString
-        // which accepts either form. URLs work out of the box.
-        return $url;
+        $parsed = parse_url($url);
+        if ($parsed === false || !isset($parsed['host'])) {
+            throw new RuntimeException("Cannot parse proxy URL: {$url}");
+        }
+        $parts = ['host=' . $parsed['host']];
+        if (isset($parsed['port'])) {
+            $parts[] = 'port=' . (int) $parsed['port'];
+        }
+        if (isset($parsed['user']) && $parsed['user'] !== '') {
+            $user = rawurldecode($parsed['user']);
+            $parts[] = "user='" . addslashes($user) . "'";
+        }
+        if (isset($parsed['pass']) && $parsed['pass'] !== '') {
+            $pass = rawurldecode($parsed['pass']);
+            $parts[] = "password='" . addslashes($pass) . "'";
+        }
+        if (isset($parsed['path']) && $parsed['path'] !== '' && $parsed['path'] !== '/') {
+            $db = ltrim($parsed['path'], '/');
+            $parts[] = "dbname='" . addslashes($db) . "'";
+        }
+        return implode(' ', $parts);
     }
 
     // ------------------------------------------------------------------

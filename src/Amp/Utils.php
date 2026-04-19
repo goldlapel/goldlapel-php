@@ -56,19 +56,20 @@ use GoldLapel\Utils as SyncUtils;
 class Utils
 {
     /**
-     * Translate PDO `?` placeholders to `$N` placeholders used by amphp/
-     * postgres (libpq). Walks the SQL skipping single-quoted strings, double-
-     * quoted identifiers, line/block comments, and dollar-quoted function
-     * bodies (used by pllua in script()).
+     * Translate SQL for amphp/postgres. Historical name — today the
+     * function mostly exists to pre-rewrite the JSONB `data ? ?` operator
+     * pattern (emitted by shared SyncUtils::buildFilter for `$exists` and
+     * by hdel) into the function form jsonb_exists(data, ?). amphp's own
+     * SQL parser is already smart enough to distinguish `?` placeholders
+     * from JSONB `?` operators in most cases (see STATEMENT_PARAM_REGEX in
+     * vendor/amphp/postgres), but `data ? ?` is an edge case where an
+     * operator `?` is immediately followed by a placeholder `?` with
+     * nothing between them — the regex can't tell which is which. The
+     * pre-rewrite is the only SQL-level divergence from sync.
      *
-     * JSONB operator note: sync SQL uses `data ? ?` for the JSONB existence
-     * operator in two places (buildFilter `$exists` and hdel). The first `?`
-     * is the JSONB operator, the second a placeholder. Since libpq has no
-     * client-side parser, we can't inject a `?` operator and a `$N`
-     * placeholder side by side — Postgres itself sees them as tokens. We
-     * pre-rewrite those patterns to the equivalent `jsonb_exists(...)`
-     * function form (a Postgres built-in alias for `?`), which is placeholder-
-     * friendly. This rewrite is the only SQL-level divergence from sync.
+     * After the rewrite we STILL translate bare `?` → `$N` ourselves so
+     * callers downstream don't have to worry about amphp's placeholder
+     * counter — identical shape to the sync PDO path.
      *
      * @param list<mixed> $params
      * @return array{0: string, 1: list<mixed>} translated SQL + params
@@ -765,9 +766,13 @@ class Utils
             )
         ");
         $json = json_encode($value);
+        // Explicit ::text casts needed: amphp/postgres uses libpq's
+        // prepared-statement path which asks the server to infer parameter
+        // types. jsonb_build_object is polymorphic, so the server can't
+        // infer that $2 is text — add the cast.
         self::exec($conn, "
-            INSERT INTO {$table} (key, data) VALUES (?, jsonb_build_object(?, ?::jsonb))
-            ON CONFLICT (key) DO UPDATE SET data = {$table}.data || jsonb_build_object(?, ?::jsonb)
+            INSERT INTO {$table} (key, data) VALUES (?, jsonb_build_object(?::text, ?::jsonb))
+            ON CONFLICT (key) DO UPDATE SET data = {$table}.data || jsonb_build_object(?::text, ?::jsonb)
         ", [$key, $field, $json, $field, $json]);
     }
 
@@ -1281,20 +1286,33 @@ class Utils
         }
 
         $cursorName = 'gl_cursor_' . bin2hex(random_bytes(4));
-        $queue = new Queue();
+        // Use a buffered queue. pushAsync returns a Future for each push,
+        // which we discard — the queue buffers pending values and the
+        // consumer drains them via iterate(). Buffer size matches batchSize
+        // so a whole batch can be pushed without producer suspending.
+        $queue = new Queue($batchSize + 1);
 
         \Amp\async(static function () use ($conn, $sql, $params, $cursorName, $batchSize, $queue): void {
             $tx = $conn->beginTransaction();
             try {
                 self::exec($tx, "DECLARE {$cursorName} CURSOR FOR {$sql}", $params);
                 while (true) {
-                    $result = $tx->query("FETCH {$batchSize} FROM {$cursorName}");
+                    // Tag each FETCH with the `goldlapel:skip` annotation so
+                    // the Rust proxy doesn't put it through rewrite + result-
+                    // cache (cursor FETCH is stateful and must not be
+                    // replayed from a cached batch).
+                    $result = $tx->query("/* goldlapel:skip */ FETCH {$batchSize} FROM {$cursorName}");
                     $count = 0;
                     foreach ($result as $row) {
-                        $queue->push($row);
+                        $queue->pushAsync($row);
                         $count++;
                     }
                     if ($count === 0) {
+                        break;
+                    }
+                    if ($count < $batchSize) {
+                        // Partial batch means the cursor is exhausted;
+                        // skip the extra FETCH that would return 0 rows.
                         break;
                     }
                 }
@@ -1303,7 +1321,11 @@ class Utils
                 $queue->complete();
             } catch (\Throwable $e) {
                 if ($tx->isActive()) {
-                    $tx->rollback();
+                    try {
+                        $tx->rollback();
+                    } catch (\Throwable $inner) {
+                        // ignore
+                    }
                 }
                 $queue->error($e);
             }
