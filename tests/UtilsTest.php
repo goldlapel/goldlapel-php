@@ -3,8 +3,10 @@
 namespace GoldLapel\Tests;
 
 use GoldLapel\Utils;
+use PHPUnit\Framework\Attributes\AllowMockObjectsWithoutExpectations;
 use PHPUnit\Framework\TestCase;
 
+#[AllowMockObjectsWithoutExpectations]
 class UtilsTest extends TestCase
 {
     private function makeMockPDO(): \PDO

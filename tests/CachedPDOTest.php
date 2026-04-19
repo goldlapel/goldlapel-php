@@ -5,8 +5,10 @@ namespace GoldLapel\Tests;
 use GoldLapel\CachedPDO;
 use GoldLapel\CachedPDOStatement;
 use GoldLapel\NativeCache;
+use PHPUnit\Framework\Attributes\AllowMockObjectsWithoutExpectations;
 use PHPUnit\Framework\TestCase;
 
+#[AllowMockObjectsWithoutExpectations]
 class CachedPDOTest extends TestCase
 {
     private NativeCache $cache;

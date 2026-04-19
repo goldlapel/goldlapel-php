@@ -3,9 +3,11 @@
 namespace GoldLapel\Tests;
 
 use GoldLapel\GoldLapel;
+use PHPUnit\Framework\Attributes\AllowMockObjectsWithoutExpectations;
 use PHPUnit\Framework\TestCase;
 use RuntimeException;
 
+#[AllowMockObjectsWithoutExpectations]
 class InstanceMethodsTest extends TestCase
 {
     private function makeGlWithMockPDO(): array

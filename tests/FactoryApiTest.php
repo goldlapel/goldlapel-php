@@ -3,6 +3,7 @@
 namespace GoldLapel\Tests;
 
 use GoldLapel\GoldLapel;
+use PHPUnit\Framework\Attributes\AllowMockObjectsWithoutExpectations;
 use PHPUnit\Framework\TestCase;
 use RuntimeException;
 
@@ -13,6 +14,7 @@ use RuntimeException;
  * without spawning the actual proxy binary. See FactoryIntegrationTest for
  * end-to-end tests that use a real goldlapel subprocess.
  */
+#[AllowMockObjectsWithoutExpectations]
 class FactoryApiTest extends TestCase
 {
     // ------------------------------------------------------------------
