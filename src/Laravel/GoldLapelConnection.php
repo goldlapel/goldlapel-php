@@ -21,7 +21,10 @@ class GoldLapelConnection extends PostgresConnection
     {
         if ($this->cachedPdo === null) {
             $pdo = $this->getPdo();
-            $this->cachedPdo = GoldLapel::wrapPDO($pdo, $this->invalidationPort);
+            // Default to proxy_port + 2 when not explicitly configured.
+            $port = $this->invalidationPort
+                ?? (((int) ($this->getConfig('port') ?? GoldLapel::DEFAULT_PORT)) + 2);
+            $this->cachedPdo = GoldLapel::wrapPDOStatic($pdo, $port);
         }
 
         return $this->cachedPdo;

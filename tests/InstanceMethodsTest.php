@@ -3,9 +3,11 @@
 namespace GoldLapel\Tests;
 
 use GoldLapel\GoldLapel;
+use PHPUnit\Framework\Attributes\AllowMockObjectsWithoutExpectations;
 use PHPUnit\Framework\TestCase;
 use RuntimeException;
 
+#[AllowMockObjectsWithoutExpectations]
 class InstanceMethodsTest extends TestCase
 {
     private function makeGlWithMockPDO(): array
@@ -13,6 +15,8 @@ class InstanceMethodsTest extends TestCase
         $gl = new GoldLapel('postgresql://user:pass@host:5432/db');
         $pdo = $this->createMock(\PDO::class);
 
+        // Inject the mock PDO via reflection — the real factory goes
+        // through proc_open/PDO construction which we can't do in unit tests.
         $ref = new \ReflectionProperty(GoldLapel::class, 'pdo');
         $ref->setAccessible(true);
         $ref->setValue($gl, $pdo);
@@ -50,15 +54,15 @@ class InstanceMethodsTest extends TestCase
     }
 
     // ========================================================================
-    // stopProxy() clears PDO
+    // stop() clears PDO
     // ========================================================================
 
-    public function testStopProxyClearsPdo(): void
+    public function testStopClearsPdo(): void
     {
         [$gl, $pdo] = $this->makeGlWithMockPDO();
         $this->assertSame($pdo, $gl->pdo());
 
-        $gl->stopProxy();
+        $gl->stop();
 
         $this->expectException(RuntimeException::class);
         $this->expectExceptionMessage('Not connected');
@@ -478,5 +482,188 @@ class InstanceMethodsTest extends TestCase
         $this->expectException(RuntimeException::class);
         $this->expectExceptionMessage('Not connected');
         $gl->incr('counters', 'views');
+    }
+
+    // ========================================================================
+    // Regression: methods that were previously missing from the instance API
+    // (docDistinct, docFindCursor, docFindOneAndDelete, docFindOneAndUpdate)
+    // ========================================================================
+
+    public function testDocDistinctMethodExists(): void
+    {
+        $this->assertTrue(method_exists(GoldLapel::class, 'docDistinct'));
+    }
+
+    public function testDocFindCursorMethodExists(): void
+    {
+        $this->assertTrue(method_exists(GoldLapel::class, 'docFindCursor'));
+    }
+
+    public function testDocFindOneAndDeleteMethodExists(): void
+    {
+        $this->assertTrue(method_exists(GoldLapel::class, 'docFindOneAndDelete'));
+    }
+
+    public function testDocFindOneAndUpdateMethodExists(): void
+    {
+        $this->assertTrue(method_exists(GoldLapel::class, 'docFindOneAndUpdate'));
+    }
+
+    public function testDocDistinctDelegatesToUtilsWithResolvedConn(): void
+    {
+        [$gl, $pdo] = $this->makeGlWithMockPDO();
+        $stmt = $this->createMock(\PDOStatement::class);
+        $stmt->method('execute')->willReturn(true);
+        $stmt->method('fetchAll')->willReturn([['NYC'], ['LA']]);
+
+        // Only the internal PDO should be used — confirms resolveConn() ran.
+        $pdo->expects($this->once())
+            ->method('prepare')
+            ->willReturn($stmt);
+
+        $result = $gl->docDistinct('users', 'city');
+        $this->assertSame(['NYC', 'LA'], $result);
+    }
+
+    public function testDocDistinctConnOverride(): void
+    {
+        [$gl, $defaultPdo] = $this->makeGlWithMockPDO();
+        $overridePdo = $this->createMock(\PDO::class);
+
+        $stmt = $this->createMock(\PDOStatement::class);
+        $stmt->method('execute')->willReturn(true);
+        $stmt->method('fetchAll')->willReturn([]);
+
+        $defaultPdo->expects($this->never())->method('prepare');
+        $overridePdo->expects($this->once())
+            ->method('prepare')
+            ->willReturn($stmt);
+
+        $gl->docDistinct('users', 'city', null, conn: $overridePdo);
+    }
+
+    public function testDocFindOneAndUpdateDelegatesToUtilsWithResolvedConn(): void
+    {
+        [$gl, $pdo] = $this->makeGlWithMockPDO();
+        $row = ['_id' => 'abc', 'data' => '{"name":"Alice"}', 'created_at' => '2026-01-01'];
+        $stmt = $this->createMock(\PDOStatement::class);
+        $stmt->method('execute')->willReturn(true);
+        $stmt->method('fetch')->willReturn($row);
+
+        $pdo->expects($this->once())
+            ->method('prepare')
+            ->willReturn($stmt);
+
+        $result = $gl->docFindOneAndUpdate('users', ['name' => 'Alice'], ['name' => 'Bob']);
+        $this->assertSame('abc', $result['_id']);
+    }
+
+    public function testDocFindOneAndUpdateConnOverride(): void
+    {
+        [$gl, $defaultPdo] = $this->makeGlWithMockPDO();
+        $overridePdo = $this->createMock(\PDO::class);
+
+        $stmt = $this->createMock(\PDOStatement::class);
+        $stmt->method('execute')->willReturn(true);
+        $stmt->method('fetch')->willReturn(false);
+
+        $defaultPdo->expects($this->never())->method('prepare');
+        $overridePdo->expects($this->once())
+            ->method('prepare')
+            ->willReturn($stmt);
+
+        $result = $gl->docFindOneAndUpdate('users', ['x' => 1], ['y' => 2], conn: $overridePdo);
+        $this->assertNull($result);
+    }
+
+    public function testDocFindOneAndDeleteDelegatesToUtilsWithResolvedConn(): void
+    {
+        [$gl, $pdo] = $this->makeGlWithMockPDO();
+        $row = ['_id' => 'abc', 'data' => '{"name":"Alice"}', 'created_at' => '2026-01-01'];
+        $stmt = $this->createMock(\PDOStatement::class);
+        $stmt->method('execute')->willReturn(true);
+        $stmt->method('fetch')->willReturn($row);
+
+        $pdo->expects($this->once())
+            ->method('prepare')
+            ->willReturn($stmt);
+
+        $result = $gl->docFindOneAndDelete('users', ['name' => 'Alice']);
+        $this->assertSame('abc', $result['_id']);
+    }
+
+    public function testDocFindOneAndDeleteConnOverride(): void
+    {
+        [$gl, $defaultPdo] = $this->makeGlWithMockPDO();
+        $overridePdo = $this->createMock(\PDO::class);
+
+        $stmt = $this->createMock(\PDOStatement::class);
+        $stmt->method('execute')->willReturn(true);
+        $stmt->method('fetch')->willReturn(false);
+
+        $defaultPdo->expects($this->never())->method('prepare');
+        $overridePdo->expects($this->once())
+            ->method('prepare')
+            ->willReturn($stmt);
+
+        $result = $gl->docFindOneAndDelete('users', ['x' => 1], conn: $overridePdo);
+        $this->assertNull($result);
+    }
+
+    public function testDocFindCursorDelegatesToUtilsWithResolvedConn(): void
+    {
+        [$gl, $pdo] = $this->makeGlWithMockPDO();
+        // docFindCursor opens a server-side cursor: DECLARE via prepare(),
+        // then FETCH via query() in a loop.
+        $declareStmt = $this->createMock(\PDOStatement::class);
+        $declareStmt->method('execute')->willReturn(true);
+
+        $fetchStmt = $this->createMock(\PDOStatement::class);
+        $fetchStmt->method('fetchAll')->willReturnOnConsecutiveCalls(
+            [['_id' => 'a', 'data' => '{"n":1}', 'created_at' => '2026-01-01']],
+            [],
+        );
+
+        $pdo->method('exec')->willReturn(0);
+        $pdo->expects($this->atLeastOnce())
+            ->method('prepare')
+            ->willReturn($declareStmt);
+        $pdo->expects($this->atLeastOnce())
+            ->method('query')
+            ->willReturn($fetchStmt);
+
+        $gen = $gl->docFindCursor('users');
+        $this->assertInstanceOf(\Generator::class, $gen);
+
+        $rows = iterator_to_array($gen, false);
+        $this->assertCount(1, $rows);
+        $this->assertSame('a', $rows[0]['_id']);
+    }
+
+    public function testDocFindCursorConnOverride(): void
+    {
+        [$gl, $defaultPdo] = $this->makeGlWithMockPDO();
+        $overridePdo = $this->createMock(\PDO::class);
+
+        $declareStmt = $this->createMock(\PDOStatement::class);
+        $declareStmt->method('execute')->willReturn(true);
+
+        $fetchStmt = $this->createMock(\PDOStatement::class);
+        $fetchStmt->method('fetchAll')->willReturn([]);
+
+        $defaultPdo->expects($this->never())->method('prepare');
+        $defaultPdo->expects($this->never())->method('query');
+
+        $overridePdo->method('exec')->willReturn(0);
+        $overridePdo->expects($this->atLeastOnce())
+            ->method('prepare')
+            ->willReturn($declareStmt);
+        $overridePdo->expects($this->atLeastOnce())
+            ->method('query')
+            ->willReturn($fetchStmt);
+
+        $gen = $gl->docFindCursor('users', conn: $overridePdo);
+        // Drain the generator so the override PDO is exercised.
+        iterator_to_array($gen, false);
     }
 }

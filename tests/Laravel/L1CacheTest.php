@@ -136,7 +136,8 @@ class L1CacheTest extends TestCase
 
         $this->assertCount(1, GoldLapel::$wrapCalls);
         $this->assertSame($fakePdo, GoldLapel::$wrapCalls[0]['pdo']);
-        $this->assertNull(GoldLapel::$wrapCalls[0]['invalidationPort']);
+        // Default invalidation port = proxy_port + 2 = 7934
+        $this->assertSame(GoldLapel::DEFAULT_PORT + 2, GoldLapel::$wrapCalls[0]['invalidationPort']);
     }
 
     public function testCustomInvalidationPortPassedToWrapPDO(): void

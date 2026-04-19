@@ -190,34 +190,72 @@ namespace GoldLapel {
         public static array $calls = [];
         public static array $wrapCalls = [];
 
+        /** @var array<int, self> */
+        public static array $liveInstances = [];
+
+        public int $stopCalls = 0;
+        private ?string $url = null;
+
         public static function reset(): void
         {
             self::$calls = [];
             self::$wrapCalls = [];
+            self::$liveInstances = [];
             NativeCache::reset();
         }
 
-        public static function start(string $upstream, ?int $port = null, array $config = [], array $extraArgs = []): string
+        public static function start(string $upstream, array $options = []): self
         {
-            self::$calls[] = compact('upstream', 'port', 'config', 'extraArgs');
-            return "postgresql://localhost:{$port}/db";
+            self::$calls[] = [
+                'upstream' => $upstream,
+                'port' => $options['port'] ?? self::DEFAULT_PORT,
+                'config' => $options['config'] ?? [],
+                'extraArgs' => $options['extra_args'] ?? [],
+                'logLevel' => $options['log_level'] ?? null,
+            ];
+            $instance = new self();
+            $port = $options['port'] ?? self::DEFAULT_PORT;
+            $instance->url = "postgresql://localhost:{$port}/db";
+            self::$liveInstances[spl_object_id($instance)] = $instance;
+            return $instance;
         }
 
-        public static function wrapPDO(\PDO $pdo, ?int $invalidationPort = null): CachedPDO
+        public static function startProxyOnly(string $upstream, array $options = []): self
+        {
+            $port = $options['port'] ?? self::DEFAULT_PORT;
+            self::$calls[] = [
+                'upstream' => $upstream,
+                'port' => $port,
+                'config' => $options['config'] ?? [],
+                'extraArgs' => $options['extra_args'] ?? [],
+                'logLevel' => $options['log_level'] ?? null,
+            ];
+            $instance = new self();
+            $instance->url = "postgresql://localhost:{$port}/db";
+            self::$liveInstances[spl_object_id($instance)] = $instance;
+            return $instance;
+        }
+
+        public static function wrapPDOStatic(\PDO $pdo, int $invalidationPort): CachedPDO
         {
             self::$wrapCalls[] = compact('pdo', 'invalidationPort');
 
             $cache = NativeCache::getInstance();
             if (!$cache->isConnected()) {
-                $cache->connectInvalidation($invalidationPort ?? self::DEFAULT_PORT + 2);
+                $cache->connectInvalidation($invalidationPort);
             }
 
             return new CachedPDO($pdo, $cache);
         }
 
-        public static function stop(): void {}
-        public static function proxyUrl(): ?string { return null; }
-        public static function cleanup(): void {}
+        public function stop(): void
+        {
+            $this->stopCalls++;
+            unset(self::$liveInstances[spl_object_id($this)]);
+        }
+
+        public function url(): ?string { return $this->url; }
+        public static function cleanupAll(): void {}
     }
 }
 
