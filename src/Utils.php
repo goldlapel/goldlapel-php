@@ -129,12 +129,14 @@ class Utils
 
     public static function publish(\PDO $pdo, string $channel, string $message): void
     {
+        self::validateIdentifier($channel);
         $stmt = $pdo->prepare("SELECT pg_notify(?, ?)");
         $stmt->execute([$channel, $message]);
     }
 
     public static function subscribe(\PDO $pdo, string $channel, callable $callback): void
     {
+        self::validateIdentifier($channel);
         $pdo->exec("LISTEN " . $channel);
         while (true) {
             $notify = $pdo->pgsqlGetNotify(\PDO::FETCH_ASSOC, 5000);
@@ -146,6 +148,7 @@ class Utils
 
     public static function enqueue(\PDO $pdo, string $queueTable, array $payload): void
     {
+        self::validateIdentifier($queueTable);
         $pdo->exec("
             CREATE TABLE IF NOT EXISTS {$queueTable} (
                 id BIGSERIAL PRIMARY KEY,
@@ -159,6 +162,7 @@ class Utils
 
     public static function dequeue(\PDO $pdo, string $queueTable): ?array
     {
+        self::validateIdentifier($queueTable);
         $stmt = $pdo->query("
             DELETE FROM {$queueTable}
             WHERE id = (
@@ -179,6 +183,7 @@ class Utils
 
     public static function incr(\PDO $pdo, string $table, string $key, int $amount = 1): int
     {
+        self::validateIdentifier($table);
         $pdo->exec("
             CREATE TABLE IF NOT EXISTS {$table} (
                 key TEXT PRIMARY KEY,
@@ -196,6 +201,7 @@ class Utils
 
     public static function getCounter(\PDO $pdo, string $table, string $key): int
     {
+        self::validateIdentifier($table);
         $stmt = $pdo->prepare("SELECT value FROM {$table} WHERE key = ?");
         $stmt->execute([$key]);
         $value = $stmt->fetchColumn();
@@ -204,6 +210,7 @@ class Utils
 
     public static function zadd(\PDO $pdo, string $table, string $member, float $score): void
     {
+        self::validateIdentifier($table);
         $pdo->exec("
             CREATE TABLE IF NOT EXISTS {$table} (
                 member TEXT PRIMARY KEY,
@@ -219,6 +226,7 @@ class Utils
 
     public static function zincrby(\PDO $pdo, string $table, string $member, float $amount = 1): float
     {
+        self::validateIdentifier($table);
         $pdo->exec("
             CREATE TABLE IF NOT EXISTS {$table} (
                 member TEXT PRIMARY KEY,
@@ -236,6 +244,7 @@ class Utils
 
     public static function zrange(\PDO $pdo, string $table, int $start = 0, int $stop = 10, bool $desc = true): array
     {
+        self::validateIdentifier($table);
         $order = $desc ? 'DESC' : 'ASC';
         $limit = $stop - $start;
         $stmt = $pdo->prepare("
@@ -249,6 +258,7 @@ class Utils
 
     public static function zrank(\PDO $pdo, string $table, string $member, bool $desc = true): ?int
     {
+        self::validateIdentifier($table);
         $order = $desc ? 'DESC' : 'ASC';
         $stmt = $pdo->prepare("
             SELECT rank FROM (
@@ -264,6 +274,7 @@ class Utils
 
     public static function zscore(\PDO $pdo, string $table, string $member): ?float
     {
+        self::validateIdentifier($table);
         $stmt = $pdo->prepare("SELECT score FROM {$table} WHERE member = ?");
         $stmt->execute([$member]);
         $value = $stmt->fetchColumn();
@@ -272,6 +283,7 @@ class Utils
 
     public static function zrem(\PDO $pdo, string $table, string $member): bool
     {
+        self::validateIdentifier($table);
         $stmt = $pdo->prepare("DELETE FROM {$table} WHERE member = ?");
         $stmt->execute([$member]);
         return $stmt->rowCount() > 0;
@@ -286,6 +298,9 @@ class Utils
         float $lon,
         float $lat,
     ): void {
+        self::validateIdentifier($table);
+        self::validateIdentifier($nameColumn);
+        self::validateIdentifier($geomColumn);
         $pdo->exec("CREATE EXTENSION IF NOT EXISTS postgis");
         $pdo->exec("
             CREATE TABLE IF NOT EXISTS {$table} (
@@ -310,6 +325,8 @@ class Utils
         float $radiusMeters,
         int $limit = 50,
     ): array {
+        self::validateIdentifier($table);
+        self::validateIdentifier($geomColumn);
         $stmt = $pdo->prepare("
             SELECT *, ST_Distance(
                 {$geomColumn}::geography,
@@ -336,6 +353,9 @@ class Utils
         string $nameA,
         string $nameB,
     ): ?float {
+        self::validateIdentifier($table);
+        self::validateIdentifier($geomColumn);
+        self::validateIdentifier($nameColumn);
         $stmt = $pdo->prepare("
             SELECT ST_Distance(a.{$geomColumn}::geography, b.{$geomColumn}::geography)
             FROM {$table} a, {$table} b
@@ -348,6 +368,7 @@ class Utils
 
     public static function hset(\PDO $pdo, string $table, string $key, string $field, mixed $value): void
     {
+        self::validateIdentifier($table);
         $pdo->exec("
             CREATE TABLE IF NOT EXISTS {$table} (
                 key TEXT PRIMARY KEY,
@@ -364,6 +385,7 @@ class Utils
 
     public static function hget(\PDO $pdo, string $table, string $key, string $field): mixed
     {
+        self::validateIdentifier($table);
         $stmt = $pdo->prepare("SELECT data->>? FROM {$table} WHERE key = ?");
         $stmt->execute([$field, $key]);
         $value = $stmt->fetchColumn();
@@ -376,6 +398,7 @@ class Utils
 
     public static function hgetall(\PDO $pdo, string $table, string $key): array
     {
+        self::validateIdentifier($table);
         $stmt = $pdo->prepare("SELECT data FROM {$table} WHERE key = ?");
         $stmt->execute([$key]);
         $value = $stmt->fetchColumn();
@@ -387,6 +410,7 @@ class Utils
 
     public static function hdel(\PDO $pdo, string $table, string $key, string $field): bool
     {
+        self::validateIdentifier($table);
         $stmt = $pdo->prepare("SELECT data ? ? AS existed FROM {$table} WHERE key = ?");
         $stmt->execute([$field, $key]);
         $row = $stmt->fetch(\PDO::FETCH_ASSOC);
@@ -400,12 +424,15 @@ class Utils
 
     public static function countDistinct(\PDO $pdo, string $table, string $column): int
     {
+        self::validateIdentifier($table);
+        self::validateIdentifier($column);
         $stmt = $pdo->query("SELECT COUNT(DISTINCT {$column}) FROM {$table}");
         return (int) $stmt->fetchColumn();
     }
 
     public static function streamAdd(\PDO $pdo, string $stream, array $payload): int
     {
+        self::validateIdentifier($stream);
         $pdo->exec("
             CREATE TABLE IF NOT EXISTS {$stream} (
                 id BIGSERIAL PRIMARY KEY,
@@ -420,6 +447,7 @@ class Utils
 
     public static function streamCreateGroup(\PDO $pdo, string $stream, string $group): void
     {
+        self::validateIdentifier($stream);
         $groupsTable = $stream . '_groups';
         $pendingTable = $stream . '_pending';
         $pdo->exec("
@@ -446,6 +474,7 @@ class Utils
 
     public static function streamRead(\PDO $pdo, string $stream, string $group, string $consumer, int $count = 1): array
     {
+        self::validateIdentifier($stream);
         $groupsTable = $stream . '_groups';
         $pendingTable = $stream . '_pending';
 
@@ -503,6 +532,7 @@ class Utils
 
     public static function streamAck(\PDO $pdo, string $stream, string $group, int $messageId): bool
     {
+        self::validateIdentifier($stream);
         $pendingTable = $stream . '_pending';
         $stmt = $pdo->prepare("DELETE FROM {$pendingTable} WHERE group_name = ? AND message_id = ?");
         $stmt->execute([$group, $messageId]);
@@ -511,6 +541,7 @@ class Utils
 
     public static function streamClaim(\PDO $pdo, string $stream, string $group, string $consumer, int $minIdleMs = 60000): array
     {
+        self::validateIdentifier($stream);
         $pendingTable = $stream . '_pending';
         $stmt = $pdo->prepare("
             UPDATE {$pendingTable}
