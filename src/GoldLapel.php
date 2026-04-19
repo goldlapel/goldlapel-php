@@ -12,7 +12,8 @@ use RuntimeException;
  *         'port' => 7932,
  *         'log_level' => 'info',
  *     ]);
- *     $pdo = new PDO($gl->url());
+ *     // PDO needs the pgsql: DSN form plus user/password — not the raw URL.
+ *     $pdo = new PDO($gl->pdoDsn(), ...$gl->pdoCredentials());
  *     $hits = $gl->search('articles', 'body', 'postgres tuning');
  *     $gl->docInsert('events', ['type' => 'signup']);
  *     $gl->using($pdo, function ($gl) {
@@ -514,12 +515,10 @@ class GoldLapel
     }
 
     /**
-     * Proxy URL for use with PDO: `new PDO($gl->url())`. Note that PHP's PDO
-     * DSN format is not a postgresql:// URL — this returns the
-     * postgresql://... form, and internally we translate it to a pgsql:
-     * DSN when we open our own connection.
-     *
-     * If the caller wants the PDO DSN directly, use pdoDsn().
+     * Proxy URL in `postgresql://user:pass@host:port/db` form — hand this to
+     * any Postgres driver (pgx, libpq, Doctrine DBAL, etc.). PHP's PDO does
+     * *not* accept this format directly: for `new PDO(...)` use
+     * `$gl->pdoDsn()` plus `$gl->pdoCredentials()`.
      */
     public function url(): ?string
     {
