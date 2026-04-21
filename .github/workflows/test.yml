@@ -52,19 +52,11 @@ jobs:
       - name: Install dependencies
         run: composer install --no-interaction --no-progress --prefer-dist
 
-      - name: Run default PHPUnit suite
+      - name: Run tests (default + Laravel suites)
         env:
           PGHOST: localhost
           PGUSER: postgres
           PGPASSWORD: postgres
           PGDATABASE: postgres
           GOLDLAPEL_TEST_PG_URL: postgres://postgres:postgres@localhost:5432/postgres
-        run: vendor/bin/phpunit --configuration phpunit.xml
-
-      - name: Run Laravel PHPUnit suite
-        env:
-          PGHOST: localhost
-          PGUSER: postgres
-          PGPASSWORD: postgres
-          PGDATABASE: postgres
-        run: vendor/bin/phpunit --configuration phpunit-laravel.xml
+        run: ./scripts/test.sh
