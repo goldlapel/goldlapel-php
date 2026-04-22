@@ -327,9 +327,14 @@ class GoldLapel
                 }
                 $this->connection = null;
             }
-            // $this->scopedConn is fiber-local; each fiber's entry is
-            // cleared by FiberLocal::clear() at fiber teardown. Nothing
-            // to reset here.
+            // $this->scopedConn is a FiberLocal — storage is a
+            // WeakMap<Fiber, ...> keyed by the owning fiber, so entries
+            // are garbage-collected when the fiber itself terminates.
+            // (Revolt's driver also calls FiberLocal::clear() after each
+            // callback/microtask, but only on the *current* fiber, not
+            // "each fiber's on teardown".) Either way, stop() runs in
+            // its own async fiber — no other fiber's scope is visible
+            // here, and there's nothing to reset.
             if ($this->process === null) {
                 unset(self::$liveInstances[spl_object_id($this)]);
                 return;
@@ -581,17 +586,28 @@ class GoldLapel
      *
      * Returns Future<mixed> — the callback's return value.
      *
-     * The callback is invoked synchronously inside this fiber; if it
-     * returns a Future, that Future is awaited before the scope is
+     * The callback runs inside the fiber that `using()`'s own `async()`
+     * block creates (not the caller's fiber). `$gl->*` calls made
+     * directly from the callback read `FiberLocal` from that same
+     * fiber, so they see `$connection` as their default executor. If
+     * the callback returns a Future, it is awaited before the scope is
      * restored, so callers can safely return `->await()`ed values.
+     *
+     * Nested `using()`: an inner `using($Y, ...)` inside an outer
+     * `using($X, ...)` runs its callback on a fresh fiber whose
+     * FiberLocal slot is set to `$Y` alone — it does NOT see a stacked
+     * `$X`+`$Y` view. When the inner call returns, the outer fiber's
+     * FiberLocal is untouched, so the outer callback continues to see
+     * `$X` as expected.
      */
     public function using(PostgresExecutor $connection, callable $callback): Future
     {
         return async(function () use ($connection, $callback) {
             // Fiber-local set/restore — concurrent fibers each see their
-            // own scope. On fiber teardown, Revolt's FiberLocal::clear()
-            // drops the entry automatically, so the `finally` restore is
-            // really only for nested using() on the same fiber.
+            // own scope. The FiberLocal WeakMap drops this fiber's entry
+            // when the fiber is garbage-collected, so the `finally`
+            // restore is really only for nested using() on the same
+            // fiber.
             $previous = $this->scopedConn->get();
             $this->scopedConn->set($connection);
             try {
