@@ -1,8 +1,20 @@
 {
   "name": "goldlapel/goldlapel",
-  "description": "PHP wrapper for the Gold Lapel self-optimizing Postgres proxy",
+  "description": "Self-optimizing Postgres proxy — automatic materialized views and indexes",
   "type": "library",
   "license": "MIT",
+  "homepage": "https://goldlapel.com",
+  "keywords": ["postgres", "proxy", "optimization", "materialized-views", "database"],
+  "authors": [
+    {
+      "name": "Gold Lapel",
+      "homepage": "https://goldlapel.com"
+    }
+  ],
+  "support": {
+    "issues": "https://github.com/goldlapel/goldlapel-php/issues",
+    "source": "https://github.com/goldlapel/goldlapel-php"
+  },
   "require": {
     "php": ">=8.1"
   },
