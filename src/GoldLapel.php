@@ -428,7 +428,10 @@ class GoldLapel
         $this->process = proc_open($cmd, $descriptors, $pipes, null, $env);
 
         if (!is_resource($this->process)) {
-            throw new RuntimeException('Failed to start Gold Lapel process');
+            throw new RuntimeException(
+                "Failed to start Gold Lapel process (proc_open returned false for {$binary}). " .
+                "Check that the binary is executable and the system has free resources."
+            );
         }
 
         $stderr = $pipes[2];

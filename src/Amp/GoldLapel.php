@@ -238,7 +238,10 @@ class GoldLapel
         $pipes = [];
         $this->process = proc_open($cmd, $descriptors, $pipes, null, $env);
         if (!is_resource($this->process)) {
-            throw new RuntimeException('Failed to start Gold Lapel process');
+            throw new RuntimeException(
+                "Failed to start Gold Lapel process (proc_open returned false for {$binary}). " .
+                "Check that the binary is executable and the system has free resources."
+            );
         }
 
         $stderr = $pipes[2];
@@ -306,7 +309,9 @@ class GoldLapel
             return;
         }
         if ($this->url === null) {
-            throw new RuntimeException('Proxy is not running (url is null)');
+            throw new RuntimeException(
+                'Gold Lapel proxy is not running. Call start() before connect().'
+            );
         }
         $config = PostgresConfig::fromString(self::urlToAmphpConnString($this->url));
         $this->connection = \Amp\Postgres\connect($config);
@@ -544,7 +549,8 @@ class GoldLapel
     {
         $parsed = parse_url($url);
         if ($parsed === false || !isset($parsed['host'])) {
-            throw new RuntimeException("Cannot parse proxy URL: {$url}");
+            // Do NOT interpolate the URL — it may contain the upstream password.
+            throw new RuntimeException('Cannot parse proxy URL (missing host).');
         }
         $parts = ['host=' . $parsed['host']];
         if (isset($parsed['port'])) {
