@@ -1480,15 +1480,23 @@ class DocTest extends TestCase
 
         Utils::docWatch($pdo, 'orders');
 
-        $this->assertCount(4, $execCalls);
+        // CREATE FUNCTION (1) + CREATE OR REPLACE TRIGGER (2) + LISTEN (3).
+        // Atomic CREATE OR REPLACE TRIGGER (PG14+) — matches the Go wrapper.
+        // Avoids the race where a DROP + CREATE pair could have two concurrent
+        // docWatch calls briefly leave no trigger, or silently replace each
+        // other's trigger body.
+        $this->assertCount(3, $execCalls);
         $this->assertStringContainsString('CREATE OR REPLACE FUNCTION orders_notify_fn', $execCalls[0]);
         $this->assertStringContainsString('pg_notify', $execCalls[0]);
         $this->assertStringContainsString('TG_OP', $execCalls[0]);
-        $this->assertStringContainsString('DROP TRIGGER IF EXISTS orders_notify_trg ON orders', $execCalls[1]);
-        $this->assertStringContainsString('CREATE TRIGGER orders_notify_trg', $execCalls[2]);
-        $this->assertStringContainsString('AFTER INSERT OR UPDATE OR DELETE ON orders', $execCalls[2]);
-        $this->assertStringContainsString('EXECUTE FUNCTION orders_notify_fn()', $execCalls[2]);
-        $this->assertStringContainsString('LISTEN orders_changes', $execCalls[3]);
+        $this->assertStringContainsString('CREATE OR REPLACE TRIGGER orders_notify_trg', $execCalls[1]);
+        $this->assertStringContainsString('AFTER INSERT OR UPDATE OR DELETE ON orders', $execCalls[1]);
+        $this->assertStringContainsString('EXECUTE FUNCTION orders_notify_fn()', $execCalls[1]);
+        $this->assertStringContainsString('LISTEN orders_changes', $execCalls[2]);
+        // Guard against the racy DROP + CREATE pair regressing.
+        foreach ($execCalls as $sql) {
+            $this->assertStringNotContainsString('DROP TRIGGER IF EXISTS orders_notify_trg', $sql);
+        }
     }
 
     public function testDocWatchInvalidCollection(): void
@@ -1542,14 +1550,19 @@ class DocTest extends TestCase
 
         Utils::docCreateTtlIndex($pdo, 'sessions', 3600);
 
-        $this->assertCount(4, $execCalls);
+        // CREATE INDEX (1) + CREATE FUNCTION (2) + CREATE OR REPLACE TRIGGER (3).
+        // Atomic CREATE OR REPLACE TRIGGER (PG14+) — matches the Go wrapper.
+        $this->assertCount(3, $execCalls);
         $this->assertStringContainsString('CREATE INDEX IF NOT EXISTS sessions_ttl_idx ON sessions (created_at)', $execCalls[0]);
         $this->assertStringContainsString('CREATE OR REPLACE FUNCTION sessions_ttl_fn', $execCalls[1]);
         $this->assertStringContainsString("INTERVAL '3600 seconds'", $execCalls[1]);
         $this->assertStringContainsString('DELETE FROM sessions WHERE created_at', $execCalls[1]);
-        $this->assertStringContainsString('DROP TRIGGER IF EXISTS sessions_ttl_trg ON sessions', $execCalls[2]);
-        $this->assertStringContainsString('CREATE TRIGGER sessions_ttl_trg', $execCalls[3]);
-        $this->assertStringContainsString('BEFORE INSERT ON sessions', $execCalls[3]);
+        $this->assertStringContainsString('CREATE OR REPLACE TRIGGER sessions_ttl_trg', $execCalls[2]);
+        $this->assertStringContainsString('BEFORE INSERT ON sessions', $execCalls[2]);
+        // Guard against the racy DROP + CREATE pair regressing.
+        foreach ($execCalls as $sql) {
+            $this->assertStringNotContainsString('DROP TRIGGER IF EXISTS sessions_ttl_trg', $sql);
+        }
     }
 
     public function testDocCreateTtlIndexCustomField(): void
@@ -1657,17 +1670,21 @@ class DocTest extends TestCase
 
         Utils::docCreateCapped($pdo, 'logs', 1000);
 
-        // ensureCollection (1) + CREATE FUNCTION (2) + DROP TRIGGER (3) + CREATE TRIGGER (4)
-        $this->assertCount(4, $execCalls);
+        // ensureCollection (1) + CREATE FUNCTION (2) + CREATE OR REPLACE TRIGGER (3).
+        // Atomic CREATE OR REPLACE TRIGGER (PG14+) — matches the Go wrapper.
+        $this->assertCount(3, $execCalls);
         $this->assertStringContainsString('CREATE TABLE IF NOT EXISTS logs', $execCalls[0]);
         $this->assertStringContainsString('CREATE OR REPLACE FUNCTION logs_cap_fn', $execCalls[1]);
         $this->assertStringContainsString('DELETE FROM logs', $execCalls[1]);
         $this->assertStringContainsString('ORDER BY created_at ASC', $execCalls[1]);
         $this->assertStringContainsString('LIMIT GREATEST', $execCalls[1]);
         $this->assertStringContainsString('1000', $execCalls[1]);
-        $this->assertStringContainsString('DROP TRIGGER IF EXISTS logs_cap_trg ON logs', $execCalls[2]);
-        $this->assertStringContainsString('CREATE TRIGGER logs_cap_trg', $execCalls[3]);
-        $this->assertStringContainsString('AFTER INSERT ON logs', $execCalls[3]);
+        $this->assertStringContainsString('CREATE OR REPLACE TRIGGER logs_cap_trg', $execCalls[2]);
+        $this->assertStringContainsString('AFTER INSERT ON logs', $execCalls[2]);
+        // Guard against the racy DROP + CREATE pair regressing.
+        foreach ($execCalls as $sql) {
+            $this->assertStringNotContainsString('DROP TRIGGER IF EXISTS logs_cap_trg', $sql);
+        }
     }
 
     public function testDocCreateCappedRejectsNonPositive(): void

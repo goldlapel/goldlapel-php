@@ -1868,10 +1868,12 @@ class Utils
             \$\$
         ");
 
-        $pdo->exec("DROP TRIGGER IF EXISTS {$triggerName} ON {$collection}");
-
+        // CREATE OR REPLACE TRIGGER (Postgres 14+) is atomic — no window
+        // where the trigger is missing between DROP and CREATE, and a
+        // redefinition cleanly replaces the old body. GL targets PG14+
+        // across the product, so this is safe and matches the Go wrapper.
         $pdo->exec(
-            "CREATE TRIGGER {$triggerName} "
+            "CREATE OR REPLACE TRIGGER {$triggerName} "
             . "AFTER INSERT OR UPDATE OR DELETE ON {$collection} "
             . "FOR EACH ROW EXECUTE FUNCTION {$funcName}()"
         );
@@ -1919,10 +1921,10 @@ class Utils
             \$\$
         ");
 
-        $pdo->exec("DROP TRIGGER IF EXISTS {$triggerName} ON {$collection}");
-
+        // CREATE OR REPLACE TRIGGER (Postgres 14+): atomic and redefinable.
+        // See docWatch for rationale.
         $pdo->exec(
-            "CREATE TRIGGER {$triggerName} "
+            "CREATE OR REPLACE TRIGGER {$triggerName} "
             . "BEFORE INSERT ON {$collection} "
             . "FOR EACH ROW EXECUTE FUNCTION {$funcName}()"
         );
@@ -1971,10 +1973,10 @@ class Utils
             \$\$
         ");
 
-        $pdo->exec("DROP TRIGGER IF EXISTS {$triggerName} ON {$collection}");
-
+        // CREATE OR REPLACE TRIGGER (Postgres 14+): atomic and redefinable.
+        // See docWatch for rationale.
         $pdo->exec(
-            "CREATE TRIGGER {$triggerName} "
+            "CREATE OR REPLACE TRIGGER {$triggerName} "
             . "AFTER INSERT ON {$collection} "
             . "FOR EACH ROW EXECUTE FUNCTION {$funcName}()"
         );
