@@ -5,3 +5,8 @@ bin/*
 !bin/goldlapel
 .phpunit.cache/
 .phpunit.result.cache
+
+# Local secrets
+.env
+.env.local
+.env.*.local
