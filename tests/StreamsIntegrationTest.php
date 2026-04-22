@@ -44,18 +44,13 @@ class StreamsIntegrationTest extends TestCase
     {
         $port = 7700 + (int) (microtime(true) * 1000) % 100;
         $name = 'gl_php_int_stream_' . (int) (microtime(true) * 1000);
-        // Disable result cache + consolidation — streamRead uses FOR UPDATE
-        // inside a transaction, which interacts poorly with the proxy's
-        // in-memory result cache (pre-existing; this is not specific to the
-        // proxy-owned-DDL migration).
+        // Proxy result_cache / consolidation / prepared_cache are intentionally
+        // left on — the FOR UPDATE tx-poisoning bug that used to require
+        // disabling them was fixed in goldlapel d77fe37 / 945d674 and has
+        // regression coverage in tests/phase32_for_update_cache.rs.
         $gl = GoldLapel::start(self::$pgUrl, [
             'port' => $port,
             'silent' => true,
-            'config' => [
-                'disable_consolidation' => true,
-                'disable_result_cache' => true,
-                'disable_prepared_cache' => true,
-            ],
         ]);
         try {
             $gl->streamAdd($name, ['type' => 'click']);
@@ -83,18 +78,10 @@ class StreamsIntegrationTest extends TestCase
     {
         $port = 7800 + (int) (microtime(true) * 1000) % 100;
         $name = 'gl_php_int_meta_' . (int) (microtime(true) * 1000);
-        // Disable result cache + consolidation — streamRead uses FOR UPDATE
-        // inside a transaction, which interacts poorly with the proxy's
-        // in-memory result cache (pre-existing; this is not specific to the
-        // proxy-owned-DDL migration).
+        // Proxy cache features left on — see testStreamAddCreatesPrefixedTable.
         $gl = GoldLapel::start(self::$pgUrl, [
             'port' => $port,
             'silent' => true,
-            'config' => [
-                'disable_consolidation' => true,
-                'disable_result_cache' => true,
-                'disable_prepared_cache' => true,
-            ],
         ]);
         try {
             $gl->streamAdd($name, ['type' => 'click']);
@@ -117,18 +104,10 @@ class StreamsIntegrationTest extends TestCase
     {
         $port = 7900 + (int) (microtime(true) * 1000) % 100;
         $name = 'gl_php_int_rt_' . (int) (microtime(true) * 1000);
-        // Disable result cache + consolidation — streamRead uses FOR UPDATE
-        // inside a transaction, which interacts poorly with the proxy's
-        // in-memory result cache (pre-existing; this is not specific to the
-        // proxy-owned-DDL migration).
+        // Proxy cache features left on — see testStreamAddCreatesPrefixedTable.
         $gl = GoldLapel::start(self::$pgUrl, [
             'port' => $port,
             'silent' => true,
-            'config' => [
-                'disable_consolidation' => true,
-                'disable_result_cache' => true,
-                'disable_prepared_cache' => true,
-            ],
         ]);
         try {
             $gl->streamCreateGroup($name, 'workers');
@@ -145,6 +124,105 @@ class StreamsIntegrationTest extends TestCase
         } finally {
             $gl->stop();
         }
+    }
+
+    /**
+     * Dedicated regression: `SELECT ... FOR UPDATE` inside a PDO transaction
+     * must acquire real row-level locks and commit cleanly, with every proxy
+     * cache feature on. This is the exact pattern that used to silently
+     * abort the transaction — PDO's DEALLOCATE-on-GC emitted by Q-mode would
+     * reference a client-side statement name the proxy had renamed on the
+     * wire, upstream errored "prepared statement does not exist", and inside
+     * a transaction that error aborted the whole thing.
+     *
+     * Runs three begin/select-FOR-UPDATE/update/commit cycles back-to-back.
+     * On broken builds, iter 1 fails with SQLSTATE[25P02] ("current
+     * transaction is aborted"), iter 2+ fail with SQLSTATE[26000] ("prepared
+     * statement does not exist"), and the final table state reflects none
+     * of the intended updates.
+     */
+    public function testForUpdateInTransactionRoundTrips(): void
+    {
+        $port = 8000 + (int) (microtime(true) * 1000) % 100;
+        $table = 'gl_php_fu_' . (int) (microtime(true) * 1000);
+        // All three cache features on — this is the regression case.
+        $gl = GoldLapel::start(self::$pgUrl, [
+            'port' => $port,
+            'silent' => true,
+        ]);
+        try {
+            $dsn = self::_toPdoDsn(str_replace(
+                self::_hostPort(self::$pgUrl),
+                "127.0.0.1:{$port}",
+                self::$pgUrl
+            ));
+            $pdo = new \PDO($dsn);
+            $pdo->setAttribute(\PDO::ATTR_ERRMODE, \PDO::ERRMODE_EXCEPTION);
+
+            $pdo->exec(
+                "DROP TABLE IF EXISTS {$table}; "
+                . "CREATE TABLE {$table} (id INT PRIMARY KEY, val TEXT); "
+                . "INSERT INTO {$table} VALUES (1,'a'),(2,'b'),(3,'c')"
+            );
+
+            for ($i = 1; $i <= 3; $i++) {
+                $pdo->beginTransaction();
+                try {
+                    $sel = $pdo->prepare("SELECT id, val FROM {$table} WHERE id = ? FOR UPDATE");
+                    $sel->execute([$i]);
+                    $row = $sel->fetch(\PDO::FETCH_ASSOC);
+                    $this->assertIsArray($row, "iter {$i}: FOR UPDATE must return a row");
+                    $this->assertSame($i, (int) $row['id']);
+
+                    $upd = $pdo->prepare("UPDATE {$table} SET val = ? WHERE id = ?");
+                    $upd->execute(["upd_{$i}", $i]);
+                    $this->assertSame(
+                        1,
+                        $upd->rowCount(),
+                        "iter {$i}: UPDATE must affect exactly one row"
+                    );
+
+                    $pdo->commit();
+                } catch (\Throwable $e) {
+                    if ($pdo->inTransaction()) {
+                        $pdo->rollBack();
+                    }
+                    throw $e;
+                }
+            }
+
+            // Verify final state went through a direct (non-proxy) connection
+            // so the assertion can't be satisfied by a cache hit.
+            $direct = new \PDO(self::_toPdoDsn(self::$pgUrl));
+            $rows = $direct
+                ->query("SELECT id, val FROM {$table} ORDER BY id")
+                ->fetchAll(\PDO::FETCH_ASSOC);
+            $this->assertSame(
+                [
+                    ['id' => 1, 'val' => 'upd_1'],
+                    ['id' => 2, 'val' => 'upd_2'],
+                    ['id' => 3, 'val' => 'upd_3'],
+                ],
+                array_map(
+                    fn($r) => ['id' => (int) $r['id'], 'val' => (string) $r['val']],
+                    $rows
+                ),
+                'Every FOR UPDATE transaction must have committed its UPDATE'
+            );
+
+            // Clean up
+            $direct->exec("DROP TABLE IF EXISTS {$table}");
+        } finally {
+            $gl->stop();
+        }
+    }
+
+    private static function _hostPort(string $url): string
+    {
+        $parts = parse_url($url);
+        $host = $parts['host'] ?? 'localhost';
+        $port = $parts['port'] ?? 5432;
+        return "{$host}:{$port}";
     }
 
     private static function _toPdoDsn(string $url): string
