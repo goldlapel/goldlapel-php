@@ -79,6 +79,16 @@ class GoldLapel
     private static array $liveInstances = [];
     private static bool $cleanupRegistered = false;
 
+    /**
+     * Stream the startup banner is written to. Defaults to STDERR; tests
+     * can swap this for a php://memory stream (or a userland stream
+     * wrapper) to capture output, or to inject a throwing write to
+     * verify banner-failure cleanup. Mirrors the sync factory.
+     *
+     * @var resource|null
+     */
+    private static $bannerStream = null;
+
     public function __construct(
         string $upstream,
         ?int $port = null,
@@ -248,8 +258,14 @@ class GoldLapel
             if (SyncGoldLapel::waitForPort('127.0.0.1', $this->port, 0.5)) {
                 fclose($stderr);
                 $this->url = SyncGoldLapel::makeProxyUrl($this->upstream, $this->port);
-                self::registerForCleanup($this);
+                // Print the banner BEFORE registering for cleanup: an fwrite()
+                // failure on stderr must not leak an orphan entry in
+                // $liveInstances. Registration is the last side-effect so
+                // that any throw between "subprocess confirmed listening"
+                // and "return $this->url" bubbles out with no registry
+                // cleanup required. Mirrors the sync factory.
                 $this->printBanner();
+                self::registerForCleanup($this);
                 return $this->url;
             }
         }
@@ -272,7 +288,7 @@ class GoldLapel
         $message = $this->dashboardPort > 0
             ? "goldlapel → :{$this->port} (proxy) | http://127.0.0.1:{$this->dashboardPort} (dashboard)\n"
             : "goldlapel → :{$this->port} (proxy)\n";
-        $stream = defined('STDERR') ? STDERR : null;
+        $stream = self::$bannerStream ?? (defined('STDERR') ? STDERR : null);
         if (is_resource($stream)) {
             fwrite($stream, $message);
         }

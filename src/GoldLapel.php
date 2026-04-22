@@ -452,12 +452,20 @@ class GoldLapel
                 fclose($stderr);
                 $this->url = self::makeProxyUrl($this->upstream, $this->port);
 
+                // Print the banner BEFORE registering for cleanup: fwrite()
+                // to stderr is vanishingly unlikely to fail, but if it does
+                // (closed fd in a long-running SAPI, unwritable stream, FPM
+                // after fastcgi_finish_request() has detached stderr) we'd
+                // rather let the throw escape with no registry entry than
+                // leak an orphan reference into $liveInstances. Registration
+                // is the last side-effect because it's the one whose cleanup
+                // is most expensive to get wrong.
+                self::printBanner($this->port, $this->dashboardPort, $this->silent);
+
                 // Register the instance for global cleanup immediately so
                 // that any subsequent init step (e.g. PDO construction in
                 // startProxy()) can throw without leaking the subprocess.
                 self::registerForCleanup($this);
-
-                self::printBanner($this->port, $this->dashboardPort, $this->silent);
 
                 return $this->url;
             }
