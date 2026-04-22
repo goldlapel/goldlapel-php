@@ -112,7 +112,16 @@ class GoldLapel
             try {
                 $instance->connect();
             } catch (\Throwable $e) {
-                $instance->terminate();
+                // Mirror the sync factory's inner-guarded cleanup: if
+                // terminate() itself throws (a proc_close() edge case or
+                // SIGTERM race), we must not mask the original $e with a
+                // teardown error. The user-facing failure is the connect
+                // failure, not the cleanup failure.
+                try {
+                    $instance->terminate();
+                } catch (\Throwable $cleanupErr) {
+                    // Don't mask the original failure with a teardown error.
+                }
                 unset(self::$liveInstances[spl_object_id($instance)]);
                 throw $e;
             }
@@ -138,8 +147,12 @@ class GoldLapel
         // args. parseStartOptions is private on sync class, so we
         // re-derive here (short enough to duplicate vs. opening sync's
         // API further).
+        //
+        // `new static(...)` (not `new self(...)`) so test subclasses can
+        // override instance methods like terminate() to simulate rare
+        // cleanup-throws scenarios from the catch block in start().
         [$port, $config, $extraArgs, $silent] = self::parseStartOptions($options);
-        $instance = new self($upstream, $port, $config, $extraArgs, $silent);
+        $instance = new static($upstream, $port, $config, $extraArgs, $silent);
         $instance->startSubprocess();
         return $instance;
     }
@@ -325,7 +338,14 @@ class GoldLapel
         }
     }
 
-    private function terminate(): void
+    /**
+     * Terminate the subprocess synchronously (SIGTERM → wait → SIGKILL).
+     * `protected` (rather than `private`) so test subclasses can override
+     * to verify the inner-guarded cleanup in start()'s catch block — if
+     * terminate() itself throws, the original connect exception must
+     * propagate unchanged.
+     */
+    protected function terminate(): void
     {
         if ($this->process === null) {
             return;
