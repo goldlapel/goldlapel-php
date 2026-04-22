@@ -478,6 +478,13 @@ class Utils
 
     public static function publish(PostgresExecutor $conn, string $channel, string $message): void
     {
+        // Defence-in-depth: the pg_notify call below is parameterised,
+        // so the channel name is passed as a value (not an identifier)
+        // and is not an injection surface here. But the sync path and
+        // the other 6 language wrappers all validate anyway for
+        // cross-wrapper consistency and belt-and-braces — this mirrors
+        // that convention.
+        SyncUtils::validateIdentifier($channel);
         self::exec($conn, "SELECT pg_notify(?, ?)", [$channel, $message]);
     }
 
