@@ -6,6 +6,7 @@ use Amp\DeferredFuture;
 use Amp\Postgres\PostgresConnection;
 use Amp\Postgres\PostgresExecutor;
 use GoldLapel\Amp\GoldLapel;
+use GoldLapel\Tests\IntegrationGate;
 use PHPUnit\Framework\TestCase;
 use ReflectionClass;
 
@@ -35,8 +36,13 @@ final class ScopeLeakTest extends TestCase
 
     public static function setUpBeforeClass(): void
     {
-        self::$upstream = getenv('GOLDLAPEL_TEST_PG_URL')
-            ?: 'postgres://postgres:postgres@localhost:5432/postgres';
+        // Evaluating the gate here surfaces the half-configured CI case
+        // (GOLDLAPEL_INTEGRATION=1 set, GOLDLAPEL_TEST_UPSTREAM missing) as
+        // a RuntimeException during PHPUnit setup — preventing false-green.
+        self::$upstream = IntegrationGate::upstream();
+        if (self::$upstream === null) {
+            return;
+        }
 
         // Upstream liveness check
         $parsed = parse_url(self::$upstream);
@@ -64,9 +70,12 @@ final class ScopeLeakTest extends TestCase
 
     protected function setUp(): void
     {
+        if (self::$upstream === null) {
+            $this->markTestSkipped(IntegrationGate::skipReason());
+        }
         if (!self::$proxyAvailable) {
             $this->markTestSkipped(
-                'Postgres or goldlapel binary not reachable; set GOLDLAPEL_TEST_PG_URL + GOLDLAPEL_BINARY to enable.'
+                'Postgres or goldlapel binary not reachable; set GOLDLAPEL_TEST_UPSTREAM + GOLDLAPEL_BINARY to enable.'
             );
         }
     }

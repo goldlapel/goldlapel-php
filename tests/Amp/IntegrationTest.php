@@ -7,6 +7,7 @@ use Amp\Postgres\PostgresConnection;
 use ReflectionClass;
 use GoldLapel\Amp\GoldLapel;
 use GoldLapel\Amp\Utils;
+use GoldLapel\Tests\IntegrationGate;
 use PHPUnit\Framework\TestCase;
 use Revolt\EventLoop;
 
@@ -14,12 +15,12 @@ use function Amp\async;
 
 /**
  * Integration tests for the async Amp wrapper. These talk to a real
- * Postgres (defaulting to `postgres://postgres:postgres@localhost:5432/
- * postgres` or the `GOLDLAPEL_TEST_PG_URL` env var) — skipped if the
- * upstream is unreachable.
+ * Postgres and spawn the real goldlapel binary.
  *
- * Tests also spawn the actual goldlapel binary (via GoldLapel::start) if
- * `goldlapel` is on PATH or GOLDLAPEL_BINARY is set.
+ * Gated on GOLDLAPEL_INTEGRATION=1 + GOLDLAPEL_TEST_UPSTREAM — the
+ * standardized integration-test convention shared across all Gold Lapel
+ * wrappers. See tests/IntegrationGate.php. Also requires the goldlapel
+ * binary on PATH or GOLDLAPEL_BINARY set.
  *
  * All async operations run inside a fiber via Amp\async() + await().
  * PHPUnit runs each test in the default loop driver — amphp / Revolt
@@ -33,8 +34,13 @@ class IntegrationTest extends TestCase
 
     public static function setUpBeforeClass(): void
     {
-        self::$upstream = getenv('GOLDLAPEL_TEST_PG_URL')
-            ?: 'postgres://postgres:postgres@localhost:5432/postgres';
+        // Evaluating the gate here surfaces the half-configured CI case
+        // (GOLDLAPEL_INTEGRATION=1 set, GOLDLAPEL_TEST_UPSTREAM missing) as
+        // a RuntimeException during PHPUnit setup — preventing false-green.
+        self::$upstream = IntegrationGate::upstream();
+        if (self::$upstream === null) {
+            return;
+        }
 
         // Quick TCP liveness check on the upstream host/port
         $parsed = parse_url(self::$upstream);
@@ -67,9 +73,12 @@ class IntegrationTest extends TestCase
 
     protected function setUp(): void
     {
+        if (self::$upstream === null) {
+            $this->markTestSkipped(IntegrationGate::skipReason());
+        }
         if (!self::$proxyAvailable) {
             $this->markTestSkipped(
-                'Postgres or goldlapel binary not reachable; set GOLDLAPEL_TEST_PG_URL + GOLDLAPEL_BINARY to enable.'
+                'Postgres or goldlapel binary not reachable; set GOLDLAPEL_TEST_UPSTREAM + GOLDLAPEL_BINARY to enable.'
             );
         }
     }

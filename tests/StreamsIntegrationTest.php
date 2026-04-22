@@ -10,11 +10,10 @@ use PHPUnit\Framework\TestCase;
 /**
  * End-to-end streams integration test — proxy-owned DDL (Phase 3).
  *
- * Requires:
- *   - DATABASE_URL / GOLDLAPEL_TEST_PG_URL pointing at a reachable Postgres
- *   - GOLDLAPEL_BINARY pointing at a goldlapel binary with the DDL API
- *
- * Skipped if either is missing.
+ * Gated on GOLDLAPEL_INTEGRATION=1 + GOLDLAPEL_TEST_UPSTREAM — the
+ * standardized integration-test convention shared across all Gold Lapel
+ * wrappers. See tests/IntegrationGate.php. Also requires GOLDLAPEL_BINARY
+ * pointing at a goldlapel binary with the DDL API.
  */
 class StreamsIntegrationTest extends TestCase
 {
@@ -23,14 +22,18 @@ class StreamsIntegrationTest extends TestCase
 
     public static function setUpBeforeClass(): void
     {
-        self::$pgUrl = getenv('GOLDLAPEL_TEST_PG_URL')
-            ?: getenv('DATABASE_URL')
-            ?: 'postgresql://sgibson@localhost:5432/postgres';
+        // Evaluating the gate here surfaces the half-configured CI case
+        // (GOLDLAPEL_INTEGRATION=1 set, GOLDLAPEL_TEST_UPSTREAM missing) as
+        // a RuntimeException during PHPUnit setup — preventing false-green.
+        self::$pgUrl = IntegrationGate::upstream();
         self::$binary = getenv('GOLDLAPEL_BINARY') ?: null;
     }
 
     protected function setUp(): void
     {
+        if (self::$pgUrl === null) {
+            $this->markTestSkipped(IntegrationGate::skipReason());
+        }
         if (!self::$binary || !is_file(self::$binary)) {
             $this->markTestSkipped('Set GOLDLAPEL_BINARY to a goldlapel binary (v0.2+) to run this test.');
         }

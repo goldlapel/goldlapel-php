@@ -54,9 +54,12 @@ jobs:
 
       - name: Run tests (default + Laravel suites)
         env:
+          # Standardized integration-test gate — both must be set for
+          # integration tests to run. See tests/IntegrationGate.php.
+          GOLDLAPEL_INTEGRATION: "1"
+          GOLDLAPEL_TEST_UPSTREAM: postgres://postgres:postgres@localhost:5432/postgres
           PGHOST: localhost
           PGUSER: postgres
           PGPASSWORD: postgres
           PGDATABASE: postgres
-          GOLDLAPEL_TEST_PG_URL: postgres://postgres:postgres@localhost:5432/postgres
         run: ./scripts/test.sh
