@@ -7,6 +7,7 @@ use Amp\Postgres\PostgresConfig;
 use Amp\Postgres\PostgresConnection;
 use Amp\Postgres\PostgresExecutor;
 use GoldLapel\GoldLapel as SyncGoldLapel;
+use Revolt\EventLoop\FiberLocal;
 use RuntimeException;
 
 use function Amp\async;
@@ -42,10 +43,12 @@ use function Amp\async;
  *
  * `using(PostgresLink, callable)` scopes a connection/transaction to the
  * current instance for the duration of the callback. Scope tracking is
- * instance-level (not fiber-local) — concurrent fibers mutating the same
- * GoldLapel instance's scope will race. For per-fiber isolation, construct
- * separate GoldLapel instances or pass the connection explicitly via the
- * trailing `$conn` argument on each method call.
+ * fiber-local (via Revolt\EventLoop\FiberLocal) — sibling fibers running
+ * concurrently on the same GoldLapel instance each see their own scope
+ * (or the default connection, outside any `using()`). The scoped conn is
+ * resolved in the caller's fiber *before* each method's inner async()
+ * fiber is spawned, so the scope propagates naturally via closure capture
+ * without leaking to concurrent siblings.
  */
 class GoldLapel
 {
@@ -63,8 +66,14 @@ class GoldLapel
     private $process = null;
     private ?string $url = null;
     private ?PostgresConnection $connection = null;
-    /** Scope set by using(); takes precedence over $connection. */
-    private ?PostgresExecutor $scopedConn = null;
+    /**
+     * Fiber-local scope set by using(); takes precedence over $connection.
+     * Each fiber stores its own value, so sibling fibers on the same
+     * instance never observe each other's scoped connections.
+     *
+     * @var FiberLocal<PostgresExecutor|null>
+     */
+    private FiberLocal $scopedConn;
 
     /** @var array<int, self> */
     private static array $liveInstances = [];
@@ -85,6 +94,7 @@ class GoldLapel
         $this->silent = $silent;
         $this->config = $config;
         $this->extraArgs = $extraArgs;
+        $this->scopedConn = new FiberLocal(static fn () => null);
     }
 
     /**
@@ -288,7 +298,9 @@ class GoldLapel
                 }
                 $this->connection = null;
             }
-            $this->scopedConn = null;
+            // $this->scopedConn is fiber-local; each fiber's entry is
+            // cleared by FiberLocal::clear() at fiber teardown. Nothing
+            // to reset here.
             if ($this->process === null) {
                 unset(self::$liveInstances[spl_object_id($this)]);
                 return;
@@ -457,13 +469,20 @@ class GoldLapel
         return $this->wrapCached($this->connection());
     }
 
+    /**
+     * Resolve the executor for a method call. Reads the fiber-local
+     * `$scopedConn` — MUST be called from the fiber whose scope should
+     * apply (i.e. outside any inner `async()` that would start a new
+     * fiber with its own empty FiberLocal slot).
+     */
     private function resolveConn(?PostgresExecutor $conn): PostgresExecutor
     {
         if ($conn !== null) {
             return $conn;
         }
-        if ($this->scopedConn !== null) {
-            return $this->scopedConn;
+        $scoped = $this->scopedConn->get();
+        if ($scoped !== null) {
+            return $scoped;
         }
         if ($this->connection !== null) {
             return $this->connection;
@@ -533,8 +552,12 @@ class GoldLapel
     public function using(PostgresExecutor $connection, callable $callback): Future
     {
         return async(function () use ($connection, $callback) {
-            $previous = $this->scopedConn;
-            $this->scopedConn = $connection;
+            // Fiber-local set/restore — concurrent fibers each see their
+            // own scope. On fiber teardown, Revolt's FiberLocal::clear()
+            // drops the entry automatically, so the `finally` restore is
+            // really only for nested using() on the same fiber.
+            $previous = $this->scopedConn->get();
+            $this->scopedConn->set($connection);
             try {
                 $result = $callback($this);
                 if ($result instanceof Future) {
@@ -542,7 +565,7 @@ class GoldLapel
                 }
                 return $result;
             } finally {
-                $this->scopedConn = $previous;
+                $this->scopedConn->set($previous);
             }
         });
     }
@@ -556,12 +579,14 @@ class GoldLapel
 
     public function docInsert(string $collection, array $document, ?PostgresExecutor $conn = null): Future
     {
-        return async(fn() => Utils::docInsert($this->resolveConn($conn), $collection, $document));
+        $c = $this->resolveConn($conn);
+        return async(fn() => Utils::docInsert($c, $collection, $document));
     }
 
     public function docInsertMany(string $collection, array $documents, ?PostgresExecutor $conn = null): Future
     {
-        return async(fn() => Utils::docInsertMany($this->resolveConn($conn), $collection, $documents));
+        $c = $this->resolveConn($conn);
+        return async(fn() => Utils::docInsertMany($c, $collection, $documents));
     }
 
     public function docFind(
@@ -572,47 +597,56 @@ class GoldLapel
         ?int $skip = null,
         ?PostgresExecutor $conn = null,
     ): Future {
-        return async(fn() => Utils::docFind($this->resolveConn($conn), $collection, $filter, $sort, $limit, $skip));
+        $c = $this->resolveConn($conn);
+        return async(fn() => Utils::docFind($c, $collection, $filter, $sort, $limit, $skip));
     }
 
     public function docFindOne(string $collection, ?array $filter = null, ?PostgresExecutor $conn = null): Future
     {
-        return async(fn() => Utils::docFindOne($this->resolveConn($conn), $collection, $filter));
+        $c = $this->resolveConn($conn);
+        return async(fn() => Utils::docFindOne($c, $collection, $filter));
     }
 
     public function docUpdate(string $collection, array $filter, array $update, ?PostgresExecutor $conn = null): Future
     {
-        return async(fn() => Utils::docUpdate($this->resolveConn($conn), $collection, $filter, $update));
+        $c = $this->resolveConn($conn);
+        return async(fn() => Utils::docUpdate($c, $collection, $filter, $update));
     }
 
     public function docUpdateOne(string $collection, array $filter, array $update, ?PostgresExecutor $conn = null): Future
     {
-        return async(fn() => Utils::docUpdateOne($this->resolveConn($conn), $collection, $filter, $update));
+        $c = $this->resolveConn($conn);
+        return async(fn() => Utils::docUpdateOne($c, $collection, $filter, $update));
     }
 
     public function docDelete(string $collection, array $filter, ?PostgresExecutor $conn = null): Future
     {
-        return async(fn() => Utils::docDelete($this->resolveConn($conn), $collection, $filter));
+        $c = $this->resolveConn($conn);
+        return async(fn() => Utils::docDelete($c, $collection, $filter));
     }
 
     public function docDeleteOne(string $collection, array $filter, ?PostgresExecutor $conn = null): Future
     {
-        return async(fn() => Utils::docDeleteOne($this->resolveConn($conn), $collection, $filter));
+        $c = $this->resolveConn($conn);
+        return async(fn() => Utils::docDeleteOne($c, $collection, $filter));
     }
 
     public function docCount(string $collection, ?array $filter = null, ?PostgresExecutor $conn = null): Future
     {
-        return async(fn() => Utils::docCount($this->resolveConn($conn), $collection, $filter));
+        $c = $this->resolveConn($conn);
+        return async(fn() => Utils::docCount($c, $collection, $filter));
     }
 
     public function docCreateIndex(string $collection, ?array $keys = null, ?PostgresExecutor $conn = null): Future
     {
-        return async(fn() => Utils::docCreateIndex($this->resolveConn($conn), $collection, $keys));
+        $c = $this->resolveConn($conn);
+        return async(fn() => Utils::docCreateIndex($c, $collection, $keys));
     }
 
     public function docAggregate(string $collection, array $pipeline, ?PostgresExecutor $conn = null): Future
     {
-        return async(fn() => Utils::docAggregate($this->resolveConn($conn), $collection, $pipeline));
+        $c = $this->resolveConn($conn);
+        return async(fn() => Utils::docAggregate($c, $collection, $pipeline));
     }
 
     /**
@@ -623,20 +657,22 @@ class GoldLapel
      */
     public function docWatch(string $collection, ?callable $callback = null, ?PostgresExecutor $conn = null): Future
     {
-        return async(function () use ($collection, $callback, $conn) {
-            $c = $this->resolveConn($conn);
-            if (!$c instanceof PostgresConnection) {
-                throw new \InvalidArgumentException(
-                    'docWatch requires a PostgresConnection (LISTEN is not supported on transactions).'
-                );
-            }
-            Utils::docWatch($c, $collection, $callback);
-        });
+        // Resolve in the caller's fiber so the fiber-local `using()` scope
+        // is honoured (inner async() spawns a fresh fiber with its own
+        // empty FiberLocal slot).
+        $c = $this->resolveConn($conn);
+        if (!$c instanceof PostgresConnection) {
+            throw new \InvalidArgumentException(
+                'docWatch requires a PostgresConnection (LISTEN is not supported on transactions).'
+            );
+        }
+        return async(fn() => Utils::docWatch($c, $collection, $callback));
     }
 
     public function docUnwatch(string $collection, ?PostgresExecutor $conn = null): Future
     {
-        return async(fn() => Utils::docUnwatch($this->resolveConn($conn), $collection));
+        $c = $this->resolveConn($conn);
+        return async(fn() => Utils::docUnwatch($c, $collection));
     }
 
     public function docCreateTtlIndex(
@@ -645,27 +681,32 @@ class GoldLapel
         string $field = 'created_at',
         ?PostgresExecutor $conn = null,
     ): Future {
-        return async(fn() => Utils::docCreateTtlIndex($this->resolveConn($conn), $collection, $expireAfterSeconds, $field));
+        $c = $this->resolveConn($conn);
+        return async(fn() => Utils::docCreateTtlIndex($c, $collection, $expireAfterSeconds, $field));
     }
 
     public function docRemoveTtlIndex(string $collection, ?PostgresExecutor $conn = null): Future
     {
-        return async(fn() => Utils::docRemoveTtlIndex($this->resolveConn($conn), $collection));
+        $c = $this->resolveConn($conn);
+        return async(fn() => Utils::docRemoveTtlIndex($c, $collection));
     }
 
     public function docCreateCollection(string $collection, bool $unlogged = false, ?PostgresExecutor $conn = null): Future
     {
-        return async(fn() => Utils::docCreateCollection($this->resolveConn($conn), $collection, $unlogged));
+        $c = $this->resolveConn($conn);
+        return async(fn() => Utils::docCreateCollection($c, $collection, $unlogged));
     }
 
     public function docCreateCapped(string $collection, int $maxDocuments, ?PostgresExecutor $conn = null): Future
     {
-        return async(fn() => Utils::docCreateCapped($this->resolveConn($conn), $collection, $maxDocuments));
+        $c = $this->resolveConn($conn);
+        return async(fn() => Utils::docCreateCapped($c, $collection, $maxDocuments));
     }
 
     public function docRemoveCap(string $collection, ?PostgresExecutor $conn = null): Future
     {
-        return async(fn() => Utils::docRemoveCap($this->resolveConn($conn), $collection));
+        $c = $this->resolveConn($conn);
+        return async(fn() => Utils::docRemoveCap($c, $collection));
     }
 
     /**
@@ -694,17 +735,20 @@ class GoldLapel
 
     public function docFindOneAndUpdate(string $collection, array $filter, array $update, ?PostgresExecutor $conn = null): Future
     {
-        return async(fn() => Utils::docFindOneAndUpdate($this->resolveConn($conn), $collection, $filter, $update));
+        $c = $this->resolveConn($conn);
+        return async(fn() => Utils::docFindOneAndUpdate($c, $collection, $filter, $update));
     }
 
     public function docFindOneAndDelete(string $collection, array $filter, ?PostgresExecutor $conn = null): Future
     {
-        return async(fn() => Utils::docFindOneAndDelete($this->resolveConn($conn), $collection, $filter));
+        $c = $this->resolveConn($conn);
+        return async(fn() => Utils::docFindOneAndDelete($c, $collection, $filter));
     }
 
     public function docDistinct(string $collection, string $field, ?array $filter = null, ?PostgresExecutor $conn = null): Future
     {
-        return async(fn() => Utils::docDistinct($this->resolveConn($conn), $collection, $field, $filter));
+        $c = $this->resolveConn($conn);
+        return async(fn() => Utils::docDistinct($c, $collection, $field, $filter));
     }
 
     // Search
@@ -718,7 +762,8 @@ class GoldLapel
         bool $highlight = false,
         ?PostgresExecutor $conn = null,
     ): Future {
-        return async(fn() => Utils::search($this->resolveConn($conn), $table, $column, $query, $limit, $lang, $highlight));
+        $c = $this->resolveConn($conn);
+        return async(fn() => Utils::search($c, $table, $column, $query, $limit, $lang, $highlight));
     }
 
     public function searchFuzzy(
@@ -729,7 +774,8 @@ class GoldLapel
         float $threshold = 0.3,
         ?PostgresExecutor $conn = null,
     ): Future {
-        return async(fn() => Utils::searchFuzzy($this->resolveConn($conn), $table, $column, $query, $limit, $threshold));
+        $c = $this->resolveConn($conn);
+        return async(fn() => Utils::searchFuzzy($c, $table, $column, $query, $limit, $threshold));
     }
 
     public function searchPhonetic(
@@ -739,7 +785,8 @@ class GoldLapel
         int $limit = 50,
         ?PostgresExecutor $conn = null,
     ): Future {
-        return async(fn() => Utils::searchPhonetic($this->resolveConn($conn), $table, $column, $query, $limit));
+        $c = $this->resolveConn($conn);
+        return async(fn() => Utils::searchPhonetic($c, $table, $column, $query, $limit));
     }
 
     public function similar(
@@ -749,7 +796,8 @@ class GoldLapel
         int $limit = 10,
         ?PostgresExecutor $conn = null,
     ): Future {
-        return async(fn() => Utils::similar($this->resolveConn($conn), $table, $column, $vector, $limit));
+        $c = $this->resolveConn($conn);
+        return async(fn() => Utils::similar($c, $table, $column, $vector, $limit));
     }
 
     public function suggest(
@@ -759,7 +807,8 @@ class GoldLapel
         int $limit = 10,
         ?PostgresExecutor $conn = null,
     ): Future {
-        return async(fn() => Utils::suggest($this->resolveConn($conn), $table, $column, $prefix, $limit));
+        $c = $this->resolveConn($conn);
+        return async(fn() => Utils::suggest($c, $table, $column, $prefix, $limit));
     }
 
     public function facets(
@@ -771,7 +820,8 @@ class GoldLapel
         string $lang = 'english',
         ?PostgresExecutor $conn = null,
     ): Future {
-        return async(fn() => Utils::facets($this->resolveConn($conn), $table, $column, $limit, $query, $queryColumn, $lang));
+        $c = $this->resolveConn($conn);
+        return async(fn() => Utils::facets($c, $table, $column, $limit, $query, $queryColumn, $lang));
     }
 
     public function aggregate(
@@ -782,108 +832,123 @@ class GoldLapel
         int $limit = 50,
         ?PostgresExecutor $conn = null,
     ): Future {
-        return async(fn() => Utils::aggregate($this->resolveConn($conn), $table, $column, $func, $groupBy, $limit));
+        $c = $this->resolveConn($conn);
+        return async(fn() => Utils::aggregate($c, $table, $column, $func, $groupBy, $limit));
     }
 
     public function createSearchConfig(string $name, string $copyFrom = 'english', ?PostgresExecutor $conn = null): Future
     {
-        return async(fn() => Utils::createSearchConfig($this->resolveConn($conn), $name, $copyFrom));
+        $c = $this->resolveConn($conn);
+        return async(fn() => Utils::createSearchConfig($c, $name, $copyFrom));
     }
 
     // Pub/Sub & Queue
 
     public function publish(string $channel, string $message, ?PostgresExecutor $conn = null): Future
     {
-        return async(fn() => Utils::publish($this->resolveConn($conn), $channel, $message));
+        $c = $this->resolveConn($conn);
+        return async(fn() => Utils::publish($c, $channel, $message));
     }
 
     public function subscribe(string $channel, callable $callback, ?PostgresExecutor $conn = null): Future
     {
-        return async(function () use ($channel, $callback, $conn) {
-            $c = $this->resolveConn($conn);
-            if (!$c instanceof PostgresConnection) {
-                throw new \InvalidArgumentException(
-                    'subscribe requires a PostgresConnection (LISTEN is not supported on transactions).'
-                );
-            }
-            Utils::subscribe($c, $channel, $callback);
-        });
+        $c = $this->resolveConn($conn);
+        if (!$c instanceof PostgresConnection) {
+            throw new \InvalidArgumentException(
+                'subscribe requires a PostgresConnection (LISTEN is not supported on transactions).'
+            );
+        }
+        return async(fn() => Utils::subscribe($c, $channel, $callback));
     }
 
     public function enqueue(string $queueTable, array $payload, ?PostgresExecutor $conn = null): Future
     {
-        return async(fn() => Utils::enqueue($this->resolveConn($conn), $queueTable, $payload));
+        $c = $this->resolveConn($conn);
+        return async(fn() => Utils::enqueue($c, $queueTable, $payload));
     }
 
     public function dequeue(string $queueTable, ?PostgresExecutor $conn = null): Future
     {
-        return async(fn() => Utils::dequeue($this->resolveConn($conn), $queueTable));
+        $c = $this->resolveConn($conn);
+        return async(fn() => Utils::dequeue($c, $queueTable));
     }
 
     // Counters
 
     public function incr(string $table, string $key, int $amount = 1, ?PostgresExecutor $conn = null): Future
     {
-        return async(fn() => Utils::incr($this->resolveConn($conn), $table, $key, $amount));
+        $c = $this->resolveConn($conn);
+        return async(fn() => Utils::incr($c, $table, $key, $amount));
     }
 
     public function getCounter(string $table, string $key, ?PostgresExecutor $conn = null): Future
     {
-        return async(fn() => Utils::getCounter($this->resolveConn($conn), $table, $key));
+        $c = $this->resolveConn($conn);
+        return async(fn() => Utils::getCounter($c, $table, $key));
     }
 
     // Hash
 
     public function hset(string $table, string $key, string $field, mixed $value, ?PostgresExecutor $conn = null): Future
     {
-        return async(fn() => Utils::hset($this->resolveConn($conn), $table, $key, $field, $value));
+        $c = $this->resolveConn($conn);
+        return async(fn() => Utils::hset($c, $table, $key, $field, $value));
     }
 
     public function hget(string $table, string $key, string $field, ?PostgresExecutor $conn = null): Future
     {
-        return async(fn() => Utils::hget($this->resolveConn($conn), $table, $key, $field));
+        $c = $this->resolveConn($conn);
+        return async(fn() => Utils::hget($c, $table, $key, $field));
     }
 
     public function hgetall(string $table, string $key, ?PostgresExecutor $conn = null): Future
     {
-        return async(fn() => Utils::hgetall($this->resolveConn($conn), $table, $key));
+        $c = $this->resolveConn($conn);
+        return async(fn() => Utils::hgetall($c, $table, $key));
     }
 
     public function hdel(string $table, string $key, string $field, ?PostgresExecutor $conn = null): Future
     {
-        return async(fn() => Utils::hdel($this->resolveConn($conn), $table, $key, $field));
+        $c = $this->resolveConn($conn);
+        return async(fn() => Utils::hdel($c, $table, $key, $field));
     }
 
     // Sorted Sets
 
     public function zadd(string $table, string $member, float $score, ?PostgresExecutor $conn = null): Future
     {
-        return async(fn() => Utils::zadd($this->resolveConn($conn), $table, $member, $score));
+        $c = $this->resolveConn($conn);
+        return async(fn() => Utils::zadd($c, $table, $member, $score));
     }
 
     public function zincrby(string $table, string $member, float $amount = 1, ?PostgresExecutor $conn = null): Future
     {
-        return async(fn() => Utils::zincrby($this->resolveConn($conn), $table, $member, $amount));
+        $c = $this->resolveConn($conn);
+        return async(fn() => Utils::zincrby($c, $table, $member, $amount));
     }
 
     public function zrange(string $table, int $start = 0, int $stop = 10, bool $desc = true, ?PostgresExecutor $conn = null): Future
     {
-        return async(fn() => Utils::zrange($this->resolveConn($conn), $table, $start, $stop, $desc));
+        $c = $this->resolveConn($conn);
+        return async(fn() => Utils::zrange($c, $table, $start, $stop, $desc));
     }
 
     public function zrank(string $table, string $member, bool $desc = true, ?PostgresExecutor $conn = null): Future
     {
-        return async(fn() => Utils::zrank($this->resolveConn($conn), $table, $member, $desc));
+        $c = $this->resolveConn($conn);
+        return async(fn() => Utils::zrank($c, $table, $member, $desc));
     }
 
     public function zscore(string $table, string $member, ?PostgresExecutor $conn = null): Future
     {
-        return async(fn() => Utils::zscore($this->resolveConn($conn), $table, $member));
+        $c = $this->resolveConn($conn);
+        return async(fn() => Utils::zscore($c, $table, $member));
     }
 
     public function zrem(string $table, string $member, ?PostgresExecutor $conn = null): Future
     {
-        return async(fn() => Utils::zrem($this->resolveConn($conn), $table, $member));
+        $c = $this->resolveConn($conn);
+        return async(fn() => Utils::zrem($c, $table, $member));
     }
 
     // Geo
@@ -897,7 +962,8 @@ class GoldLapel
         int $limit = 50,
         ?PostgresExecutor $conn = null,
     ): Future {
-        return async(fn() => Utils::georadius($this->resolveConn($conn), $table, $geomColumn, $lon, $lat, $radiusMeters, $limit));
+        $c = $this->resolveConn($conn);
+        return async(fn() => Utils::georadius($c, $table, $geomColumn, $lon, $lat, $radiusMeters, $limit));
     }
 
     public function geoadd(
@@ -909,7 +975,8 @@ class GoldLapel
         float $lat,
         ?PostgresExecutor $conn = null,
     ): Future {
-        return async(fn() => Utils::geoadd($this->resolveConn($conn), $table, $nameColumn, $geomColumn, $name, $lon, $lat));
+        $c = $this->resolveConn($conn);
+        return async(fn() => Utils::geoadd($c, $table, $nameColumn, $geomColumn, $name, $lon, $lat));
     }
 
     public function geodist(
@@ -920,14 +987,16 @@ class GoldLapel
         string $nameB,
         ?PostgresExecutor $conn = null,
     ): Future {
-        return async(fn() => Utils::geodist($this->resolveConn($conn), $table, $geomColumn, $nameColumn, $nameA, $nameB));
+        $c = $this->resolveConn($conn);
+        return async(fn() => Utils::geodist($c, $table, $geomColumn, $nameColumn, $nameA, $nameB));
     }
 
     // Misc
 
     public function countDistinct(string $table, string $column, ?PostgresExecutor $conn = null): Future
     {
-        return async(fn() => Utils::countDistinct($this->resolveConn($conn), $table, $column));
+        $c = $this->resolveConn($conn);
+        return async(fn() => Utils::countDistinct($c, $table, $column));
     }
 
     /**
@@ -938,19 +1007,22 @@ class GoldLapel
      */
     public function script(string $luaCode, mixed ...$args): Future
     {
-        return async(fn() => Utils::script($this->resolveConn(null), $luaCode, ...$args));
+        $c = $this->resolveConn(null);
+        return async(fn() => Utils::script($c, $luaCode, ...$args));
     }
 
     // Streams
 
     public function streamAdd(string $stream, array $payload, ?PostgresExecutor $conn = null): Future
     {
-        return async(fn() => Utils::streamAdd($this->resolveConn($conn), $stream, $payload));
+        $c = $this->resolveConn($conn);
+        return async(fn() => Utils::streamAdd($c, $stream, $payload));
     }
 
     public function streamCreateGroup(string $stream, string $group, ?PostgresExecutor $conn = null): Future
     {
-        return async(fn() => Utils::streamCreateGroup($this->resolveConn($conn), $stream, $group));
+        $c = $this->resolveConn($conn);
+        return async(fn() => Utils::streamCreateGroup($c, $stream, $group));
     }
 
     public function streamRead(
@@ -960,20 +1032,19 @@ class GoldLapel
         int $count = 1,
         ?PostgresExecutor $conn = null,
     ): Future {
-        return async(function () use ($stream, $group, $consumer, $count, $conn) {
-            $c = $this->resolveConn($conn);
-            if (!$c instanceof PostgresConnection) {
-                throw new \InvalidArgumentException(
-                    'streamRead requires a PostgresConnection (opens its own transaction).'
-                );
-            }
-            return Utils::streamRead($c, $stream, $group, $consumer, $count);
-        });
+        $c = $this->resolveConn($conn);
+        if (!$c instanceof PostgresConnection) {
+            throw new \InvalidArgumentException(
+                'streamRead requires a PostgresConnection (opens its own transaction).'
+            );
+        }
+        return async(fn() => Utils::streamRead($c, $stream, $group, $consumer, $count));
     }
 
     public function streamAck(string $stream, string $group, int $messageId, ?PostgresExecutor $conn = null): Future
     {
-        return async(fn() => Utils::streamAck($this->resolveConn($conn), $stream, $group, $messageId));
+        $c = $this->resolveConn($conn);
+        return async(fn() => Utils::streamAck($c, $stream, $group, $messageId));
     }
 
     public function streamClaim(
@@ -983,7 +1054,8 @@ class GoldLapel
         int $minIdleMs = 60000,
         ?PostgresExecutor $conn = null,
     ): Future {
-        return async(fn() => Utils::streamClaim($this->resolveConn($conn), $stream, $group, $consumer, $minIdleMs));
+        $c = $this->resolveConn($conn);
+        return async(fn() => Utils::streamClaim($c, $stream, $group, $consumer, $minIdleMs));
     }
 
     // Percolate
@@ -996,7 +1068,8 @@ class GoldLapel
         ?array $metadata = null,
         ?PostgresExecutor $conn = null,
     ): Future {
-        return async(fn() => Utils::percolateAdd($this->resolveConn($conn), $name, $queryId, $query, $lang, $metadata));
+        $c = $this->resolveConn($conn);
+        return async(fn() => Utils::percolateAdd($c, $name, $queryId, $query, $lang, $metadata));
     }
 
     public function percolate(
@@ -1006,19 +1079,22 @@ class GoldLapel
         string $lang = 'english',
         ?PostgresExecutor $conn = null,
     ): Future {
-        return async(fn() => Utils::percolate($this->resolveConn($conn), $name, $text, $limit, $lang));
+        $c = $this->resolveConn($conn);
+        return async(fn() => Utils::percolate($c, $name, $text, $limit, $lang));
     }
 
     public function percolateDelete(string $name, string $queryId, ?PostgresExecutor $conn = null): Future
     {
-        return async(fn() => Utils::percolateDelete($this->resolveConn($conn), $name, $queryId));
+        $c = $this->resolveConn($conn);
+        return async(fn() => Utils::percolateDelete($c, $name, $queryId));
     }
 
     // Debug
 
     public function analyze(string $text, string $lang = 'english', ?PostgresExecutor $conn = null): Future
     {
-        return async(fn() => Utils::analyze($this->resolveConn($conn), $text, $lang));
+        $c = $this->resolveConn($conn);
+        return async(fn() => Utils::analyze($c, $text, $lang));
     }
 
     public function explainScore(
@@ -1030,6 +1106,7 @@ class GoldLapel
         string $lang = 'english',
         ?PostgresExecutor $conn = null,
     ): Future {
-        return async(fn() => Utils::explainScore($this->resolveConn($conn), $table, $column, $query, $idColumn, $idValue, $lang));
+        $c = $this->resolveConn($conn);
+        return async(fn() => Utils::explainScore($c, $table, $column, $query, $idColumn, $idValue, $lang));
     }
 }
