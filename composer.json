@@ -53,6 +53,5 @@
   },
   "bin": [
     "bin/goldlapel"
-  ],
-  "version": "0.2.0"
+  ]
 }
