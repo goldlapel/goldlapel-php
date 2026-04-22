@@ -66,6 +66,12 @@ class GoldLapel
     private $process = null;
     private ?string $url = null;
     private ?PostgresConnection $connection = null;
+
+    /** Dashboard token provisioned by startProxy(); null for external proxies. */
+    private ?string $dashboardToken = null;
+
+    /** Per-instance cache of fetched DDL patterns keyed on "family:name". */
+    private array $ddlCache = [];
     /**
      * Fiber-local scope set by using(); takes precedence over $connection.
      * Each fiber stores its own value, so sibling fibers on the same
@@ -234,6 +240,13 @@ class GoldLapel
         $env = getenv();
         if (!isset($env['GOLDLAPEL_CLIENT'])) {
             $env['GOLDLAPEL_CLIENT'] = 'php-amp';
+        }
+        // Session-scoped dashboard token for /api/ddl/* calls.
+        if (!empty($env['GOLDLAPEL_DASHBOARD_TOKEN'])) {
+            $this->dashboardToken = $env['GOLDLAPEL_DASHBOARD_TOKEN'];
+        } else {
+            $this->dashboardToken = bin2hex(random_bytes(32));
+            $env['GOLDLAPEL_DASHBOARD_TOKEN'] = $this->dashboardToken;
         }
         $pipes = [];
         $this->process = proc_open($cmd, $descriptors, $pipes, null, $env);
@@ -1069,18 +1082,27 @@ class GoldLapel
         return async(fn() => Utils::script($c, $luaCode, ...$args));
     }
 
-    // Streams
+    // Streams — proxy-owned DDL. First call fetches canonical query patterns
+    // from /api/ddl/stream/create; cache is keyed on (family, name) per instance.
+
+    private function streamPatterns(string $stream): array
+    {
+        $token = $this->dashboardToken ?? \GoldLapel\Ddl::tokenFromEnvOrFile();
+        return \GoldLapel\Ddl::fetch($this->ddlCache, 'stream', $stream, $this->dashboardPort, $token);
+    }
 
     public function streamAdd(string $stream, array $payload, ?PostgresExecutor $conn = null): Future
     {
+        $patterns = $this->streamPatterns($stream);
         $c = $this->resolveConn($conn);
-        return async(fn() => Utils::streamAdd($c, $stream, $payload));
+        return async(fn() => Utils::streamAdd($c, $stream, $payload, $patterns));
     }
 
     public function streamCreateGroup(string $stream, string $group, ?PostgresExecutor $conn = null): Future
     {
+        $patterns = $this->streamPatterns($stream);
         $c = $this->resolveConn($conn);
-        return async(fn() => Utils::streamCreateGroup($c, $stream, $group));
+        return async(fn() => Utils::streamCreateGroup($c, $stream, $group, $patterns));
     }
 
     public function streamRead(
@@ -1090,19 +1112,21 @@ class GoldLapel
         int $count = 1,
         ?PostgresExecutor $conn = null,
     ): Future {
+        $patterns = $this->streamPatterns($stream);
         $c = $this->resolveConn($conn);
         if (!$c instanceof PostgresConnection) {
             throw new \InvalidArgumentException(
                 'streamRead requires a PostgresConnection (opens its own transaction).'
             );
         }
-        return async(fn() => Utils::streamRead($c, $stream, $group, $consumer, $count));
+        return async(fn() => Utils::streamRead($c, $stream, $group, $consumer, $count, $patterns));
     }
 
     public function streamAck(string $stream, string $group, int $messageId, ?PostgresExecutor $conn = null): Future
     {
+        $patterns = $this->streamPatterns($stream);
         $c = $this->resolveConn($conn);
-        return async(fn() => Utils::streamAck($c, $stream, $group, $messageId));
+        return async(fn() => Utils::streamAck($c, $stream, $group, $messageId, $patterns));
     }
 
     public function streamClaim(
@@ -1112,8 +1136,9 @@ class GoldLapel
         int $minIdleMs = 60000,
         ?PostgresExecutor $conn = null,
     ): Future {
+        $patterns = $this->streamPatterns($stream);
         $c = $this->resolveConn($conn);
-        return async(fn() => Utils::streamClaim($c, $stream, $group, $consumer, $minIdleMs));
+        return async(fn() => Utils::streamClaim($c, $stream, $group, $consumer, $minIdleMs, $patterns));
     }
 
     // Percolate

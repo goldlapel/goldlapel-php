@@ -430,57 +430,53 @@ class Utils
         return (int) $stmt->fetchColumn();
     }
 
-    public static function streamAdd(\PDO $pdo, string $stream, array $payload): int
+    private static function requireStreamPattern(?array $patterns, string $key, string $fn): string
+    {
+        if ($patterns === null || !isset($patterns['query_patterns'])) {
+            throw new \RuntimeException(
+                "{$fn} requires DDL patterns from the proxy — call via "
+                . "\$gl->{$fn}(...) rather than Utils::{$fn} directly."
+            );
+        }
+        $qp = $patterns['query_patterns'];
+        if (!isset($qp[$key])) {
+            throw new \RuntimeException(
+                "DDL API response missing pattern '{$key}' for {$fn}"
+            );
+        }
+        return Ddl::toPdoPlaceholders($qp[$key]);
+    }
+
+    public static function streamAdd(\PDO $pdo, string $stream, array $payload, ?array $patterns = null): int
     {
         self::validateIdentifier($stream);
-        $pdo->exec("
-            CREATE TABLE IF NOT EXISTS {$stream} (
-                id BIGSERIAL PRIMARY KEY,
-                payload JSONB NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )
-        ");
-        $stmt = $pdo->prepare("INSERT INTO {$stream} (payload) VALUES (?) RETURNING id");
+        $sql = self::requireStreamPattern($patterns, 'insert', 'streamAdd');
+        // JSONB binding through PDO: cast at the SQL site.
+        $withCast = str_replace('VALUES (?)', 'VALUES (?::jsonb)', $sql);
+        $stmt = $pdo->prepare($withCast);
         $stmt->execute([json_encode($payload)]);
         return (int) $stmt->fetchColumn();
     }
 
-    public static function streamCreateGroup(\PDO $pdo, string $stream, string $group): void
+    public static function streamCreateGroup(\PDO $pdo, string $stream, string $group, ?array $patterns = null): void
     {
         self::validateIdentifier($stream);
-        $groupsTable = $stream . '_groups';
-        $pendingTable = $stream . '_pending';
-        $pdo->exec("
-            CREATE TABLE IF NOT EXISTS {$groupsTable} (
-                group_name TEXT PRIMARY KEY,
-                last_id BIGINT NOT NULL DEFAULT 0
-            )
-        ");
-        $pdo->exec("
-            CREATE TABLE IF NOT EXISTS {$pendingTable} (
-                message_id BIGINT NOT NULL,
-                group_name TEXT NOT NULL,
-                consumer TEXT NOT NULL,
-                assigned_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                PRIMARY KEY (group_name, message_id)
-            )
-        ");
-        $stmt = $pdo->prepare("
-            INSERT INTO {$groupsTable} (group_name, last_id) VALUES (?, 0)
-            ON CONFLICT (group_name) DO NOTHING
-        ");
+        $sql = self::requireStreamPattern($patterns, 'create_group', 'streamCreateGroup');
+        $stmt = $pdo->prepare($sql);
         $stmt->execute([$group]);
     }
 
-    public static function streamRead(\PDO $pdo, string $stream, string $group, string $consumer, int $count = 1): array
+    public static function streamRead(\PDO $pdo, string $stream, string $group, string $consumer, int $count = 1, ?array $patterns = null): array
     {
         self::validateIdentifier($stream);
-        $groupsTable = $stream . '_groups';
-        $pendingTable = $stream . '_pending';
+        $cursorSql = self::requireStreamPattern($patterns, 'group_get_cursor', 'streamRead');
+        $readSql = self::requireStreamPattern($patterns, 'read_since', 'streamRead');
+        $advanceSql = self::requireStreamPattern($patterns, 'group_advance_cursor', 'streamRead');
+        $pendingSql = self::requireStreamPattern($patterns, 'pending_insert', 'streamRead');
 
         $pdo->beginTransaction();
         try {
-            $stmt = $pdo->prepare("SELECT last_id FROM {$groupsTable} WHERE group_name = ? FOR UPDATE");
+            $stmt = $pdo->prepare($cursorSql);
             $stmt->execute([$group]);
             $lastId = $stmt->fetchColumn();
             if ($lastId === false) {
@@ -488,13 +484,7 @@ class Utils
                 return [];
             }
 
-            $stmt = $pdo->prepare("
-                SELECT id, payload, created_at FROM {$stream}
-                WHERE id > ?
-                ORDER BY id
-                LIMIT ?
-                FOR UPDATE SKIP LOCKED
-            ");
+            $stmt = $pdo->prepare($readSql);
             $stmt->execute([$lastId, $count]);
             $messages = $stmt->fetchAll(\PDO::FETCH_ASSOC);
 
@@ -504,11 +494,7 @@ class Utils
             }
 
             $maxId = 0;
-            $insert = $pdo->prepare("
-                INSERT INTO {$pendingTable} (message_id, group_name, consumer)
-                VALUES (?, ?, ?)
-                ON CONFLICT (group_name, message_id) DO NOTHING
-            ");
+            $insert = $pdo->prepare($pendingSql);
             foreach ($messages as &$msg) {
                 $msg['payload'] = json_decode($msg['payload'], true);
                 $id = (int) $msg['id'];
@@ -519,8 +505,8 @@ class Utils
             }
             unset($msg);
 
-            $stmt = $pdo->prepare("UPDATE {$groupsTable} SET last_id = ? WHERE group_name = ?");
-            $stmt->execute([$maxId, $group]);
+            $advance = $pdo->prepare($advanceSql);
+            $advance->execute([$maxId, $group]);
 
             $pdo->commit();
             return $messages;
@@ -530,26 +516,22 @@ class Utils
         }
     }
 
-    public static function streamAck(\PDO $pdo, string $stream, string $group, int $messageId): bool
+    public static function streamAck(\PDO $pdo, string $stream, string $group, int $messageId, ?array $patterns = null): bool
     {
         self::validateIdentifier($stream);
-        $pendingTable = $stream . '_pending';
-        $stmt = $pdo->prepare("DELETE FROM {$pendingTable} WHERE group_name = ? AND message_id = ?");
+        $sql = self::requireStreamPattern($patterns, 'ack', 'streamAck');
+        $stmt = $pdo->prepare($sql);
         $stmt->execute([$group, $messageId]);
         return $stmt->rowCount() > 0;
     }
 
-    public static function streamClaim(\PDO $pdo, string $stream, string $group, string $consumer, int $minIdleMs = 60000): array
+    public static function streamClaim(\PDO $pdo, string $stream, string $group, string $consumer, int $minIdleMs = 60000, ?array $patterns = null): array
     {
         self::validateIdentifier($stream);
-        $pendingTable = $stream . '_pending';
-        $stmt = $pdo->prepare("
-            UPDATE {$pendingTable}
-            SET consumer = ?, assigned_at = NOW()
-            WHERE group_name = ?
-            AND assigned_at < NOW() - (? || ' milliseconds')::interval
-            RETURNING message_id
-        ");
+        $claimSql = self::requireStreamPattern($patterns, 'claim', 'streamClaim');
+        $readByIdSql = self::requireStreamPattern($patterns, 'read_by_id', 'streamClaim');
+
+        $stmt = $pdo->prepare($claimSql);
         $stmt->execute([$consumer, $group, $minIdleMs]);
         $claimed = $stmt->fetchAll(\PDO::FETCH_COLUMN);
 
@@ -557,19 +539,16 @@ class Utils
             return [];
         }
 
-        $placeholders = implode(', ', array_fill(0, count($claimed), '?'));
-        $stmt = $pdo->prepare("
-            SELECT id, payload, created_at FROM {$stream}
-            WHERE id IN ({$placeholders})
-            ORDER BY id
-        ");
-        $stmt->execute($claimed);
-        $messages = $stmt->fetchAll(\PDO::FETCH_ASSOC);
-        foreach ($messages as &$msg) {
-            $msg['payload'] = json_decode($msg['payload'], true);
+        $readStmt = $pdo->prepare($readByIdSql);
+        $messages = [];
+        foreach ($claimed as $msgId) {
+            $readStmt->execute([(int) $msgId]);
+            $row = $readStmt->fetch(\PDO::FETCH_ASSOC);
+            if ($row !== false) {
+                $row['payload'] = json_decode($row['payload'], true);
+                $messages[] = $row;
+            }
         }
-        unset($msg);
-
         return $messages;
     }
 

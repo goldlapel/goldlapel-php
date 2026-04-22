@@ -89,6 +89,12 @@ class GoldLapel
     /** Connection set by using(); takes precedence over $pdo. */
     private ?\PDO $scopedConn = null;
 
+    /** Dashboard token, provisioned on startProxy(). Used by Ddl.php. */
+    private ?string $dashboardToken = null;
+
+    /** Per-instance cache of fetched DDL patterns keyed on "family:name". */
+    private array $ddlCache = [];
+
     /** @var array<int, self> */
     private static array $liveInstances = [];
     private static bool $cleanupRegistered = false;
@@ -423,6 +429,14 @@ class GoldLapel
         if (!isset($env['GOLDLAPEL_CLIENT'])) {
             $env['GOLDLAPEL_CLIENT'] = 'php';
         }
+        // Provision a session-scoped dashboard token so Ddl.php can authenticate
+        // against /api/ddl/* without a file on disk. Pre-set env wins.
+        if (!empty($env['GOLDLAPEL_DASHBOARD_TOKEN'])) {
+            $this->dashboardToken = $env['GOLDLAPEL_DASHBOARD_TOKEN'];
+        } else {
+            $this->dashboardToken = bin2hex(random_bytes(32));
+            $env['GOLDLAPEL_DASHBOARD_TOKEN'] = $this->dashboardToken;
+        }
 
         $pipes = [];
         $this->process = proc_open($cmd, $descriptors, $pipes, null, $env);
@@ -518,6 +532,10 @@ class GoldLapel
     {
         $this->pdo = null;
         $this->scopedConn = null;
+        // Drop cached DDL patterns — they're tied to the proxy we're about
+        // to terminate.
+        $this->ddlCache = [];
+        $this->dashboardToken = null;
 
         if ($this->process === null) {
             unset(self::$liveInstances[spl_object_id($this)]);
@@ -531,6 +549,17 @@ class GoldLapel
         if (empty(self::$liveInstances)) {
             NativeCache::reset();
         }
+    }
+
+    public function dashboardToken(): ?string
+    {
+        return $this->dashboardToken;
+    }
+
+    /** @return array<string, array<string, mixed>> by-reference */
+    public function &ddlCache(): array
+    {
+        return $this->ddlCache;
     }
 
     public function __destruct()
@@ -1115,16 +1144,26 @@ class GoldLapel
         return Utils::script($this->resolveConn(null), $luaCode, ...$args);
     }
 
-    // Streams
+    // Streams — proxy-owned DDL. First call for a given stream fetches the
+    // canonical query patterns from /api/ddl/stream/create; subsequent calls
+    // hit the per-instance cache.
+
+    private function streamPatterns(string $stream): array
+    {
+        $token = $this->dashboardToken ?? Ddl::tokenFromEnvOrFile();
+        return Ddl::fetch($this->ddlCache, 'stream', $stream, $this->dashboardPort, $token);
+    }
 
     public function streamAdd(string $stream, array $payload, ?\PDO $conn = null): int
     {
-        return Utils::streamAdd($this->resolveConn($conn), $stream, $payload);
+        $patterns = $this->streamPatterns($stream);
+        return Utils::streamAdd($this->resolveConn($conn), $stream, $payload, $patterns);
     }
 
     public function streamCreateGroup(string $stream, string $group, ?\PDO $conn = null): void
     {
-        Utils::streamCreateGroup($this->resolveConn($conn), $stream, $group);
+        $patterns = $this->streamPatterns($stream);
+        Utils::streamCreateGroup($this->resolveConn($conn), $stream, $group, $patterns);
     }
 
     public function streamRead(
@@ -1134,12 +1173,14 @@ class GoldLapel
         int $count = 1,
         ?\PDO $conn = null,
     ): array {
-        return Utils::streamRead($this->resolveConn($conn), $stream, $group, $consumer, $count);
+        $patterns = $this->streamPatterns($stream);
+        return Utils::streamRead($this->resolveConn($conn), $stream, $group, $consumer, $count, $patterns);
     }
 
     public function streamAck(string $stream, string $group, int $messageId, ?\PDO $conn = null): bool
     {
-        return Utils::streamAck($this->resolveConn($conn), $stream, $group, $messageId);
+        $patterns = $this->streamPatterns($stream);
+        return Utils::streamAck($this->resolveConn($conn), $stream, $group, $messageId, $patterns);
     }
 
     public function streamClaim(
@@ -1149,7 +1190,8 @@ class GoldLapel
         int $minIdleMs = 60000,
         ?\PDO $conn = null,
     ): array {
-        return Utils::streamClaim($this->resolveConn($conn), $stream, $group, $consumer, $minIdleMs);
+        $patterns = $this->streamPatterns($stream);
+        return Utils::streamClaim($this->resolveConn($conn), $stream, $group, $consumer, $minIdleMs, $patterns);
     }
 
     // Percolate

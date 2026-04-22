@@ -419,6 +419,21 @@ class InstanceMethodsTest extends TestCase
         $pdo->method('exec')->willReturn(0);
         $pdo->method('prepare')->willReturn($stmt);
 
+        // Stream DDL patterns now come from the proxy's /api/ddl/* endpoint.
+        // Pre-populate the per-instance cache so streamAdd doesn't try to
+        // POST to a non-running dashboard in this unit test.
+        $refl = new \ReflectionClass($gl);
+        $prop = $refl->getProperty('ddlCache');
+        $prop->setAccessible(true);
+        $prop->setValue($gl, [
+            'stream:events' => [
+                'tables' => ['main' => '_goldlapel.stream_events'],
+                'query_patterns' => [
+                    'insert' => 'INSERT INTO _goldlapel.stream_events (payload) VALUES ($1) RETURNING id, created_at',
+                ],
+            ],
+        ]);
+
         $id = $gl->streamAdd('events', ['type' => 'click']);
         $this->assertSame(1, $id);
     }

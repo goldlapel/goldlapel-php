@@ -875,49 +875,35 @@ class Utils
     // Streams
     // ========================================================================
 
-    public static function streamAdd(PostgresExecutor $conn, string $stream, array $payload): int
+    private static function requireStreamPattern(?array $patterns, string $key, string $fn): string
+    {
+        if ($patterns === null || !isset($patterns['query_patterns'])) {
+            throw new \RuntimeException(
+                "{$fn} requires DDL patterns from the proxy — call via "
+                . "\$gl->{$fn}(...) rather than Utils::{$fn} directly."
+            );
+        }
+        $qp = $patterns['query_patterns'];
+        if (!isset($qp[$key])) {
+            throw new \RuntimeException("DDL API response missing pattern '{$key}' for {$fn}");
+        }
+        return \GoldLapel\Ddl::toPdoPlaceholders($qp[$key]);
+    }
+
+    public static function streamAdd(PostgresExecutor $conn, string $stream, array $payload, ?array $patterns = null): int
     {
         SyncUtils::validateIdentifier($stream);
-        $conn->query("
-            CREATE TABLE IF NOT EXISTS {$stream} (
-                id BIGSERIAL PRIMARY KEY,
-                payload JSONB NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )
-        ");
-        $id = self::fetchColumn(
-            $conn,
-            "INSERT INTO {$stream} (payload) VALUES (?) RETURNING id",
-            [json_encode($payload)]
-        );
+        $sql = self::requireStreamPattern($patterns, 'insert', 'streamAdd');
+        $withCast = str_replace('VALUES (?)', 'VALUES (?::jsonb)', $sql);
+        $id = self::fetchColumn($conn, $withCast, [json_encode($payload)]);
         return (int) $id;
     }
 
-    public static function streamCreateGroup(PostgresExecutor $conn, string $stream, string $group): void
+    public static function streamCreateGroup(PostgresExecutor $conn, string $stream, string $group, ?array $patterns = null): void
     {
         SyncUtils::validateIdentifier($stream);
-        $groupsTable = $stream . '_groups';
-        $pendingTable = $stream . '_pending';
-        $conn->query("
-            CREATE TABLE IF NOT EXISTS {$groupsTable} (
-                group_name TEXT PRIMARY KEY,
-                last_id BIGINT NOT NULL DEFAULT 0
-            )
-        ");
-        $conn->query("
-            CREATE TABLE IF NOT EXISTS {$pendingTable} (
-                message_id BIGINT NOT NULL,
-                group_name TEXT NOT NULL,
-                consumer TEXT NOT NULL,
-                assigned_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-                PRIMARY KEY (group_name, message_id)
-            )
-        ");
-        self::exec(
-            $conn,
-            "INSERT INTO {$groupsTable} (group_name, last_id) VALUES (?, 0) ON CONFLICT (group_name) DO NOTHING",
-            [$group]
-        );
+        $sql = self::requireStreamPattern($patterns, 'create_group', 'streamCreateGroup');
+        self::exec($conn, $sql, [$group]);
     }
 
     /**
@@ -931,31 +917,23 @@ class Utils
         string $group,
         string $consumer,
         int $count = 1,
+        ?array $patterns = null,
     ): array {
         SyncUtils::validateIdentifier($stream);
-        $groupsTable = $stream . '_groups';
-        $pendingTable = $stream . '_pending';
+        $cursorSql = self::requireStreamPattern($patterns, 'group_get_cursor', 'streamRead');
+        $readSql = self::requireStreamPattern($patterns, 'read_since', 'streamRead');
+        $advanceSql = self::requireStreamPattern($patterns, 'group_advance_cursor', 'streamRead');
+        $pendingSql = self::requireStreamPattern($patterns, 'pending_insert', 'streamRead');
 
         $tx = $conn->beginTransaction();
         try {
-            $lastId = self::fetchColumn(
-                $tx,
-                "SELECT last_id FROM {$groupsTable} WHERE group_name = ? FOR UPDATE",
-                [$group]
-            );
+            $lastId = self::fetchColumn($tx, $cursorSql, [$group]);
             if ($lastId === null) {
                 $tx->commit();
                 return [];
             }
 
-            $messages = self::fetchAll($tx, "
-                SELECT id, payload, created_at FROM {$stream}
-                WHERE id > ?
-                ORDER BY id
-                LIMIT ?
-                FOR UPDATE SKIP LOCKED
-            ", [(int) $lastId, $count]);
-
+            $messages = self::fetchAll($tx, $readSql, [(int) $lastId, $count]);
             if (empty($messages)) {
                 $tx->commit();
                 return [];
@@ -970,19 +948,11 @@ class Utils
                 if ($id > $maxId) {
                     $maxId = $id;
                 }
-                self::exec($tx, "
-                    INSERT INTO {$pendingTable} (message_id, group_name, consumer)
-                    VALUES (?, ?, ?)
-                    ON CONFLICT (group_name, message_id) DO NOTHING
-                ", [$id, $group, $consumer]);
+                self::exec($tx, $pendingSql, [$id, $group, $consumer]);
             }
             unset($msg);
 
-            self::exec(
-                $tx,
-                "UPDATE {$groupsTable} SET last_id = ? WHERE group_name = ?",
-                [$maxId, $group]
-            );
+            self::exec($tx, $advanceSql, [$maxId, $group]);
             $tx->commit();
             return $messages;
         } catch (\Throwable $e) {
@@ -998,14 +968,11 @@ class Utils
         string $stream,
         string $group,
         int $messageId,
+        ?array $patterns = null,
     ): bool {
         SyncUtils::validateIdentifier($stream);
-        $pendingTable = $stream . '_pending';
-        $result = self::exec(
-            $conn,
-            "DELETE FROM {$pendingTable} WHERE group_name = ? AND message_id = ?",
-            [$group, $messageId]
-        );
+        $sql = self::requireStreamPattern($patterns, 'ack', 'streamAck');
+        $result = self::exec($conn, $sql, [$group, $messageId]);
         return ($result->getRowCount() ?? 0) > 0;
     }
 
@@ -1015,32 +982,27 @@ class Utils
         string $group,
         string $consumer,
         int $minIdleMs = 60000,
+        ?array $patterns = null,
     ): array {
         SyncUtils::validateIdentifier($stream);
-        $pendingTable = $stream . '_pending';
-        $claimedRows = self::fetchAll($conn, "
-            UPDATE {$pendingTable}
-            SET consumer = ?, assigned_at = NOW()
-            WHERE group_name = ?
-            AND assigned_at < NOW() - (? || ' milliseconds')::interval
-            RETURNING message_id
-        ", [$consumer, $group, $minIdleMs]);
+        $claimSql = self::requireStreamPattern($patterns, 'claim', 'streamClaim');
+        $readByIdSql = self::requireStreamPattern($patterns, 'read_by_id', 'streamClaim');
+
+        $claimedRows = self::fetchAll($conn, $claimSql, [$consumer, $group, $minIdleMs]);
         $claimed = array_map(fn($r) => (int) $r['message_id'], $claimedRows);
         if (empty($claimed)) {
             return [];
         }
-        $placeholders = implode(', ', array_fill(0, count($claimed), '?'));
-        $messages = self::fetchAll($conn, "
-            SELECT id, payload, created_at FROM {$stream}
-            WHERE id IN ({$placeholders})
-            ORDER BY id
-        ", $claimed);
-        foreach ($messages as &$msg) {
-            if (is_string($msg['payload'])) {
-                $msg['payload'] = json_decode($msg['payload'], true);
+        $messages = [];
+        foreach ($claimed as $msgId) {
+            $rows = self::fetchAll($conn, $readByIdSql, [$msgId]);
+            foreach ($rows as $msg) {
+                if (is_string($msg['payload'])) {
+                    $msg['payload'] = json_decode($msg['payload'], true);
+                }
+                $messages[] = $msg;
             }
         }
-        unset($msg);
         return $messages;
     }
 
