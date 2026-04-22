@@ -132,7 +132,7 @@ PHP;
             'query_patterns' => ['insert' => 'INSERT ...'],
         ]);
         $cache = [];
-        $entry = Ddl::fetch($cache, 'stream', 'events', self::$port, 'tok');
+        $entry = Ddl::fetchPatterns($cache, 'stream', 'events', self::$port, 'tok');
         $this->assertSame('_goldlapel.stream_events', $entry['tables']['main']);
         $this->assertSame('INSERT ...', $entry['query_patterns']['insert']);
 
@@ -152,8 +152,8 @@ PHP;
             'query_patterns' => ['insert' => 'X'],
         ]);
         $cache = [];
-        $r1 = Ddl::fetch($cache, 'stream', 'events', self::$port, 'tok');
-        $r2 = Ddl::fetch($cache, 'stream', 'events', self::$port, 'tok');
+        $r1 = Ddl::fetchPatterns($cache, 'stream', 'events', self::$port, 'tok');
+        $r2 = Ddl::fetchPatterns($cache, 'stream', 'events', self::$port, 'tok');
         $this->assertSame($r1, $r2);
         $this->assertCount(1, self::_captured());
     }
@@ -170,8 +170,8 @@ PHP;
         ]);
         $cacheA = [];
         $cacheB = [];
-        Ddl::fetch($cacheA, 'stream', 'events', self::$port, 'tok');
-        Ddl::fetch($cacheB, 'stream', 'events', self::$port, 'tok');
+        Ddl::fetchPatterns($cacheA, 'stream', 'events', self::$port, 'tok');
+        Ddl::fetchPatterns($cacheB, 'stream', 'events', self::$port, 'tok');
         $this->assertCount(2, self::_captured(), 'isolated caches must each trigger a fetch');
     }
 
@@ -186,8 +186,8 @@ PHP;
             'query_patterns' => ['insert' => 'INSERT orders'],
         ]);
         $cache = [];
-        Ddl::fetch($cache, 'stream', 'events', self::$port, 'tok');
-        Ddl::fetch($cache, 'stream', 'orders', self::$port, 'tok');
+        Ddl::fetchPatterns($cache, 'stream', 'events', self::$port, 'tok');
+        Ddl::fetchPatterns($cache, 'stream', 'orders', self::$port, 'tok');
         $this->assertCount(2, self::_captured(), 'different names must each trigger a fetch');
     }
 
@@ -200,7 +200,7 @@ PHP;
         $cache = [];
         $this->expectException(\RuntimeException::class);
         $this->expectExceptionMessageMatches('/schema version mismatch/');
-        Ddl::fetch($cache, 'stream', 'events', self::$port, 'tok');
+        Ddl::fetchPatterns($cache, 'stream', 'events', self::$port, 'tok');
     }
 
     public function testForbiddenRaisesTokenError(): void
@@ -209,7 +209,7 @@ PHP;
         $cache = [];
         $this->expectException(\RuntimeException::class);
         $this->expectExceptionMessageMatches('/dashboard token/');
-        Ddl::fetch($cache, 'stream', 'events', self::$port, 'tok');
+        Ddl::fetchPatterns($cache, 'stream', 'events', self::$port, 'tok');
     }
 
     public function testMissingTokenRaisesBeforeHttp(): void
@@ -217,7 +217,7 @@ PHP;
         $cache = [];
         $this->expectException(\RuntimeException::class);
         $this->expectExceptionMessageMatches('/No dashboard token/');
-        Ddl::fetch($cache, 'stream', 'events', 9999, null);
+        Ddl::fetchPatterns($cache, 'stream', 'events', 9999, null);
     }
 
     public function testMissingPortRaises(): void
@@ -225,7 +225,7 @@ PHP;
         $cache = [];
         $this->expectException(\RuntimeException::class);
         $this->expectExceptionMessageMatches('/No dashboard port/');
-        Ddl::fetch($cache, 'stream', 'events', 0, 'tok');
+        Ddl::fetchPatterns($cache, 'stream', 'events', 0, 'tok');
     }
 
     public function testUnreachableRaisesActionable(): void
@@ -234,7 +234,7 @@ PHP;
         $this->expectException(\RuntimeException::class);
         $this->expectExceptionMessageMatches('/dashboard not reachable/');
         // Port 1 guaranteed unreachable
-        Ddl::fetch($cache, 'stream', 'events', 1, 'tok');
+        Ddl::fetchPatterns($cache, 'stream', 'events', 1, 'tok');
     }
 
     public function testInvalidateDropsCache(): void
@@ -248,9 +248,9 @@ PHP;
             'query_patterns' => ['insert' => 'X'],
         ]);
         $cache = [];
-        Ddl::fetch($cache, 'stream', 'events', self::$port, 'tok');
+        Ddl::fetchPatterns($cache, 'stream', 'events', self::$port, 'tok');
         Ddl::invalidate($cache);
-        Ddl::fetch($cache, 'stream', 'events', self::$port, 'tok');
+        Ddl::fetchPatterns($cache, 'stream', 'events', self::$port, 'tok');
         $this->assertCount(2, self::_captured());
     }
 

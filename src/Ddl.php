@@ -64,7 +64,7 @@ final class Ddl
      *                                            caller supplies the per-instance cache.
      * @return array{tables: array<string, string>, query_patterns: array<string, string>}
      */
-    public static function fetch(
+    public static function fetchPatterns(
         array &$cache,
         string $family,
         string $name,

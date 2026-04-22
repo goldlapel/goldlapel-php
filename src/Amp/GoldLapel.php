@@ -1088,7 +1088,7 @@ class GoldLapel
     private function streamPatterns(string $stream): array
     {
         $token = $this->dashboardToken ?? \GoldLapel\Ddl::tokenFromEnvOrFile();
-        return \GoldLapel\Ddl::fetch($this->ddlCache, 'stream', $stream, $this->dashboardPort, $token);
+        return \GoldLapel\Ddl::fetchPatterns($this->ddlCache, 'stream', $stream, $this->dashboardPort, $token);
     }
 
     public function streamAdd(string $stream, array $payload, ?PostgresExecutor $conn = null): Future

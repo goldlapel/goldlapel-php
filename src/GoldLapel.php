@@ -1151,7 +1151,7 @@ class GoldLapel
     private function streamPatterns(string $stream): array
     {
         $token = $this->dashboardToken ?? Ddl::tokenFromEnvOrFile();
-        return Ddl::fetch($this->ddlCache, 'stream', $stream, $this->dashboardPort, $token);
+        return Ddl::fetchPatterns($this->ddlCache, 'stream', $stream, $this->dashboardPort, $token);
     }
 
     public function streamAdd(string $stream, array $payload, ?\PDO $conn = null): int
