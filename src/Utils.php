@@ -4,10 +4,14 @@ namespace GoldLapel;
 
 class Utils
 {
-    /** @internal Shared with GoldLapel\Amp\Utils. */
+    /** @internal Shared with GoldLapel\Amp\Utils.
+     *
+     * Bound to 63 chars (Postgres NAMEDATALEN-1) so identifiers match the
+     * proxy's server-side regex exactly: `^[A-Za-z_][A-Za-z0-9_]{0,62}$`.
+     */
     public static function validateIdentifier(string $name): string
     {
-        if ($name === '' || !preg_match('/^[a-zA-Z_][a-zA-Z0-9_]*$/', $name)) {
+        if ($name === '' || !preg_match('/^[a-zA-Z_][a-zA-Z0-9_]{0,62}$/', $name)) {
             throw new \InvalidArgumentException("Invalid identifier: {$name}");
         }
         return $name;
