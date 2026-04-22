@@ -682,23 +682,25 @@ class FactoryApiTest extends TestCase
             }
             $this->assertNotNull($pid, 'Fake subprocess should have written its PID.');
 
-            // Instance should still be tracked in $liveInstances even
-            // though the user never received a reference — the fix
-            // registers during startProxyWithoutConnect(), before PDO.
+            // $liveInstances must be drained at exception-propagation time.
+            // The stronger invariant (added in the subprocess-cleanup fix
+            // matching Python/Ruby semantics): start()'s catch block calls
+            // stop() immediately, which drops the instance from the
+            // registry — we do NOT rely on cleanupAll() at shutdown.
             $ref = new \ReflectionProperty(GoldLapel::class, 'liveInstances');
             $ref->setAccessible(true);
             $live = $ref->getValue();
             $this->assertCount(
-                1,
+                0,
                 $live,
-                'Subprocess must remain tracked after partial-init failure so cleanupAll can find it.'
+                'Subprocess registry must be drained when start() throws — cleanup is immediate, not deferred.'
             );
 
-            // cleanupAll() must terminate the subprocess.
-            GoldLapel::cleanupAll();
-
-            // Allow the OS a moment to reap the process.
-            $deadline = hrtime(true) + (int) (3 * 1e9);
+            // The subprocess must already be dead. Poll for a short grace
+            // window (SIGTERM → wait → SIGKILL is not instantaneous), but
+            // we do NOT call cleanupAll() ourselves — the wrapper's own
+            // start()-catch path must have killed it already.
+            $deadline = hrtime(true) + (int) (5 * 1e9);
             $alive = true;
             while (hrtime(true) < $deadline) {
                 // posix_kill with signal 0 checks existence without sending.
@@ -712,7 +714,11 @@ class FactoryApiTest extends TestCase
                 }
                 usleep(50000);
             }
-            $this->assertFalse($alive, "Subprocess PID {$pid} should have been terminated by cleanupAll().");
+            $this->assertFalse(
+                $alive,
+                "Subprocess PID {$pid} should have been terminated by start()'s catch block "
+                . '— not left for the shutdown hook.'
+            );
         } finally {
             GoldLapel::cleanupAll();
             if ($origBinary === false) {
@@ -725,28 +731,25 @@ class FactoryApiTest extends TestCase
 
     public function testProcGetStatusConfirmsNoOrphanAfterPartialInitFailure(): void
     {
-        // Complementary regression for the same CRITICAL bug #3 — resource
-        // precedence where start()'s PDO-construction path fails after the
-        // subprocess is already spawned. Unlike
-        // testSpawnSuccessButPdoFailsStillCleansUpSubprocess, this one:
+        // Complementary regression for the partial-init resource-cleanup
+        // path, using proc_get_status() (via isRunning()) rather than
+        // posix_kill to assert the subprocess is fully dead — this
+        // exercises the zombie-detection cross-checks in isRunning()
+        // (exitcode cache + posix_kill($pid, 0)) added in commit 07ba012.
         //
-        //   1. Grabs the live GoldLapel instance directly out of
-        //      $liveInstances (the user never saw it — start() threw
-        //      before returning) and asserts isRunning() is true, i.e.
-        //      the fix really does register the instance before PDO.
-        //   2. Uses proc_get_status() via isRunning() to confirm the
-        //      process has actually been terminated after cleanupAll(),
-        //      not just absent from the pid table — this catches the
-        //      zombie case where the PID is reaped but the resource
-        //      handle leaks.
-        //   3. Asserts $liveInstances is emptied post-cleanup, proving
-        //      there's no lingering reference that would prevent the
-        //      next start() from reusing the same tracker slot.
+        // Invariant (strengthened to match Python/Ruby semantics): when
+        // start()'s PDO step throws, start()'s catch block calls stop()
+        // immediately — the subprocess is terminated BEFORE the exception
+        // propagates to the caller. We do NOT rely on cleanupAll() at
+        // shutdown. This is the stronger contract; the old weaker one
+        // ("deferred cleanup via shutdown hook") left orphan subprocesses
+        // in long-running PHP workers (Octane/Swoole/RoadRunner).
         //
-        // If the fix ever regresses — if someone moves
-        // registerForCleanup() back after the PDO construction — this
-        // test fails on the "instance should be tracked" assertion
-        // below because $liveInstances stays empty when start() throws.
+        // start() threw before returning, so we can't call isRunning() on
+        // the instance directly. Instead we check two OS-level observables:
+        // $liveInstances is empty (no registry leak) and the proxy port
+        // rebinds cleanly (the old subprocess has released it). Together
+        // these match the guarantee that the process is gone.
         if (!extension_loaded('pdo_pgsql')) {
             $this->markTestSkipped('pdo_pgsql not loaded');
         }
@@ -772,6 +775,9 @@ class FactoryApiTest extends TestCase
         try {
             putenv("GOLDLAPEL_BINARY={$fake}");
 
+            $ref = new \ReflectionProperty(GoldLapel::class, 'liveInstances');
+            $ref->setAccessible(true);
+
             $threw = false;
             try {
                 GoldLapel::start(
@@ -784,37 +790,40 @@ class FactoryApiTest extends TestCase
 
             $this->assertTrue($threw, 'start() must throw when PDO construction fails against a fake listener.');
 
-            // Pull the orphaned instance out of $liveInstances — the user
-            // has no reference to it since start() threw before returning,
-            // but the fix registers it during startProxyWithoutConnect().
-            $ref = new \ReflectionProperty(GoldLapel::class, 'liveInstances');
-            $ref->setAccessible(true);
+            // $liveInstances must be drained at exception-propagation time.
             /** @var array<int, GoldLapel> $live */
             $live = $ref->getValue();
-            $this->assertCount(1, $live, 'Instance must be tracked despite PDO failure.');
+            $this->assertCount(
+                0,
+                $live,
+                'start() must drain $liveInstances in its catch block — no deferred-cleanup orphans.'
+            );
 
-            /** @var GoldLapel $orphan */
-            $orphan = array_values($live)[0];
-
-            // proc_get_status (via isRunning()) must confirm the subprocess
-            // is actually running — this is the invariant the fix preserves.
+            // proc_get_status cross-check: the TCP port must be free
+            // immediately after start() throws. If the subprocess were
+            // still alive it would still hold the port. This complements
+            // the posix_kill check in SubprocessCleanupTest by validating
+            // the OS-level observable (bind availability).
+            $deadline = hrtime(true) + (int) (5 * 1e9);
+            $portFree = false;
+            while (hrtime(true) < $deadline) {
+                $probe = @stream_socket_server(
+                    "tcp://127.0.0.1:{$port}",
+                    $errno,
+                    $errstr,
+                );
+                if ($probe !== false) {
+                    fclose($probe);
+                    $portFree = true;
+                    break;
+                }
+                usleep(50000);
+            }
             $this->assertTrue(
-                $orphan->isRunning(),
-                'Subprocess must still be alive after PDO failure so cleanupAll has something to kill.'
+                $portFree,
+                "Proxy port {$port} must be free immediately after start() throws "
+                . '— subprocess should have been terminated before exception propagation.'
             );
-
-            // cleanupAll terminates the subprocess. isRunning() must then
-            // flip to false — which exercises both proc_get_status and the
-            // zombie-detection cross-checks added in commit 07ba012.
-            GoldLapel::cleanupAll();
-
-            $this->assertFalse(
-                $orphan->isRunning(),
-                'isRunning() (proc_get_status) must report the subprocess stopped after cleanupAll.'
-            );
-
-            $live = $ref->getValue();
-            $this->assertCount(0, $live, 'cleanupAll must drain $liveInstances.');
         } finally {
             GoldLapel::cleanupAll();
             if ($origBinary === false) {

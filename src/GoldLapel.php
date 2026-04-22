@@ -139,9 +139,26 @@ class GoldLapel
         $instance = new self($upstream, $port, $config, $extraArgs, $silent);
         // startProxyWithoutConnect() (invoked via startProxy) registers the
         // instance with cleanupAll as soon as the subprocess spawns, before
-        // the PDO is opened — so a PDO failure here still leaves the
-        // subprocess cleanable via __destruct or the shutdown hook.
-        $instance->startProxy();
+        // the PDO is opened. If the subsequent PDO construction fails we
+        // tear the subprocess down *immediately* here rather than leaving
+        // it for the shutdown hook — matching the sync Python and Ruby
+        // wrappers. A long-running PHP process (Octane, Swoole, RoadRunner,
+        // a CLI daemon) that repeatedly calls start() against a bad
+        // upstream would otherwise accumulate orphan goldlapel children
+        // until the PHP process itself exited. The $liveInstances registry
+        // keeps a reference to $instance, so PHP's deterministic destructor
+        // does NOT fire when start() throws — explicit cleanup here is the
+        // only path that runs at throw-time.
+        try {
+            $instance->startProxy();
+        } catch (\Throwable $e) {
+            try {
+                $instance->stop();
+            } catch (\Throwable $cleanupErr) {
+                // Don't mask the original failure with a teardown error.
+            }
+            throw $e;
+        }
 
         return $instance;
     }
