@@ -17,7 +17,7 @@ class GoldLapelServiceProvider extends ServiceProvider
      * matching `GoldLapelConnection` needs when it wraps its PDO with the L1
      * cache.
      *
-     * @var array<string, array{port:int, invalidation_port:?int, instance:GoldLapel}>
+     * @var array<string, array{proxy_port:int, invalidation_port:?int, instance:GoldLapel}>
      */
     private array $glConnections = [];
 
@@ -36,27 +36,35 @@ class GoldLapelServiceProvider extends ServiceProvider
                 continue;
             }
 
-            $port = $glConfig['port'] ?? GoldLapel::DEFAULT_PORT;
+            // YAML / config.php key follows the canonical snake_case name.
+            $proxyPort = $glConfig['proxy_port'] ?? GoldLapel::DEFAULT_PROXY_PORT;
             $glOptions = $glConfig['config'] ?? [];
             $extraArgs = $glConfig['extra_args'] ?? [];
             $invalidationPort = $glConfig['invalidation_port'] ?? null;
             $logLevel = $glConfig['log_level'] ?? null;
+            $mode = $glConfig['mode'] ?? null;
 
             try {
                 $upstream = buildUpstreamUrl($config);
-                putenv('GOLDLAPEL_CLIENT=laravel');
                 // Use the connection-less factory variant — Laravel manages
                 // its own PDOs via the Connection resolver below. We hold
                 // onto the returned instance so the terminating callback
                 // below can stop each subprocess deterministically at
                 // worker shutdown (Octane/Swoole/RoadRunner).
                 $startOptions = [
-                    'port' => $port,
+                    'proxy_port' => $proxyPort,
+                    'client' => 'laravel',
                     'config' => $glOptions,
                     'extra_args' => $extraArgs,
                 ];
+                if ($invalidationPort !== null) {
+                    $startOptions['invalidation_port'] = $invalidationPort;
+                }
                 if ($logLevel !== null) {
                     $startOptions['log_level'] = $logLevel;
+                }
+                if ($mode !== null) {
+                    $startOptions['mode'] = $mode;
                 }
                 $instance = GoldLapel::startProxyOnly($upstream, $startOptions);
             } catch (\Exception $e) {
@@ -65,14 +73,14 @@ class GoldLapelServiceProvider extends ServiceProvider
             }
 
             $this->glConnections[$name] = [
-                'port' => $port,
+                'proxy_port' => $proxyPort,
                 'invalidation_port' => $invalidationPort,
                 'instance' => $instance,
             ];
 
             config([
                 "database.connections.{$name}.host" => '127.0.0.1',
-                "database.connections.{$name}.port" => $port,
+                "database.connections.{$name}.port" => $proxyPort,
                 "database.connections.{$name}.url" => null,
                 "database.connections.{$name}.sslmode" => 'prefer',
             ]);

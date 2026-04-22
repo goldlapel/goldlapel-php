@@ -74,7 +74,7 @@ class StartCleanupGuardTest extends TestCase
                 // exception is swallowed.
                 AmpGoldLapelTerminateThrows::start(
                     'postgresql://user:pass@localhost:5432/testdb',
-                    ['port' => $port, 'dashboard_port' => 0, 'silent' => true]
+                    ['proxy_port' => $port, 'dashboard_port' => 0, 'silent' => true]
                 )->await();
                 $this->fail('start()->await() should have thrown.');
             } catch (\Throwable $e) {
@@ -182,7 +182,7 @@ class StartCleanupGuardTest extends TestCase
             try {
                 GoldLapel::start(
                     'postgresql://user:pass@localhost:5432/testdb',
-                    ['port' => $port, 'dashboard_port' => 0, 'silent' => false]
+                    ['proxy_port' => $port, 'dashboard_port' => 0, 'silent' => false]
                 )->await();
                 $this->fail('start()->await() should have thrown from banner write.');
             } catch (\Throwable $e) {

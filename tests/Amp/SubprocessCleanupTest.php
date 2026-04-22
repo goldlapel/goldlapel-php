@@ -70,7 +70,7 @@ class SubprocessCleanupTest extends TestCase
             try {
                 GoldLapel::start(
                     'postgresql://user:pass@localhost:5432/testdb',
-                    ['port' => $port, 'dashboard_port' => 0, 'silent' => true]
+                    ['proxy_port' => $port, 'dashboard_port' => 0, 'silent' => true]
                 )->await();
                 $this->fail('start()->await() should have thrown — fake listener rejects Postgres handshake.');
             } catch (\Throwable $e) {

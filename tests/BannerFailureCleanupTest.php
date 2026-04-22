@@ -70,7 +70,7 @@ class BannerFailureCleanupTest extends TestCase
             try {
                 GoldLapel::startProxyOnly(
                     'postgresql://user:pass@localhost:5432/testdb',
-                    ['port' => $port, 'dashboard_port' => 0, 'silent' => false]
+                    ['proxy_port' => $port, 'dashboard_port' => 0, 'silent' => false]
                 );
                 $this->fail('startProxyOnly() should have thrown from banner write.');
             } catch (\Throwable $e) {

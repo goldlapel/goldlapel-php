@@ -57,12 +57,12 @@ class GoldLapelServiceProviderTest extends TestCase
         $this->assertCount(1, GoldLapel::$calls);
         $call = GoldLapel::$calls[0];
         $this->assertSame('postgresql://admin:secret@db.example.com:5432/mydb', $call['upstream']);
-        $this->assertSame(GoldLapel::DEFAULT_PORT, $call['port']);
+        $this->assertSame(GoldLapel::DEFAULT_PROXY_PORT, $call['port']);
         $this->assertSame([], $call['config']);
         $this->assertSame([], $call['extraArgs']);
 
         $this->assertSame('127.0.0.1', config('database.connections.pgsql.host'));
-        $this->assertSame(GoldLapel::DEFAULT_PORT, config('database.connections.pgsql.port'));
+        $this->assertSame(GoldLapel::DEFAULT_PROXY_PORT, config('database.connections.pgsql.port'));
     }
 
     public function testSkipsNonPgsqlConnections(): void
@@ -103,7 +103,7 @@ class GoldLapelServiceProviderTest extends TestCase
                 'username' => 'u',
                 'password' => 'p',
                 'goldlapel' => [
-                    'port' => 9000,
+                    'proxy_port' => 9000,
                     'extra_args' => ['--threshold-duration-ms', '200'],
                 ],
             ],
@@ -130,7 +130,7 @@ class GoldLapelServiceProviderTest extends TestCase
                 'password' => 'p',
                 'goldlapel' => [
                     'config' => [
-                        'mode' => 'waiter',
+                        'pool_mode' => 'transaction',
                         'pool_size' => 30,
                     ],
                 ],
@@ -139,7 +139,7 @@ class GoldLapelServiceProviderTest extends TestCase
 
         $this->assertCount(1, GoldLapel::$calls);
         $call = GoldLapel::$calls[0];
-        $this->assertSame(['mode' => 'waiter', 'pool_size' => 30], $call['config']);
+        $this->assertSame(['pool_mode' => 'transaction', 'pool_size' => 30], $call['config']);
         $this->assertSame([], $call['extraArgs']);
     }
 
@@ -154,9 +154,9 @@ class GoldLapelServiceProviderTest extends TestCase
                 'username' => 'u',
                 'password' => 'p',
                 'goldlapel' => [
-                    'port' => 9000,
+                    'proxy_port' => 9000,
+                    'mode' => 'waiter',
                     'config' => [
-                        'mode' => 'waiter',
                         'disable_pool' => true,
                     ],
                     'extra_args' => ['--threshold-duration-ms', '200'],
@@ -167,7 +167,8 @@ class GoldLapelServiceProviderTest extends TestCase
         $this->assertCount(1, GoldLapel::$calls);
         $call = GoldLapel::$calls[0];
         $this->assertSame(9000, $call['port']);
-        $this->assertSame(['mode' => 'waiter', 'disable_pool' => true], $call['config']);
+        $this->assertSame('waiter', $call['mode']);
+        $this->assertSame(['disable_pool' => true], $call['config']);
         $this->assertSame(['--threshold-duration-ms', '200'], $call['extraArgs']);
 
         $this->assertSame(9000, config('database.connections.pgsql.port'));
@@ -234,9 +235,9 @@ class GoldLapelServiceProviderTest extends TestCase
                 'username' => 'u',
                 'password' => 'p',
                 'goldlapel' => [
-                    'port' => 9001,
+                    'proxy_port' => 9001,
                     'log_level' => 'trace',
-                    'config' => ['mode' => 'waiter'],
+                    'mode' => 'waiter',
                     'extra_args' => ['--flag'],
                 ],
             ],
@@ -246,7 +247,8 @@ class GoldLapelServiceProviderTest extends TestCase
         $call = GoldLapel::$calls[0];
         $this->assertSame(9001, $call['port']);
         $this->assertSame('trace', $call['logLevel']);
-        $this->assertSame(['mode' => 'waiter'], $call['config']);
+        $this->assertSame('waiter', $call['mode']);
+        $this->assertSame([], $call['config']);
         $this->assertSame(['--flag'], $call['extraArgs']);
     }
 
@@ -281,7 +283,7 @@ class GoldLapelServiceProviderTest extends TestCase
                 'database' => 'app',
                 'username' => 'u',
                 'password' => 'p',
-                'goldlapel' => ['port' => 7932],
+                'goldlapel' => ['proxy_port' => 7932],
             ],
             'analytics' => [
                 'driver' => 'pgsql',
@@ -290,7 +292,7 @@ class GoldLapelServiceProviderTest extends TestCase
                 'database' => 'analytics',
                 'username' => 'u',
                 'password' => 'p',
-                'goldlapel' => ['port' => 7933],
+                'goldlapel' => ['proxy_port' => 7933],
             ],
         ]);
 
@@ -317,7 +319,7 @@ class GoldLapelServiceProviderTest extends TestCase
 
         $this->assertCount(1, GoldLapel::$calls);
         $call = GoldLapel::$calls[0];
-        $this->assertSame(GoldLapel::DEFAULT_PORT, $call['port']);
+        $this->assertSame(GoldLapel::DEFAULT_PROXY_PORT, $call['port']);
         $this->assertSame([], $call['config']);
         $this->assertSame([], $call['extraArgs']);
     }
@@ -356,7 +358,7 @@ class GoldLapelServiceProviderTest extends TestCase
 
         $this->assertNull(config('database.connections.pgsql.url'));
         $this->assertSame('127.0.0.1', config('database.connections.pgsql.host'));
-        $this->assertSame(GoldLapel::DEFAULT_PORT, config('database.connections.pgsql.port'));
+        $this->assertSame(GoldLapel::DEFAULT_PROXY_PORT, config('database.connections.pgsql.port'));
     }
 
     public function testUrlKeyClearedEvenWhenNotPresent(): void
@@ -447,7 +449,7 @@ class GoldLapelServiceProviderTest extends TestCase
                 'database' => 'app',
                 'username' => 'u',
                 'password' => 'p',
-                'goldlapel' => ['port' => 7940],
+                'goldlapel' => ['proxy_port' => 7940],
             ],
             'analytics' => [
                 'driver' => 'pgsql',
@@ -456,7 +458,7 @@ class GoldLapelServiceProviderTest extends TestCase
                 'database' => 'analytics',
                 'username' => 'u',
                 'password' => 'p',
-                'goldlapel' => ['port' => 7941],
+                'goldlapel' => ['proxy_port' => 7941],
             ],
         ]);
 
@@ -524,7 +526,7 @@ class GoldLapelServiceProviderTest extends TestCase
                 'database' => 'app',
                 'username' => 'u',
                 'password' => 'p',
-                'goldlapel' => ['port' => 7942],
+                'goldlapel' => ['proxy_port' => 7942],
             ],
             'analytics' => [
                 'driver' => 'pgsql',
@@ -533,7 +535,7 @@ class GoldLapelServiceProviderTest extends TestCase
                 'database' => 'analytics',
                 'username' => 'u',
                 'password' => 'p',
-                'goldlapel' => ['port' => 7943],
+                'goldlapel' => ['proxy_port' => 7943],
             ],
         ]);
 

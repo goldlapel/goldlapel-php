@@ -126,10 +126,10 @@ class IntegrationTest extends TestCase
     public function testFactoryStartsProxyAndConnects(): void
     {
         $port = $this->uniqPort();
-        $gl = GoldLapel::start(self::$upstream, ['port' => $port, 'silent' => true])->await();
+        $gl = GoldLapel::start(self::$upstream, ['proxy_port' => $port, 'silent' => true])->await();
 
         try {
-            $this->assertSame($port, $gl->getPort());
+            $this->assertSame($port, $gl->getProxyPort());
             $this->assertNotNull($gl->url());
             $this->assertStringContainsString("localhost:{$port}", $gl->url());
             $this->assertTrue($gl->isRunning());
@@ -149,7 +149,7 @@ class IntegrationTest extends TestCase
     public function testDocInsertFindAndUpdate(): void
     {
         $port = $this->uniqPort();
-        $gl = GoldLapel::start(self::$upstream, ['port' => $port, 'silent' => true])->await();
+        $gl = GoldLapel::start(self::$upstream, ['proxy_port' => $port, 'silent' => true])->await();
         $coll = $this->uniqColl();
         try {
             $inserted = $gl->docInsert($coll, ['name' => 'alice', 'age' => 30])->await();
@@ -178,7 +178,7 @@ class IntegrationTest extends TestCase
         // Exercises the `data ? ?` → jsonb_exists rewrite against a real
         // Postgres — verifies the translator doesn't corrupt semantics.
         $port = $this->uniqPort();
-        $gl = GoldLapel::start(self::$upstream, ['port' => $port, 'silent' => true])->await();
+        $gl = GoldLapel::start(self::$upstream, ['proxy_port' => $port, 'silent' => true])->await();
         $coll = $this->uniqColl();
         try {
             $gl->docInsert($coll, ['email' => 'a@b.com', 'name' => 'alice'])->await();
@@ -198,7 +198,7 @@ class IntegrationTest extends TestCase
     public function testCounterIncr(): void
     {
         $port = $this->uniqPort();
-        $gl = GoldLapel::start(self::$upstream, ['port' => $port, 'silent' => true])->await();
+        $gl = GoldLapel::start(self::$upstream, ['proxy_port' => $port, 'silent' => true])->await();
         $table = 'amp_counters_' . bin2hex(random_bytes(4));
         try {
             $v1 = $gl->incr($table, 'orders')->await();
@@ -216,7 +216,7 @@ class IntegrationTest extends TestCase
     {
         // Exercises the jsonb `?` operator in hdel + hget round-trip.
         $port = $this->uniqPort();
-        $gl = GoldLapel::start(self::$upstream, ['port' => $port, 'silent' => true])->await();
+        $gl = GoldLapel::start(self::$upstream, ['proxy_port' => $port, 'silent' => true])->await();
         $table = 'amp_hash_' . bin2hex(random_bytes(4));
         try {
             $gl->hset($table, 'user:1', 'name', 'alice')->await();
@@ -243,7 +243,7 @@ class IntegrationTest extends TestCase
     public function testUsingTransactionScope(): void
     {
         $port = $this->uniqPort();
-        $gl = GoldLapel::start(self::$upstream, ['port' => $port, 'silent' => true])->await();
+        $gl = GoldLapel::start(self::$upstream, ['proxy_port' => $port, 'silent' => true])->await();
         $coll = $this->uniqColl();
         $cnt = 'amp_c_' . bin2hex(random_bytes(4));
         try {
@@ -268,7 +268,7 @@ class IntegrationTest extends TestCase
     public function testDocFindCursorStreamsInBatches(): void
     {
         $port = $this->uniqPort();
-        $gl = GoldLapel::start(self::$upstream, ['port' => $port, 'silent' => true])->await();
+        $gl = GoldLapel::start(self::$upstream, ['proxy_port' => $port, 'silent' => true])->await();
         $coll = $this->uniqColl();
         try {
             // Insert enough to span multiple batches
@@ -293,7 +293,7 @@ class IntegrationTest extends TestCase
     public function testPubSubRoundTrip(): void
     {
         $port = $this->uniqPort();
-        $gl = GoldLapel::start(self::$upstream, ['port' => $port, 'silent' => true])->await();
+        $gl = GoldLapel::start(self::$upstream, ['proxy_port' => $port, 'silent' => true])->await();
         $channel = $this->uniqCh();
         try {
             // Open a second connection for LISTEN to avoid self-listening
@@ -330,7 +330,7 @@ class IntegrationTest extends TestCase
     public function testStreamReadWriteAck(): void
     {
         $port = $this->uniqPort();
-        $gl = GoldLapel::start(self::$upstream, ['port' => $port, 'silent' => true])->await();
+        $gl = GoldLapel::start(self::$upstream, ['proxy_port' => $port, 'silent' => true])->await();
         $stream = 'amp_str_' . bin2hex(random_bytes(4));
         try {
             $gl->streamCreateGroup($stream, 'workers')->await();
@@ -356,7 +356,7 @@ class IntegrationTest extends TestCase
     public function testSubprocessTerminatesOnStop(): void
     {
         $port = $this->uniqPort();
-        $gl = GoldLapel::start(self::$upstream, ['port' => $port, 'silent' => true])->await();
+        $gl = GoldLapel::start(self::$upstream, ['proxy_port' => $port, 'silent' => true])->await();
         $this->assertTrue($gl->isRunning());
 
         // Port should be occupied by the proxy
@@ -386,7 +386,7 @@ class IntegrationTest extends TestCase
     public function testSubscribeDeliversNotifications(): void
     {
         $port = $this->uniqPort();
-        $gl = GoldLapel::start(self::$upstream, ['port' => $port, 'silent' => true])->await();
+        $gl = GoldLapel::start(self::$upstream, ['proxy_port' => $port, 'silent' => true])->await();
         $channel = $this->uniqCh();
         try {
             // Second connection to LISTEN concurrently while primary publishes
@@ -421,7 +421,7 @@ class IntegrationTest extends TestCase
     public function testSearchRoundTrip(): void
     {
         $port = $this->uniqPort();
-        $gl = GoldLapel::start(self::$upstream, ['port' => $port, 'silent' => true])->await();
+        $gl = GoldLapel::start(self::$upstream, ['proxy_port' => $port, 'silent' => true])->await();
         $table = 'amp_search_' . bin2hex(random_bytes(4));
         try {
             $conn = $gl->connection();
@@ -446,7 +446,7 @@ class IntegrationTest extends TestCase
         // cancellation" recovery path (since our stop() is the async
         // termination primitive).
         $port = $this->uniqPort();
-        $gl = GoldLapel::start(self::$upstream, ['port' => $port, 'silent' => true])->await();
+        $gl = GoldLapel::start(self::$upstream, ['proxy_port' => $port, 'silent' => true])->await();
         $this->assertTrue($gl->isRunning());
 
         $ref = new ReflectionClass(GoldLapel::class);
@@ -475,7 +475,7 @@ class IntegrationTest extends TestCase
     public function testCachedConnectionHitsL1OnRepeatRead(): void
     {
         $port = $this->uniqPort();
-        $gl = GoldLapel::start(self::$upstream, ['port' => $port, 'silent' => true])->await();
+        $gl = GoldLapel::start(self::$upstream, ['proxy_port' => $port, 'silent' => true])->await();
         $table = 'amp_cache_' . bin2hex(random_bytes(4));
         try {
             $conn = $gl->connection();
@@ -523,7 +523,7 @@ class IntegrationTest extends TestCase
     public function testStartProxyOnlyAllowsDeferredConnect(): void
     {
         $port = $this->uniqPort();
-        $gl = GoldLapel::startProxyOnly(self::$upstream, ['port' => $port, 'silent' => true])->await();
+        $gl = GoldLapel::startProxyOnly(self::$upstream, ['proxy_port' => $port, 'silent' => true])->await();
         try {
             $this->assertNotNull($gl->url());
             $this->assertTrue($gl->isRunning());

@@ -22,8 +22,11 @@ class GoldLapelConnection extends PostgresConnection
         if ($this->cachedPdo === null) {
             $pdo = $this->getPdo();
             // Default to proxy_port + 2 when not explicitly configured.
+            // Laravel connection config carries the port under `port`
+            // (Laravel idiom). The Gold Lapel service provider set that key
+            // to the proxy port during boot().
             $port = $this->invalidationPort
-                ?? (((int) ($this->getConfig('port') ?? GoldLapel::DEFAULT_PORT)) + 2);
+                ?? (((int) ($this->getConfig('port') ?? GoldLapel::DEFAULT_PROXY_PORT)) + 2);
             $this->cachedPdo = GoldLapel::wrapPDOStatic($pdo, $port);
         }
 

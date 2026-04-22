@@ -52,12 +52,20 @@ use function Amp\async;
  */
 class GoldLapel
 {
-    const DEFAULT_PORT = SyncGoldLapel::DEFAULT_PORT;
+    const DEFAULT_PROXY_PORT = SyncGoldLapel::DEFAULT_PROXY_PORT;
     const STARTUP_TIMEOUT = SyncGoldLapel::STARTUP_TIMEOUT;
 
     private string $upstream;
-    private int $port;
+    private int $proxyPort;
     private int $dashboardPort;
+    private bool $dashboardPortExplicit;
+    private int $invalidationPort;
+    private bool $invalidationPortExplicit;
+    private ?string $logLevel;
+    private ?string $mode;
+    private ?string $license;
+    private ?string $client;
+    private ?string $configFile;
     private bool $silent;
     private array $config;
     private array $extraArgs;
@@ -95,21 +103,34 @@ class GoldLapel
      */
     private static $bannerStream = null;
 
-    public function __construct(
-        string $upstream,
-        ?int $port = null,
-        array $config = [],
-        array $extraArgs = [],
-        bool $silent = false,
-    ) {
+    public function __construct(string $upstream, array $options = [])
+    {
         $this->upstream = $upstream;
-        $this->port = $port ?? self::DEFAULT_PORT;
-        $this->dashboardPort = array_key_exists('dashboard_port', $config)
-            ? (int) $config['dashboard_port']
-            : $this->port + 1;
-        $this->silent = $silent;
-        $this->config = $config;
-        $this->extraArgs = $extraArgs;
+        $this->proxyPort = isset($options['proxy_port']) ? (int) $options['proxy_port'] : self::DEFAULT_PROXY_PORT;
+
+        // Dashboard / invalidation ports default to proxyPort + 1 / + 2 when
+        // unset. An explicit value (including 0 for "disable dashboard")
+        // overrides the derivation.
+        $this->dashboardPortExplicit = array_key_exists('dashboard_port', $options);
+        $this->dashboardPort = $this->dashboardPortExplicit
+            ? (int) $options['dashboard_port']
+            : $this->proxyPort + 1;
+        $this->invalidationPortExplicit = array_key_exists('invalidation_port', $options);
+        $this->invalidationPort = $this->invalidationPortExplicit
+            ? (int) $options['invalidation_port']
+            : $this->proxyPort + 2;
+
+        $this->logLevel = isset($options['log_level']) ? (string) $options['log_level'] : null;
+        $this->mode = isset($options['mode']) ? (string) $options['mode'] : null;
+        $this->license = isset($options['license']) ? (string) $options['license'] : null;
+        $this->client = isset($options['client']) ? (string) $options['client'] : null;
+        $this->configFile = isset($options['config_file']) ? (string) $options['config_file'] : null;
+
+        $this->config = $options['config'] ?? [];
+        $this->extraArgs = $options['extra_args'] ?? [];
+        $this->silent = !empty($options['silent']);
+        // Leave structured-config validation to SyncGoldLapel::configToArgs()
+        // at spawn time — same contract as the sync wrapper pre-rollout.
         $this->scopedConn = new FiberLocal(static fn () => null);
     }
 
@@ -159,42 +180,12 @@ class GoldLapel
 
     private static function startProxyInstance(string $upstream, array $options): self
     {
-        // Reuse sync option parser via reflection trick: rebuild the same
-        // args. parseStartOptions is private on sync class, so we
-        // re-derive here (short enough to duplicate vs. opening sync's
-        // API further).
-        //
         // `new static(...)` (not `new self(...)`) so test subclasses can
         // override instance methods like terminate() to simulate rare
         // cleanup-throws scenarios from the catch block in start().
-        [$port, $config, $extraArgs, $silent] = self::parseStartOptions($options);
-        $instance = new static($upstream, $port, $config, $extraArgs, $silent);
+        $instance = new static($upstream, $options);
         $instance->startSubprocess();
         return $instance;
-    }
-
-    private static function parseStartOptions(array $options): array
-    {
-        $port = isset($options['port']) ? (int) $options['port'] : null;
-        $silent = !empty($options['silent']);
-        $config = $options['config'] ?? [];
-        $extraArgs = $options['extra_args'] ?? [];
-
-        $reserved = ['port', 'log_level', 'config', 'extra_args', 'silent'];
-        foreach ($options as $key => $value) {
-            if (in_array($key, $reserved, true)) {
-                continue;
-            }
-            $config[$key] = $value;
-        }
-
-        if (array_key_exists('log_level', $options) && $options['log_level'] !== null) {
-            $flag = self::translateLogLevel($options['log_level']);
-            if ($flag !== null) {
-                $extraArgs[] = $flag;
-            }
-        }
-        return [$port, $config, $extraArgs, $silent];
     }
 
     private static function translateLogLevel($level): ?string
@@ -225,11 +216,41 @@ class GoldLapel
             return $this->url;
         }
         $binary = SyncGoldLapel::findBinary();
-        $cmd = array_merge(
-            [$binary, '--upstream', $this->upstream, '--proxy-port', (string) $this->port],
-            SyncGoldLapel::configToArgs($this->config),
-            $this->extraArgs,
-        );
+        $cmd = [$binary, '--upstream', $this->upstream, '--proxy-port', (string) $this->proxyPort];
+
+        // Top-level options (promoted out of the config map) emit their own
+        // CLI flags before the tuning-knob config map.
+        if ($this->dashboardPortExplicit) {
+            $cmd[] = '--dashboard-port';
+            $cmd[] = (string) $this->dashboardPort;
+        }
+        if ($this->invalidationPortExplicit) {
+            $cmd[] = '--invalidation-port';
+            $cmd[] = (string) $this->invalidationPort;
+        }
+        if ($this->logLevel !== null) {
+            $verboseFlag = self::translateLogLevel($this->logLevel);
+            if ($verboseFlag !== null) {
+                $cmd[] = $verboseFlag;
+            }
+        }
+        if ($this->mode !== null) {
+            $cmd[] = '--mode';
+            $cmd[] = $this->mode;
+        }
+        if ($this->license !== null) {
+            $cmd[] = '--license';
+            $cmd[] = $this->license;
+        }
+        if ($this->client !== null) {
+            $cmd[] = '--client';
+            $cmd[] = $this->client;
+        }
+        if ($this->configFile !== null) {
+            $cmd[] = '--config';
+            $cmd[] = $this->configFile;
+        }
+        $cmd = array_merge($cmd, SyncGoldLapel::configToArgs($this->config), $this->extraArgs);
 
         $nullDevice = PHP_OS_FAMILY === 'Windows' ? 'NUL' : '/dev/null';
         $descriptors = [
@@ -238,7 +259,7 @@ class GoldLapel
             2 => ['pipe', 'w'],
         ];
         $env = getenv();
-        if (!isset($env['GOLDLAPEL_CLIENT'])) {
+        if ($this->client === null && !isset($env['GOLDLAPEL_CLIENT'])) {
             $env['GOLDLAPEL_CLIENT'] = 'php-amp';
         }
         // Session-scoped dashboard token for /api/ddl/* calls.
@@ -271,9 +292,9 @@ class GoldLapel
             if (!$status['running']) {
                 break;
             }
-            if (SyncGoldLapel::waitForPort('127.0.0.1', $this->port, 0.5)) {
+            if (SyncGoldLapel::waitForPort('127.0.0.1', $this->proxyPort, 0.5)) {
                 fclose($stderr);
-                $this->url = SyncGoldLapel::makeProxyUrl($this->upstream, $this->port);
+                $this->url = SyncGoldLapel::makeProxyUrl($this->upstream, $this->proxyPort);
                 // Print the banner BEFORE registering for cleanup: an fwrite()
                 // failure on stderr must not leak an orphan entry in
                 // $liveInstances. Registration is the last side-effect so
@@ -292,7 +313,7 @@ class GoldLapel
         fclose($stderr);
         $this->terminate();
         throw new RuntimeException(
-            "Gold Lapel failed to start on port {$this->port} within " . self::STARTUP_TIMEOUT . "s.\nstderr: {$stderrOutput}"
+            "Gold Lapel failed to start on port {$this->proxyPort} within " . self::STARTUP_TIMEOUT . "s.\nstderr: {$stderrOutput}"
         );
     }
 
@@ -302,8 +323,8 @@ class GoldLapel
             return;
         }
         $message = $this->dashboardPort > 0
-            ? "goldlapel → :{$this->port} (proxy) | http://127.0.0.1:{$this->dashboardPort} (dashboard)\n"
-            : "goldlapel → :{$this->port} (proxy)\n";
+            ? "goldlapel → :{$this->proxyPort} (proxy) | http://127.0.0.1:{$this->dashboardPort} (dashboard)\n"
+            : "goldlapel → :{$this->proxyPort} (proxy)\n";
         $stream = self::$bannerStream ?? (defined('STDERR') ? STDERR : null);
         if (is_resource($stream)) {
             fwrite($stream, $message);
@@ -460,14 +481,19 @@ class GoldLapel
         return $this->url;
     }
 
-    public function getPort(): int
+    public function getProxyPort(): int
     {
-        return $this->port;
+        return $this->proxyPort;
     }
 
     public function getDashboardPort(): int
     {
         return $this->dashboardPort;
+    }
+
+    public function getInvalidationPort(): int
+    {
+        return $this->invalidationPort;
     }
 
     public function getDashboardUrl(): ?string
@@ -508,9 +534,9 @@ class GoldLapel
         ?int $invalidationPort = null,
     ): CachedConnection {
         if ($invalidationPort === null) {
-            $invalidationPort = isset($this->config['invalidation_port'])
-                ? (int) $this->config['invalidation_port']
-                : $this->port + 2;
+            // Top-level invalidation_port option takes precedence; otherwise
+            // fall back to proxy_port + 2 (matches the Rust binary default).
+            $invalidationPort = $this->invalidationPort;
         }
         $cache = \GoldLapel\NativeCache::getInstance();
         if (!$cache->isConnected()) {

@@ -52,7 +52,7 @@ class StreamsIntegrationTest extends TestCase
         // disabling them was fixed in goldlapel d77fe37 / 945d674 and has
         // regression coverage in tests/phase32_for_update_cache.rs.
         $gl = GoldLapel::start(self::$pgUrl, [
-            'port' => $port,
+            'proxy_port' => $port,
             'silent' => true,
         ]);
         try {
@@ -83,7 +83,7 @@ class StreamsIntegrationTest extends TestCase
         $name = 'gl_php_int_meta_' . (int) (microtime(true) * 1000);
         // Proxy cache features left on — see testStreamAddCreatesPrefixedTable.
         $gl = GoldLapel::start(self::$pgUrl, [
-            'port' => $port,
+            'proxy_port' => $port,
             'silent' => true,
         ]);
         try {
@@ -109,7 +109,7 @@ class StreamsIntegrationTest extends TestCase
         $name = 'gl_php_int_rt_' . (int) (microtime(true) * 1000);
         // Proxy cache features left on — see testStreamAddCreatesPrefixedTable.
         $gl = GoldLapel::start(self::$pgUrl, [
-            'port' => $port,
+            'proxy_port' => $port,
             'silent' => true,
         ]);
         try {
@@ -150,7 +150,7 @@ class StreamsIntegrationTest extends TestCase
         $table = 'gl_php_fu_' . (int) (microtime(true) * 1000);
         // All three cache features on — this is the regression case.
         $gl = GoldLapel::start(self::$pgUrl, [
-            'port' => $port,
+            'proxy_port' => $port,
             'silent' => true,
         ]);
         try {

@@ -102,7 +102,7 @@ final class ScopeLeakTest extends TestCase
     public function testUsingScopeDoesNotLeakToSiblingFiber(): void
     {
         $port = $this->uniqPort();
-        $gl = GoldLapel::start(self::$upstream, ['port' => $port, 'silent' => true])->await();
+        $gl = GoldLapel::start(self::$upstream, ['proxy_port' => $port, 'silent' => true])->await();
 
         try {
             $defaultConn = $gl->connection();
@@ -176,7 +176,7 @@ final class ScopeLeakTest extends TestCase
         // the `finally` restore inside using() is missing, or the scope
         // is somehow bleeding back out to the parent fiber.
         $port = $this->uniqPort();
-        $gl = GoldLapel::start(self::$upstream, ['port' => $port, 'silent' => true])->await();
+        $gl = GoldLapel::start(self::$upstream, ['proxy_port' => $port, 'silent' => true])->await();
 
         try {
             $defaultConn = $gl->connection();

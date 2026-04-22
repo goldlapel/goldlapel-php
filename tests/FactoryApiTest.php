@@ -18,148 +18,92 @@ use RuntimeException;
 class FactoryApiTest extends TestCase
 {
     // ------------------------------------------------------------------
-    // parseStartOptions is private; we test its effects indirectly via
-    // configToArgs + examining state of instances constructed from options.
+    // Constructor options — the canonical config surface promotes top-level
+    // concepts (proxy_port, dashboard_port, log_level, mode, etc.) to
+    // first-class keys on the options array. The structured `config` bag is
+    // reserved for tuning knobs only.
     // ------------------------------------------------------------------
 
-    private function invokeParseOptions(array $options): array
+    private function optionFieldValue(GoldLapel $gl, string $field): mixed
     {
-        $ref = new \ReflectionMethod(GoldLapel::class, 'parseStartOptions');
+        $ref = new \ReflectionProperty(GoldLapel::class, $field);
         $ref->setAccessible(true);
-        return $ref->invoke(null, $options);
+        return $ref->getValue($gl);
     }
 
-    public function testParseOptionsEmpty(): void
+    public function testConstructDefaults(): void
     {
-        [$port, $config, $extraArgs] = $this->invokeParseOptions([]);
-        $this->assertNull($port);
-        $this->assertSame([], $config);
-        $this->assertSame([], $extraArgs);
+        $gl = new GoldLapel('postgresql://u:p@h/d');
+        $this->assertSame(GoldLapel::DEFAULT_PROXY_PORT, $this->optionFieldValue($gl, 'proxyPort'));
+        $this->assertSame([], $this->optionFieldValue($gl, 'config'));
+        $this->assertSame([], $this->optionFieldValue($gl, 'extraArgs'));
+        $this->assertNull($this->optionFieldValue($gl, 'logLevel'));
+        $this->assertNull($this->optionFieldValue($gl, 'mode'));
     }
 
-    public function testParseOptionsExplicitPort(): void
+    public function testConstructExplicitProxyPort(): void
     {
-        [$port, $config, $extraArgs] = $this->invokeParseOptions(['port' => 7935]);
-        $this->assertSame(7935, $port);
-        $this->assertSame([], $config);
-        $this->assertSame([], $extraArgs);
+        $gl = new GoldLapel('postgresql://u:p@h/d', ['proxy_port' => 7935]);
+        $this->assertSame(7935, $this->optionFieldValue($gl, 'proxyPort'));
     }
 
-    public function testParseOptionsConfigExplicit(): void
+    public function testConstructExplicitConfig(): void
     {
-        [$port, $config, $extraArgs] = $this->invokeParseOptions([
-            'config' => ['mode' => 'waiter', 'pool_size' => 30],
+        $gl = new GoldLapel('postgresql://u:p@h/d', [
+            'config' => ['pool_mode' => 'transaction', 'pool_size' => 30],
         ]);
-        $this->assertNull($port);
-        $this->assertSame(['mode' => 'waiter', 'pool_size' => 30], $config);
+        $this->assertSame(['pool_mode' => 'transaction', 'pool_size' => 30], $this->optionFieldValue($gl, 'config'));
     }
 
-    public function testParseOptionsConfigInline(): void
+    public function testConstructRejectsPromotedTopLevelKeysInConfigMap(): void
     {
-        // Top-level config keys should be folded into 'config'
-        [$port, $config, $extraArgs] = $this->invokeParseOptions([
-            'port' => 7932,
+        // Regression guard: mode, log_level, dashboard_port, etc. are top-
+        // level options on the canonical surface. Passing them through the
+        // `config` map must raise at construction.
+        foreach (['mode', 'log_level', 'dashboard_port', 'invalidation_port', 'config', 'license', 'client'] as $promoted) {
+            $caught = false;
+            try {
+                new GoldLapel('postgresql://u:p@h/d', ['config' => [$promoted => 'x']]);
+            } catch (\InvalidArgumentException $e) {
+                $caught = true;
+                $this->assertStringContainsString('Unknown config key', $e->getMessage());
+            }
+            $this->assertTrue($caught, "expected '{$promoted}' to be rejected inside the config map");
+        }
+    }
+
+    public function testConstructModeAndLogLevelTopLevel(): void
+    {
+        $gl = new GoldLapel('postgresql://u:p@h/d', [
+            'proxy_port' => 7932,
             'mode' => 'waiter',
-            'pool_size' => 30,
-        ]);
-        $this->assertSame(7932, $port);
-        $this->assertSame(['mode' => 'waiter', 'pool_size' => 30], $config);
-    }
-
-    public function testParseOptionsLogLevelDebugTranslatesToDoubleVerbose(): void
-    {
-        [$port, $config, $extraArgs] = $this->invokeParseOptions([
-            'log_level' => 'debug',
-        ]);
-        $this->assertSame(['-vv'], $extraArgs);
-    }
-
-    public function testParseOptionsLogLevelTraceTranslatesToTripleVerbose(): void
-    {
-        [$port, $config, $extraArgs] = $this->invokeParseOptions([
-            'log_level' => 'trace',
-        ]);
-        $this->assertSame(['-vvv'], $extraArgs);
-    }
-
-    public function testParseOptionsLogLevelInfoTranslatesToSingleVerbose(): void
-    {
-        [$port, $config, $extraArgs] = $this->invokeParseOptions([
             'log_level' => 'info',
         ]);
-        $this->assertSame(['-v'], $extraArgs);
+        $this->assertSame('waiter', $this->optionFieldValue($gl, 'mode'));
+        $this->assertSame('info', $this->optionFieldValue($gl, 'logLevel'));
     }
 
-    public function testParseOptionsLogLevelWarnOmitted(): void
+    public function testConstructDashboardPortOverrideAndDerivation(): void
     {
-        [$port, $config, $extraArgs] = $this->invokeParseOptions([
-            'log_level' => 'warn',
+        $gl = new GoldLapel('postgresql://u:p@h/d', ['proxy_port' => 17932]);
+        $this->assertSame(17933, $gl->getDashboardPort());
+        $this->assertSame(17934, $gl->getInvalidationPort());
+
+        $gl2 = new GoldLapel('postgresql://u:p@h/d', [
+            'proxy_port' => 17932,
+            'dashboard_port' => 9999,
+            'invalidation_port' => 9998,
         ]);
-        $this->assertSame([], $extraArgs);
+        $this->assertSame(9999, $gl2->getDashboardPort());
+        $this->assertSame(9998, $gl2->getInvalidationPort());
     }
 
-    public function testParseOptionsLogLevelErrorOmitted(): void
+    public function testConstructExtraArgsPreserved(): void
     {
-        [$port, $config, $extraArgs] = $this->invokeParseOptions([
-            'log_level' => 'error',
-        ]);
-        $this->assertSame([], $extraArgs);
-    }
-
-    public function testParseOptionsLogLevelNullOmitted(): void
-    {
-        [$port, $config, $extraArgs] = $this->invokeParseOptions([
-            'log_level' => null,
-        ]);
-        $this->assertSame([], $extraArgs);
-    }
-
-    public function testParseOptionsLogLevelCaseInsensitive(): void
-    {
-        [$port, $config, $extraArgs] = $this->invokeParseOptions([
-            'log_level' => 'DEBUG',
-        ]);
-        $this->assertSame(['-vv'], $extraArgs);
-    }
-
-    public function testParseOptionsLogLevelInvalidThrows(): void
-    {
-        $this->expectException(\InvalidArgumentException::class);
-        $this->expectExceptionMessage('log_level must be one of');
-        $this->invokeParseOptions(['log_level' => 'verbose']);
-    }
-
-    public function testParseOptionsLogLevelNonStringThrows(): void
-    {
-        $this->expectException(\InvalidArgumentException::class);
-        $this->expectExceptionMessage('log_level must be a string');
-        $this->invokeParseOptions(['log_level' => 2]);
-    }
-
-    public function testParseOptionsExtraArgsPreserved(): void
-    {
-        [$port, $config, $extraArgs] = $this->invokeParseOptions([
+        $gl = new GoldLapel('postgresql://u:p@h/d', [
             'extra_args' => ['--some-flag', 'val'],
         ]);
-        $this->assertSame(['--some-flag', 'val'], $extraArgs);
-    }
-
-    public function testParseOptionsLogLevelAppendsToExtraArgs(): void
-    {
-        [$port, $config, $extraArgs] = $this->invokeParseOptions([
-            'extra_args' => ['--some-flag', 'val'],
-            'log_level' => 'info',
-        ]);
-        $this->assertSame(['--some-flag', 'val', '-v'], $extraArgs);
-    }
-
-    public function testParseOptionsMergesInlineWithExplicitConfig(): void
-    {
-        [$port, $config, $extraArgs] = $this->invokeParseOptions([
-            'config' => ['mode' => 'waiter'],
-            'pool_size' => 30,
-        ]);
-        $this->assertSame(['mode' => 'waiter', 'pool_size' => 30], $config);
+        $this->assertSame(['--some-flag', 'val'], $this->optionFieldValue($gl, 'extraArgs'));
     }
 
     // ------------------------------------------------------------------
@@ -182,7 +126,7 @@ class FactoryApiTest extends TestCase
         try {
             putenv("GOLDLAPEL_BINARY={$fake}");
             $this->expectException(RuntimeException::class);
-            GoldLapel::start('postgresql://user:pass@localhost:5432/db', ['port' => 19876]);
+            GoldLapel::start('postgresql://user:pass@localhost:5432/db', ['proxy_port' => 19876]);
         } finally {
             if ($origBinary === false) {
                 putenv('GOLDLAPEL_BINARY');
@@ -225,7 +169,7 @@ class FactoryApiTest extends TestCase
             // path, so it's a valid smoke test of the public API.
             $gl = GoldLapel::startProxyOnly(
                 'postgresql://user:pass@localhost:5432/db',
-                ['port' => $port, 'dashboard_port' => 0]
+                ['proxy_port' => $port, 'dashboard_port' => 0]
             );
 
             $this->assertInstanceOf(GoldLapel::class, $gl);
@@ -584,7 +528,7 @@ class FactoryApiTest extends TestCase
 
             GoldLapel::startProxyOnly(
                 'postgresql://user:pass@localhost:5432/db',
-                ['port' => $port, 'dashboard_port' => 0]
+                ['proxy_port' => $port, 'dashboard_port' => 0]
             );
 
             // Immediately after the proxy is started, the instance should
@@ -655,7 +599,7 @@ class FactoryApiTest extends TestCase
             try {
                 GoldLapel::start(
                     'postgresql://user:pass@localhost:5432/testdb',
-                    ['port' => $port, 'dashboard_port' => 0]
+                    ['proxy_port' => $port, 'dashboard_port' => 0]
                 );
                 $this->fail('Expected PDOException from start() when fake server does not speak Postgres.');
             } catch (\PDOException $e) {
@@ -782,7 +726,7 @@ class FactoryApiTest extends TestCase
             try {
                 GoldLapel::start(
                     'postgresql://user:pass@localhost:5432/testdb',
-                    ['port' => $port, 'dashboard_port' => 0]
+                    ['proxy_port' => $port, 'dashboard_port' => 0]
                 );
             } catch (\Throwable $e) {
                 $threw = true;
@@ -869,7 +813,7 @@ class FactoryApiTest extends TestCase
 
             GoldLapel::startProxyOnly(
                 'postgresql://user:pass@localhost:5432/db',
-                ['port' => $port, 'dashboard_port' => 0]
+                ['proxy_port' => $port, 'dashboard_port' => 0]
             );
 
             $ref = new \ReflectionProperty(GoldLapel::class, 'liveInstances');
@@ -925,7 +869,7 @@ class FactoryApiTest extends TestCase
 
             GoldLapel::startProxyOnly(
                 'postgresql://user:pass@localhost:5432/db',
-                ['port' => $port, 'dashboard_port' => 0]
+                ['proxy_port' => $port, 'dashboard_port' => 0]
             );
 
             $ref = new \ReflectionProperty(GoldLapel::class, 'liveInstances');

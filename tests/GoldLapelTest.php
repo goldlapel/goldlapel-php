@@ -203,13 +203,13 @@ class GoldLapelTest extends TestCase
     public function testDefaultPort(): void
     {
         $gl = new GoldLapel('postgresql://host:5432/db');
-        $this->assertSame(7932, $gl->getPort());
+        $this->assertSame(7932, $gl->getProxyPort());
     }
 
     public function testCustomPort(): void
     {
-        $gl = new GoldLapel('postgresql://host:5432/db', 9000);
-        $this->assertSame(9000, $gl->getPort());
+        $gl = new GoldLapel('postgresql://host:5432/db', ['proxy_port' => 9000]);
+        $this->assertSame(9000, $gl->getProxyPort());
     }
 
     public function testNotRunningInitially(): void
@@ -259,8 +259,8 @@ class GoldLapelTest extends TestCase
     public function testConfigStringValue(): void
     {
         $this->assertSame(
-            ['--mode', 'waiter'],
-            GoldLapel::configToArgs(['mode' => 'waiter'])
+            ['--pool-mode', 'transaction'],
+            GoldLapel::configToArgs(['pool_mode' => 'transaction'])
         );
     }
 
@@ -306,12 +306,12 @@ class GoldLapelTest extends TestCase
     public function testConfigMultipleKeys(): void
     {
         $result = GoldLapel::configToArgs([
-            'mode' => 'waiter',
+            'pool_mode' => 'transaction',
             'pool_size' => 10,
             'disable_rewrite' => true,
         ]);
         $this->assertSame(
-            ['--mode', 'waiter', '--pool-size', '10', '--disable-rewrite'],
+            ['--pool-mode', 'transaction', '--pool-size', '10', '--disable-rewrite'],
             $result
         );
     }
@@ -345,11 +345,11 @@ class GoldLapelTest extends TestCase
 
     public function testConfigConstructorIntegration(): void
     {
-        $gl = new GoldLapel('postgresql://host:5432/db', null, [
+        $gl = new GoldLapel('postgresql://host:5432/db', [
             'mode' => 'waiter',
-            'disable_matviews' => true,
+            'config' => ['disable_matviews' => true],
         ]);
-        $this->assertSame(7932, $gl->getPort());
+        $this->assertSame(7932, $gl->getProxyPort());
         $this->assertFalse($gl->isRunning());
     }
 
@@ -363,13 +363,13 @@ class GoldLapelTest extends TestCase
 
     public function testCustomDashboardPort(): void
     {
-        $gl = new GoldLapel('postgresql://host:5432/db', null, ['dashboard_port' => 8080]);
+        $gl = new GoldLapel('postgresql://host:5432/db', ['dashboard_port' => 8080]);
         $this->assertSame(8080, $gl->getDashboardPort());
     }
 
     public function testDashboardPortDisabledWithZero(): void
     {
-        $gl = new GoldLapel('postgresql://host:5432/db', null, ['dashboard_port' => 0]);
+        $gl = new GoldLapel('postgresql://host:5432/db', ['dashboard_port' => 0]);
         $this->assertSame(0, $gl->getDashboardPort());
         $this->assertNull($gl->getDashboardUrl());
     }
@@ -382,13 +382,13 @@ class GoldLapelTest extends TestCase
 
     public function testDashboardPortDerivesFromCustomProxyPort(): void
     {
-        $gl = new GoldLapel('postgresql://host:5432/db', 17932);
+        $gl = new GoldLapel('postgresql://host:5432/db', ['proxy_port' => 17932]);
         $this->assertSame(17933, $gl->getDashboardPort());
     }
 
     public function testExplicitDashboardPortOverridesDerivation(): void
     {
-        $gl = new GoldLapel('postgresql://host:5432/db', 17932, ['dashboard_port' => 9999]);
+        $gl = new GoldLapel('postgresql://host:5432/db', ['proxy_port' => 17932, 'dashboard_port' => 9999]);
         $this->assertSame(9999, $gl->getDashboardPort());
     }
 
@@ -402,18 +402,31 @@ class GoldLapelTest extends TestCase
 
     public function testConfigKeysContainsKnownKeys(): void
     {
+        // Tuning knobs still live in the structured config map.
         $keys = GoldLapel::configKeys();
-        $this->assertContains('mode', $keys);
         $this->assertContains('pool_size', $keys);
         $this->assertContains('disable_matviews', $keys);
         $this->assertContains('replica', $keys);
-        $this->assertContains('invalidation_port', $keys);
+    }
+
+    public function testConfigKeysDoesNotContainPromotedTopLevelKeys(): void
+    {
+        // Top-level concepts (mode, log_level, dashboard_port, etc.) were
+        // promoted out of the structured config map.
+        $keys = GoldLapel::configKeys();
+        $this->assertNotContains('mode', $keys);
+        $this->assertNotContains('log_level', $keys);
+        $this->assertNotContains('dashboard_port', $keys);
+        $this->assertNotContains('invalidation_port', $keys);
+        $this->assertNotContains('config', $keys);
+        $this->assertNotContains('license', $keys);
+        $this->assertNotContains('client', $keys);
     }
 
     public function testConfigKeysCount(): void
     {
         $keys = GoldLapel::configKeys();
-        $this->assertCount(42, $keys);
+        $this->assertCount(38, $keys);
     }
 
     // -- urlToPdoDsn (3 tests) --

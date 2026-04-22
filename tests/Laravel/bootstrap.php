@@ -185,7 +185,7 @@ namespace GoldLapel {
 
     class GoldLapel
     {
-        const DEFAULT_PORT = 7932;
+        const DEFAULT_PROXY_PORT = 7932;
 
         public static array $calls = [];
         public static array $wrapCalls = [];
@@ -206,15 +206,18 @@ namespace GoldLapel {
 
         public static function start(string $upstream, array $options = []): self
         {
+            $port = $options['proxy_port'] ?? self::DEFAULT_PROXY_PORT;
             self::$calls[] = [
                 'upstream' => $upstream,
-                'port' => $options['port'] ?? self::DEFAULT_PORT,
+                'port' => $port,
                 'config' => $options['config'] ?? [],
                 'extraArgs' => $options['extra_args'] ?? [],
                 'logLevel' => $options['log_level'] ?? null,
+                'mode' => $options['mode'] ?? null,
+                'client' => $options['client'] ?? null,
+                'invalidationPort' => $options['invalidation_port'] ?? null,
             ];
             $instance = new self();
-            $port = $options['port'] ?? self::DEFAULT_PORT;
             $instance->url = "postgresql://localhost:{$port}/db";
             self::$liveInstances[spl_object_id($instance)] = $instance;
             return $instance;
@@ -222,13 +225,16 @@ namespace GoldLapel {
 
         public static function startProxyOnly(string $upstream, array $options = []): self
         {
-            $port = $options['port'] ?? self::DEFAULT_PORT;
+            $port = $options['proxy_port'] ?? self::DEFAULT_PROXY_PORT;
             self::$calls[] = [
                 'upstream' => $upstream,
                 'port' => $port,
                 'config' => $options['config'] ?? [],
                 'extraArgs' => $options['extra_args'] ?? [],
                 'logLevel' => $options['log_level'] ?? null,
+                'mode' => $options['mode'] ?? null,
+                'client' => $options['client'] ?? null,
+                'invalidationPort' => $options['invalidation_port'] ?? null,
             ];
             $instance = new self();
             $instance->url = "postgresql://localhost:{$port}/db";

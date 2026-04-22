@@ -130,21 +130,30 @@ class BannerTest extends TestCase
         $this->assertSame('', $stderr, 'Silent must not write to stderr either.');
     }
 
+    private function silentFieldValue(GoldLapel $gl): bool
+    {
+        $ref = new \ReflectionProperty(GoldLapel::class, 'silent');
+        $ref->setAccessible(true);
+        return $ref->getValue($gl);
+    }
+
+    private function configFieldValue(GoldLapel $gl): array
+    {
+        $ref = new \ReflectionProperty(GoldLapel::class, 'config');
+        $ref->setAccessible(true);
+        return $ref->getValue($gl);
+    }
+
     public function testSilentDefaultsToFalse(): void
     {
-        // parseStartOptions should return $silent = false when not specified.
-        $ref = new \ReflectionMethod(GoldLapel::class, 'parseStartOptions');
-        $ref->setAccessible(true);
-        [$port, $config, $extraArgs, $silent] = $ref->invoke(null, []);
-        $this->assertFalse($silent);
+        $gl = new GoldLapel('postgresql://u:p@h/d');
+        $this->assertFalse($this->silentFieldValue($gl));
     }
 
     public function testSilentOptionParsedAsTrue(): void
     {
-        $ref = new \ReflectionMethod(GoldLapel::class, 'parseStartOptions');
-        $ref->setAccessible(true);
-        [$port, $config, $extraArgs, $silent] = $ref->invoke(null, ['silent' => true]);
-        $this->assertTrue($silent);
+        $gl = new GoldLapel('postgresql://u:p@h/d', ['silent' => true]);
+        $this->assertTrue($this->silentFieldValue($gl));
     }
 
     // ------------------------------------------------------------------
@@ -153,59 +162,41 @@ class BannerTest extends TestCase
 
     public function testSilentNotForwardedToBinaryArgv(): void
     {
-        $ref = new \ReflectionMethod(GoldLapel::class, 'parseStartOptions');
-        $ref->setAccessible(true);
-        [$port, $config, $extraArgs, $silent] = $ref->invoke(null, [
-            'port' => 7932,
+        $gl = new GoldLapel('postgresql://u:p@h/d', [
+            'proxy_port' => 7932,
             'silent' => true,
             'mode' => 'waiter',
         ]);
 
-        // Silent must not land in $config (from which CLI flags are built)
-        // and must not land in $extraArgs.
-        $this->assertArrayNotHasKey('silent', $config);
-        $this->assertNotContains('--silent', $extraArgs);
-        $this->assertNotContains('silent', $extraArgs);
-
-        // And the full argv assembled by configToArgs() must not mention it.
-        $args = GoldLapel::configToArgs($config);
+        // The configToArgs output for the structured config map must not
+        // mention 'silent' — it's a wrapper-only key stored on the instance.
+        $args = GoldLapel::configToArgs($this->configFieldValue($gl));
         $this->assertNotContains('--silent', $args);
         $this->assertNotContains('silent', $args);
-
-        // Sanity: real config keys still came through.
-        $this->assertContains('--mode', $args);
-        $this->assertContains('waiter', $args);
     }
 
-    public function testSilentWithExplicitConfigArrayStillNotLeaked(): void
+    public function testSilentAsConfigKeyRejected(): void
     {
-        // Belt-and-braces: caller passes both a silent flag AND a 'config'
-        // sub-array. The wrapper-only key must still be stripped.
-        $ref = new \ReflectionMethod(GoldLapel::class, 'parseStartOptions');
-        $ref->setAccessible(true);
-        [$port, $config, $extraArgs, $silent] = $ref->invoke(null, [
-            'silent' => true,
-            'config' => ['mode' => 'waiter'],
+        // Belt-and-braces: a caller who tries to pass 'silent' inside the
+        // config sub-array must be rejected. 'silent' is a top-level
+        // wrapper option, not a tuning knob — forwarding it as a CLI flag
+        // to the Rust binary (which has no --silent) is a bug waiting to
+        // happen.
+        $this->expectException(\InvalidArgumentException::class);
+        new GoldLapel('postgresql://u:p@h/d', [
+            'config' => ['silent' => true],
         ]);
-
-        $this->assertTrue($silent);
-        $this->assertArrayNotHasKey('silent', $config);
-        $this->assertSame(['mode' => 'waiter'], $config);
-
-        $args = GoldLapel::configToArgs($config);
-        $this->assertNotContains('--silent', $args);
     }
 
     public function testSilentFalseyValuesTreatedAsFalse(): void
     {
         // silent => false, 0, '', null should all yield $silent === false.
-        $ref = new \ReflectionMethod(GoldLapel::class, 'parseStartOptions');
-        $ref->setAccessible(true);
-
         foreach ([false, 0, '', null] as $falsey) {
-            [$_p, $config, $_e, $silent] = $ref->invoke(null, ['silent' => $falsey]);
-            $this->assertFalse($silent, "silent => " . var_export($falsey, true) . ' should be false');
-            $this->assertArrayNotHasKey('silent', $config);
+            $gl = new GoldLapel('postgresql://u:p@h/d', ['silent' => $falsey]);
+            $this->assertFalse(
+                $this->silentFieldValue($gl),
+                'silent => ' . var_export($falsey, true) . ' should be false'
+            );
         }
     }
 }

@@ -9,7 +9,7 @@ use RuntimeException;
  *
  * Usage:
  *     $gl = GoldLapel::start('postgresql://user:pass@db/mydb', [
- *         'port' => 7932,
+ *         'proxy_port' => 7932,
  *         'log_level' => 'info',
  *     ]);
  *     // PDO needs the pgsql: DSN form plus user/password — not the raw URL.
@@ -23,25 +23,29 @@ use RuntimeException;
  */
 class GoldLapel
 {
-    const DEFAULT_PORT = 7932;
+    const DEFAULT_PROXY_PORT = 7932;
     const STARTUP_TIMEOUT = 10.0;
     const STARTUP_POLL_INTERVAL = 0.05;
 
+    // Keys that are valid inside the structured `config` map. Top-level
+    // concepts (proxy_port, dashboard_port, invalidation_port, log_level,
+    // mode, license, client, config_file) are accepted as top-level options
+    // on GoldLapel::start() and are NOT valid keys here — passing them
+    // through `config` raises.
     private const VALID_CONFIG_KEYS = [
-        'mode', 'min_pattern_count', 'refresh_interval_secs', 'pattern_ttl_secs',
+        'min_pattern_count', 'refresh_interval_secs', 'pattern_ttl_secs',
         'max_tables_per_view', 'max_columns_per_view', 'deep_pagination_threshold',
         'report_interval_secs', 'result_cache_size', 'batch_cache_size',
         'batch_cache_ttl_secs', 'pool_size', 'pool_timeout_secs',
         'pool_mode', 'mgmt_idle_timeout', 'fallback', 'read_after_write_secs',
         'n1_threshold', 'n1_window_ms', 'n1_cross_threshold',
-        'tls_cert', 'tls_key', 'tls_client_ca', 'config', 'dashboard_port',
+        'tls_cert', 'tls_key', 'tls_client_ca',
         'disable_matviews', 'disable_consolidation', 'disable_btree_indexes',
         'disable_trigram_indexes', 'disable_expression_indexes',
         'disable_partial_indexes', 'disable_rewrite', 'disable_prepared_cache',
         'disable_result_cache', 'disable_pool',
         'disable_n1', 'disable_n1_cross_connection', 'disable_shadow_mode',
         'enable_coalescing', 'replica', 'exclude_tables',
-        'invalidation_port',
     ];
 
     private const BOOLEAN_KEYS = [
@@ -58,15 +62,6 @@ class GoldLapel
     ];
 
     /**
-     * Option keys consumed by the wrapper itself — never forwarded to the
-     * Rust binary as CLI flags. Keep in sync with the reserved keys handled
-     * in parseStartOptions().
-     */
-    private const WRAPPER_ONLY_KEYS = [
-        'silent',
-    ];
-
-    /**
      * Stream the startup banner is written to. Defaults to STDERR; tests
      * can swap this for a php://memory stream to capture output without
      * depending on the real stderr file descriptor.
@@ -76,8 +71,16 @@ class GoldLapel
     private static $bannerStream;
 
     private string $upstream;
-    private int $port;
+    private int $proxyPort;
     private int $dashboardPort;
+    private bool $dashboardPortExplicit;
+    private int $invalidationPort;
+    private bool $invalidationPortExplicit;
+    private ?string $logLevel;
+    private ?string $mode;
+    private ?string $license;
+    private ?string $client;
+    private ?string $configFile;
     private bool $silent;
     private array $config;
     private array $extraArgs;
@@ -100,49 +103,87 @@ class GoldLapel
     private static bool $cleanupRegistered = false;
 
     /**
-     * Private constructor — use GoldLapel::start() to create and start an instance.
+     * Constructor — use GoldLapel::start() to create and start an instance.
+     * Accepts a canonical-surface options array (same shape as start()).
      *
-     * Internal users (and tests) can still construct directly.
+     * @param array{
+     *   proxy_port?: int,
+     *   dashboard_port?: int,
+     *   invalidation_port?: int,
+     *   log_level?: string,
+     *   mode?: string,
+     *   license?: string,
+     *   client?: string,
+     *   config_file?: string,
+     *   config?: array<string, mixed>,
+     *   extra_args?: list<string>,
+     *   silent?: bool,
+     * } $options
      */
-    public function __construct(
-        string $upstream,
-        ?int $port = null,
-        array $config = [],
-        array $extraArgs = [],
-        bool $silent = false
-    ) {
+    public function __construct(string $upstream, array $options = [])
+    {
         $this->upstream = $upstream;
-        $this->port = $port ?? self::DEFAULT_PORT;
-        $this->dashboardPort = array_key_exists('dashboard_port', $config)
-            ? (int) $config['dashboard_port']
-            : $this->port + 1;
-        $this->silent = $silent;
+        $this->proxyPort = isset($options['proxy_port']) ? (int) $options['proxy_port'] : self::DEFAULT_PROXY_PORT;
+
+        // Dashboard / invalidation ports default to proxyPort + 1 / + 2 when
+        // unset. An explicit value (including 0 for "disable dashboard")
+        // overrides the derivation and is emitted as --dashboard-port /
+        // --invalidation-port at spawn time.
+        $this->dashboardPortExplicit = array_key_exists('dashboard_port', $options);
+        $this->dashboardPort = $this->dashboardPortExplicit
+            ? (int) $options['dashboard_port']
+            : $this->proxyPort + 1;
+        $this->invalidationPortExplicit = array_key_exists('invalidation_port', $options);
+        $this->invalidationPort = $this->invalidationPortExplicit
+            ? (int) $options['invalidation_port']
+            : $this->proxyPort + 2;
+
+        $this->logLevel = isset($options['log_level']) ? (string) $options['log_level'] : null;
+        $this->mode = isset($options['mode']) ? (string) $options['mode'] : null;
+        $this->license = isset($options['license']) ? (string) $options['license'] : null;
+        $this->client = isset($options['client']) ? (string) $options['client'] : null;
+        $this->configFile = isset($options['config_file']) ? (string) $options['config_file'] : null;
+
+        $config = $options['config'] ?? [];
+        // Validate structured-config keys eagerly so a test that constructs
+        // without spawning still catches bad keys.
+        $validKeys = array_flip(self::VALID_CONFIG_KEYS);
+        foreach ($config as $key => $_) {
+            if (!isset($validKeys[$key])) {
+                throw new \InvalidArgumentException("Unknown config key: {$key}");
+            }
+        }
         $this->config = $config;
-        $this->extraArgs = $extraArgs;
+        $this->extraArgs = $options['extra_args'] ?? [];
+        $this->silent = !empty($options['silent']);
     }
 
     /**
      * Factory — start a Gold Lapel proxy and return a ready-to-use instance.
      *
-     * Options (all optional):
-     *   - 'port' (int): proxy port (default 7932)
+     * Top-level options (all optional):
+     *   - 'proxy_port' (int): proxy port (default 7932)
+     *   - 'dashboard_port' (int): dashboard port. Defaults to proxy_port + 1. 0 disables.
+     *   - 'invalidation_port' (int): cache-invalidation port. Defaults to proxy_port + 2.
      *   - 'log_level' (string): 'trace'|'debug'|'info'|'warn'|'error' — translated to the proxy's -v/-vv/-vvv verbosity flag
-     *   - 'config' (array): per-proxy config keys (see configKeys())
+     *   - 'mode' (string): proxy operating mode ('waiter', 'bellhop')
+     *   - 'license' (string): path to a signed license file
+     *   - 'client' (string): client identifier for telemetry tagging
+     *   - 'config_file' (string): path to a TOML config file (passed as --config)
+     *   - 'config' (array): structured tuning keys — must be one of configKeys()
      *   - 'extra_args' (array): raw extra CLI flags
+     *   - 'silent' (bool): suppress the startup banner
      *
-     * The options array also accepts any of the keys from configKeys()
-     * directly at the top level — those are merged into 'config'. This makes
-     * `['port' => 7932, 'mode' => 'waiter']` work as well as
-     * `['port' => 7932, 'config' => ['mode' => 'waiter']]`.
+     * Promoted top-level concepts (proxy_port, dashboard_port, etc.) are NOT
+     * valid keys inside `config` — passing them there raises at construction
+     * time. This matches the canonical config surface across all wrappers.
      *
      * Eagerly opens a PDO connection to the proxy; raises RuntimeException
      * if pdo_pgsql is not enabled.
      */
     public static function start(string $upstream, array $options = []): self
     {
-        [$port, $config, $extraArgs, $silent] = self::parseStartOptions($options);
-
-        $instance = new self($upstream, $port, $config, $extraArgs, $silent);
+        $instance = new self($upstream, $options);
         // startProxyWithoutConnect() (invoked via startProxy) registers the
         // instance with cleanupAll as soon as the subprocess spawns, before
         // the PDO is opened. If the subsequent PDO construction fails we
@@ -182,47 +223,10 @@ class GoldLapel
      */
     public static function startProxyOnly(string $upstream, array $options = []): self
     {
-        [$port, $config, $extraArgs, $silent] = self::parseStartOptions($options);
-
-        $instance = new self($upstream, $port, $config, $extraArgs, $silent);
+        $instance = new self($upstream, $options);
         $instance->startProxyWithoutConnect();
 
         return $instance;
-    }
-
-    private static function parseStartOptions(array $options): array
-    {
-        $port = isset($options['port']) ? (int) $options['port'] : null;
-        $silent = !empty($options['silent']);
-
-        // Accept either {'config' => [...]} or top-level config keys mixed
-        // into options. 'port', 'log_level', 'extra_args', 'config' are
-        // reserved option keys; wrapper-only keys (e.g. 'silent') are also
-        // reserved and must never be forwarded to the Rust binary as CLI
-        // flags. Everything else is treated as a config key.
-        $config = $options['config'] ?? [];
-        $extraArgs = $options['extra_args'] ?? [];
-
-        $reserved = array_merge(
-            ['port', 'log_level', 'config', 'extra_args'],
-            self::WRAPPER_ONLY_KEYS
-        );
-        foreach ($options as $key => $value) {
-            if (in_array($key, $reserved, true)) {
-                continue;
-            }
-            // Implicit top-level config key
-            $config[$key] = $value;
-        }
-
-        if (array_key_exists('log_level', $options) && $options['log_level'] !== null) {
-            $verboseFlag = self::translateLogLevel($options['log_level']);
-            if ($verboseFlag !== null) {
-                $extraArgs[] = $verboseFlag;
-            }
-        }
-
-        return [$port, $config, $extraArgs, $silent];
     }
 
     /**
@@ -412,11 +416,43 @@ class GoldLapel
         }
 
         $binary = self::findBinary();
-        $cmd = array_merge(
-            [$binary, '--upstream', $this->upstream, '--proxy-port', (string) $this->port],
-            self::configToArgs($this->config),
-            $this->extraArgs
-        );
+        $cmd = [$binary, '--upstream', $this->upstream, '--proxy-port', (string) $this->proxyPort];
+
+        // Top-level options (promoted out of the config map by the canonical
+        // surface) emit their own CLI flags before the tuning-knob config
+        // map. Each is suppressed when the user hasn't set it, so the Rust
+        // binary applies its own defaults.
+        if ($this->dashboardPortExplicit) {
+            $cmd[] = '--dashboard-port';
+            $cmd[] = (string) $this->dashboardPort;
+        }
+        if ($this->invalidationPortExplicit) {
+            $cmd[] = '--invalidation-port';
+            $cmd[] = (string) $this->invalidationPort;
+        }
+        if ($this->logLevel !== null) {
+            $verboseFlag = self::translateLogLevel($this->logLevel);
+            if ($verboseFlag !== null) {
+                $cmd[] = $verboseFlag;
+            }
+        }
+        if ($this->mode !== null) {
+            $cmd[] = '--mode';
+            $cmd[] = $this->mode;
+        }
+        if ($this->license !== null) {
+            $cmd[] = '--license';
+            $cmd[] = $this->license;
+        }
+        if ($this->client !== null) {
+            $cmd[] = '--client';
+            $cmd[] = $this->client;
+        }
+        if ($this->configFile !== null) {
+            $cmd[] = '--config';
+            $cmd[] = $this->configFile;
+        }
+        $cmd = array_merge($cmd, self::configToArgs($this->config), $this->extraArgs);
 
         $nullDevice = PHP_OS_FAMILY === 'Windows' ? 'NUL' : '/dev/null';
         $descriptors = [
@@ -426,7 +462,10 @@ class GoldLapel
         ];
 
         $env = getenv();
-        if (!isset($env['GOLDLAPEL_CLIENT'])) {
+        // GOLDLAPEL_CLIENT env var is only set when the user hasn't opted
+        // in via the top-level `client` option (which emits --client and
+        // takes precedence over the env var).
+        if ($this->client === null && !isset($env['GOLDLAPEL_CLIENT'])) {
             $env['GOLDLAPEL_CLIENT'] = 'php';
         }
         // Provision a session-scoped dashboard token so Ddl.php can authenticate
@@ -465,9 +504,9 @@ class GoldLapel
                 break;
             }
 
-            if (self::waitForPort('127.0.0.1', $this->port, 0.5)) {
+            if (self::waitForPort('127.0.0.1', $this->proxyPort, 0.5)) {
                 fclose($stderr);
-                $this->url = self::makeProxyUrl($this->upstream, $this->port);
+                $this->url = self::makeProxyUrl($this->upstream, $this->proxyPort);
 
                 // Print the banner BEFORE registering for cleanup: fwrite()
                 // to stderr is vanishingly unlikely to fail, but if it does
@@ -477,7 +516,7 @@ class GoldLapel
                 // leak an orphan reference into $liveInstances. Registration
                 // is the last side-effect because it's the one whose cleanup
                 // is most expensive to get wrong.
-                self::printBanner($this->port, $this->dashboardPort, $this->silent);
+                self::printBanner($this->proxyPort, $this->dashboardPort, $this->silent);
 
                 // Register the instance for global cleanup immediately so
                 // that any subsequent init step (e.g. PDO construction in
@@ -498,7 +537,7 @@ class GoldLapel
         $this->terminate();
 
         throw new RuntimeException(
-            "Gold Lapel failed to start on port {$this->port} within " . self::STARTUP_TIMEOUT . "s.\nstderr: {$stderrOutput}"
+            "Gold Lapel failed to start on port {$this->proxyPort} within " . self::STARTUP_TIMEOUT . "s.\nstderr: {$stderrOutput}"
         );
     }
 
@@ -613,14 +652,19 @@ class GoldLapel
         return [$user, $pass];
     }
 
-    public function getPort(): int
+    public function getProxyPort(): int
     {
-        return $this->port;
+        return $this->proxyPort;
     }
 
     public function getDashboardPort(): int
     {
         return $this->dashboardPort;
+    }
+
+    public function getInvalidationPort(): int
+    {
+        return $this->invalidationPort;
     }
 
     public function getDashboardUrl(): ?string
@@ -716,7 +760,7 @@ class GoldLapel
         if ($invalidationPort === null) {
             $invalidationPort = isset($this->config['invalidation_port'])
                 ? (int) $this->config['invalidation_port']
-                : $this->port + 2;
+                : $this->proxyPort + 2;
         }
 
         return self::wrapPDOStatic($pdo, $invalidationPort);
