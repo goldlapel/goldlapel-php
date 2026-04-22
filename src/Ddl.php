@@ -45,7 +45,7 @@ final class Ddl
         if ($home === null) {
             return null;
         }
-        $path = rtrim($home, '/') . '/.goldlapel/dashboard_token';
+        $path = rtrim($home, '/') . '/.goldlapel/dashboard-token';
         if (!is_file($path)) {
             return null;
         }
@@ -110,7 +110,7 @@ final class Ddl
                 throw new \RuntimeException(
                     'Gold Lapel dashboard rejected the DDL request (403). '
                     . 'The dashboard token is missing or incorrect — check '
-                    . 'GOLDLAPEL_DASHBOARD_TOKEN or ~/.goldlapel/dashboard_token.'
+                    . 'GOLDLAPEL_DASHBOARD_TOKEN or ~/.goldlapel/dashboard-token.'
                 );
             }
             throw new \RuntimeException(
