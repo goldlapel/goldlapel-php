@@ -158,6 +158,39 @@ PHP;
         $this->assertCount(1, self::_captured());
     }
 
+    public function testDifferentOwnersIsolated(): void
+    {
+        self::_queue(200, [
+            'tables' => ['main' => '_goldlapel.stream_events'],
+            'query_patterns' => ['insert' => 'X'],
+        ]);
+        self::_queue(200, [
+            'tables' => ['main' => '_goldlapel.stream_events'],
+            'query_patterns' => ['insert' => 'X'],
+        ]);
+        $cacheA = [];
+        $cacheB = [];
+        Ddl::fetch($cacheA, 'stream', 'events', self::$port, 'tok');
+        Ddl::fetch($cacheB, 'stream', 'events', self::$port, 'tok');
+        $this->assertCount(2, self::_captured(), 'isolated caches must each trigger a fetch');
+    }
+
+    public function testDifferentNamesMissCache(): void
+    {
+        self::_queue(200, [
+            'tables' => ['main' => '_goldlapel.stream_events'],
+            'query_patterns' => ['insert' => 'INSERT events'],
+        ]);
+        self::_queue(200, [
+            'tables' => ['main' => '_goldlapel.stream_orders'],
+            'query_patterns' => ['insert' => 'INSERT orders'],
+        ]);
+        $cache = [];
+        Ddl::fetch($cache, 'stream', 'events', self::$port, 'tok');
+        Ddl::fetch($cache, 'stream', 'orders', self::$port, 'tok');
+        $this->assertCount(2, self::_captured(), 'different names must each trigger a fetch');
+    }
+
     public function testVersionMismatchRaisesActionable(): void
     {
         self::_queue(409, [
