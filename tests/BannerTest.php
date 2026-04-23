@@ -199,4 +199,82 @@ class BannerTest extends TestCase
             );
         }
     }
+
+    // ─── Mesh startup options ─────────────────────────────────────────────
+
+    private function meshFieldValue(GoldLapel $gl): bool
+    {
+        $ref = new \ReflectionProperty(GoldLapel::class, 'mesh');
+        $ref->setAccessible(true);
+        return $ref->getValue($gl);
+    }
+
+    private function meshTagFieldValue(GoldLapel $gl): ?string
+    {
+        $ref = new \ReflectionProperty(GoldLapel::class, 'meshTag');
+        $ref->setAccessible(true);
+        return $ref->getValue($gl);
+    }
+
+    public function testMeshDefaultsToFalse(): void
+    {
+        $gl = new GoldLapel('postgresql://u:p@h/d');
+        $this->assertFalse($this->meshFieldValue($gl));
+        $this->assertNull($this->meshTagFieldValue($gl));
+    }
+
+    public function testMeshOptionParsedAsTrue(): void
+    {
+        $gl = new GoldLapel('postgresql://u:p@h/d', ['mesh' => true, 'mesh_tag' => 'prod-east']);
+        $this->assertTrue($this->meshFieldValue($gl));
+        $this->assertSame('prod-east', $this->meshTagFieldValue($gl));
+    }
+
+    public function testMeshTagEmptyStringNormalizedToNull(): void
+    {
+        $gl = new GoldLapel('postgresql://u:p@h/d', ['mesh' => true, 'mesh_tag' => '']);
+        $this->assertNull($this->meshTagFieldValue($gl));
+    }
+
+    public function testMeshAsConfigKeyRejected(): void
+    {
+        // Belt-and-braces: mesh is a top-level canonical-surface option, never
+        // valid inside the structured config map.
+        $this->expectException(\InvalidArgumentException::class);
+        new GoldLapel('postgresql://u:p@h/d', [
+            'config' => ['mesh' => true],
+        ]);
+    }
+
+    public function testMeshTagAsConfigKeyRejected(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        new GoldLapel('postgresql://u:p@h/d', [
+            'config' => ['mesh_tag' => 'prod'],
+        ]);
+    }
+
+    public function testMeshNotForwardedAsConfigArg(): void
+    {
+        $gl = new GoldLapel('postgresql://u:p@h/d', [
+            'mesh' => true,
+            'mesh_tag' => 'prod-east',
+        ]);
+        // configToArgs only sees the structured config map; mesh lives
+        // on the instance and is emitted in startProxyWithoutConnect.
+        $args = GoldLapel::configToArgs($this->configFieldValue($gl));
+        $this->assertNotContains('--mesh', $args);
+        $this->assertNotContains('--mesh-tag', $args);
+    }
+
+    public function testMeshFalseyValuesTreatedAsFalse(): void
+    {
+        foreach ([false, 0, '', null] as $falsey) {
+            $gl = new GoldLapel('postgresql://u:p@h/d', ['mesh' => $falsey]);
+            $this->assertFalse(
+                $this->meshFieldValue($gl),
+                'mesh => ' . var_export($falsey, true) . ' should be false'
+            );
+        }
+    }
 }

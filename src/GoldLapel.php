@@ -82,6 +82,8 @@ class GoldLapel
     private ?string $client;
     private ?string $configFile;
     private bool $silent;
+    private bool $mesh;
+    private ?string $meshTag;
     private array $config;
     private array $extraArgs;
     /** @var resource|null */
@@ -118,6 +120,8 @@ class GoldLapel
      *   config?: array<string, mixed>,
      *   extra_args?: list<string>,
      *   silent?: bool,
+     *   mesh?: bool,
+     *   mesh_tag?: string,
      * } $options
      */
     public function __construct(string $upstream, array $options = [])
@@ -156,6 +160,10 @@ class GoldLapel
         $this->config = $config;
         $this->extraArgs = $options['extra_args'] ?? [];
         $this->silent = !empty($options['silent']);
+        // Mesh membership (startup intent — HQ enforces license).
+        $this->mesh = !empty($options['mesh']);
+        $tag = isset($options['mesh_tag']) ? (string) $options['mesh_tag'] : '';
+        $this->meshTag = $tag === '' ? null : $tag;
     }
 
     /**
@@ -173,6 +181,8 @@ class GoldLapel
      *   - 'config' (array): structured tuning keys — must be one of configKeys()
      *   - 'extra_args' (array): raw extra CLI flags
      *   - 'silent' (bool): suppress the startup banner
+     *   - 'mesh' (bool): opt into the mesh at startup (HQ enforces license; denial is non-fatal)
+     *   - 'mesh_tag' (string): optional mesh tag — instances with the same tag cluster together
      *
      * Promoted top-level concepts (proxy_port, dashboard_port, etc.) are NOT
      * valid keys inside `config` — passing them there raises at construction
@@ -451,6 +461,13 @@ class GoldLapel
         if ($this->configFile !== null) {
             $cmd[] = '--config';
             $cmd[] = $this->configFile;
+        }
+        if ($this->mesh) {
+            $cmd[] = '--mesh';
+        }
+        if ($this->meshTag !== null) {
+            $cmd[] = '--mesh-tag';
+            $cmd[] = $this->meshTag;
         }
         $cmd = array_merge($cmd, self::configToArgs($this->config), $this->extraArgs);
 
