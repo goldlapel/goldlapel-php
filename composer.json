@@ -4,11 +4,11 @@
   "type": "library",
   "license": "MIT",
   "homepage": "https://goldlapel.com",
-  "keywords": ["postgres", "proxy", "optimization", "materialized-views", "database"],
+  "keywords": ["postgres", "proxy", "optimization", "materialized-views", "database", "cache", "redis-compat", "mongo-compat", "query-optimization"],
   "authors": [
     {
-      "name": "Gold Lapel",
-      "homepage": "https://goldlapel.com"
+      "name": "The Waiter of Gold Lapel",
+      "email": "thewaiter@goldlapel.com"
     }
   ],
   "support": {
