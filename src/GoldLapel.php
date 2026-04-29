@@ -174,7 +174,7 @@ class GoldLapel
      *   - 'dashboard_port' (int): dashboard port. Defaults to proxy_port + 1. 0 disables.
      *   - 'invalidation_port' (int): cache-invalidation port. Defaults to proxy_port + 2.
      *   - 'log_level' (string): 'trace'|'debug'|'info'|'warn'|'error' — translated to the proxy's -v/-vv/-vvv verbosity flag
-     *   - 'mode' (string): proxy operating mode ('waiter', 'bellhop')
+     *   - 'mode' (string): proxy operating mode ('waiter', 'consideration')
      *   - 'license' (string): path to a signed license file
      *   - 'client' (string): client identifier for telemetry tagging
      *   - 'config_file' (string): path to a TOML config file (passed as --config)
