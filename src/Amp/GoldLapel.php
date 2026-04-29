@@ -27,8 +27,8 @@ use function Amp\async;
  *     // Scoped transactional coordination:
  *     $conn = $gl->connection();
  *     $gl->using($conn, function ($gl) {
- *         $gl->docInsert('events', ['type' => 'x'])->await();
- *         $gl->incr('counters', 'orders')->await();
+ *         $gl->documents->insert('events', ['type' => 'x'])->await();
+ *         $gl->counters->incr('counters', 'orders')->await();
  *     })->await();
  *
  * Every method that issues SQL returns Amp\Future<T>. Callers `->await()`
@@ -107,6 +107,19 @@ class GoldLapel
     public readonly Streams $streams;
 
     /**
+     * Phase 5 Redis-compat sub-APIs. Each issues `/api/ddl/<family>/create`
+     * (idempotent) on first use of a name and shares the pattern cache held
+     * on this client. The legacy flat `incr`, `hset`, `zadd`, `enqueue`,
+     * `geoadd`, … methods are gone — see src/Amp/{Counters,Zsets,Hashes,
+     * Queues,Geos}.php for the canonical surfaces.
+     */
+    public readonly Counters $counters;
+    public readonly Zsets $zsets;
+    public readonly Hashes $hashes;
+    public readonly Queues $queues;
+    public readonly Geos $geos;
+
+    /**
      * Stream the startup banner is written to. Defaults to STDERR; tests
      * can swap this for a php://memory stream (or a userland stream
      * wrapper) to capture output, or to inject a throwing write to
@@ -146,12 +159,18 @@ class GoldLapel
         // at spawn time — same contract as the sync wrapper pre-rollout.
         $this->scopedConn = new FiberLocal(static fn () => null);
 
-        // Nested namespaces — see src/Amp/Documents.php and src/Amp/Streams.php.
-        // These are the canonical schema-to-core sub-API instances. Each
-        // holds a back-reference to this client for shared state (license,
-        // dashboard token, PDO/PostgresExecutor, DDL pattern cache).
+        // Nested namespaces — see src/Amp/Documents.php, src/Amp/Streams.php,
+        // plus the Phase 5 Redis-compat families under src/Amp/{Counters,
+        // Zsets,Hashes,Queues,Geos}.php. Each holds a back-reference to this
+        // client for shared state (license, dashboard token, PDO/Postgres
+        // executor, DDL pattern cache).
         $this->documents = new Documents($this);
         $this->streams = new Streams($this);
+        $this->counters = new Counters($this);
+        $this->zsets = new Zsets($this);
+        $this->hashes = new Hashes($this);
+        $this->queues = new Queues($this);
+        $this->geos = new Geos($this);
     }
 
     /**
@@ -679,8 +698,8 @@ class GoldLapel
      *
      *     $tx = $gl->connection()->beginTransaction();
      *     $gl->using($tx, function ($gl) {
-     *         $gl->docInsert('events', ['type' => 'x'])->await();
-     *         $gl->incr('counters', 'orders')->await();
+     *         $gl->documents->insert('events', ['type' => 'x'])->await();
+     *         $gl->counters->incr('counters', 'orders')->await();
      *     })->await();
      *     $tx->commit();
      *
@@ -839,135 +858,10 @@ class GoldLapel
         return async(fn() => Utils::subscribe($c, $channel, $callback));
     }
 
-    public function enqueue(string $queueTable, array $payload, ?PostgresExecutor $conn = null): Future
-    {
-        $c = $this->resolveConn($conn);
-        return async(fn() => Utils::enqueue($c, $queueTable, $payload));
-    }
-
-    public function dequeue(string $queueTable, ?PostgresExecutor $conn = null): Future
-    {
-        $c = $this->resolveConn($conn);
-        return async(fn() => Utils::dequeue($c, $queueTable));
-    }
-
-    // Counters
-
-    public function incr(string $table, string $key, int $amount = 1, ?PostgresExecutor $conn = null): Future
-    {
-        $c = $this->resolveConn($conn);
-        return async(fn() => Utils::incr($c, $table, $key, $amount));
-    }
-
-    public function getCounter(string $table, string $key, ?PostgresExecutor $conn = null): Future
-    {
-        $c = $this->resolveConn($conn);
-        return async(fn() => Utils::getCounter($c, $table, $key));
-    }
-
-    // Hash
-
-    public function hset(string $table, string $key, string $field, mixed $value, ?PostgresExecutor $conn = null): Future
-    {
-        $c = $this->resolveConn($conn);
-        return async(fn() => Utils::hset($c, $table, $key, $field, $value));
-    }
-
-    public function hget(string $table, string $key, string $field, ?PostgresExecutor $conn = null): Future
-    {
-        $c = $this->resolveConn($conn);
-        return async(fn() => Utils::hget($c, $table, $key, $field));
-    }
-
-    public function hgetall(string $table, string $key, ?PostgresExecutor $conn = null): Future
-    {
-        $c = $this->resolveConn($conn);
-        return async(fn() => Utils::hgetall($c, $table, $key));
-    }
-
-    public function hdel(string $table, string $key, string $field, ?PostgresExecutor $conn = null): Future
-    {
-        $c = $this->resolveConn($conn);
-        return async(fn() => Utils::hdel($c, $table, $key, $field));
-    }
-
-    // Sorted Sets
-
-    public function zadd(string $table, string $member, float $score, ?PostgresExecutor $conn = null): Future
-    {
-        $c = $this->resolveConn($conn);
-        return async(fn() => Utils::zadd($c, $table, $member, $score));
-    }
-
-    public function zincrby(string $table, string $member, float $amount = 1, ?PostgresExecutor $conn = null): Future
-    {
-        $c = $this->resolveConn($conn);
-        return async(fn() => Utils::zincrby($c, $table, $member, $amount));
-    }
-
-    public function zrange(string $table, int $start = 0, int $stop = 10, bool $desc = true, ?PostgresExecutor $conn = null): Future
-    {
-        $c = $this->resolveConn($conn);
-        return async(fn() => Utils::zrange($c, $table, $start, $stop, $desc));
-    }
-
-    public function zrank(string $table, string $member, bool $desc = true, ?PostgresExecutor $conn = null): Future
-    {
-        $c = $this->resolveConn($conn);
-        return async(fn() => Utils::zrank($c, $table, $member, $desc));
-    }
-
-    public function zscore(string $table, string $member, ?PostgresExecutor $conn = null): Future
-    {
-        $c = $this->resolveConn($conn);
-        return async(fn() => Utils::zscore($c, $table, $member));
-    }
-
-    public function zrem(string $table, string $member, ?PostgresExecutor $conn = null): Future
-    {
-        $c = $this->resolveConn($conn);
-        return async(fn() => Utils::zrem($c, $table, $member));
-    }
-
-    // Geo
-
-    public function georadius(
-        string $table,
-        string $geomColumn,
-        float $lon,
-        float $lat,
-        float $radiusMeters,
-        int $limit = 50,
-        ?PostgresExecutor $conn = null,
-    ): Future {
-        $c = $this->resolveConn($conn);
-        return async(fn() => Utils::georadius($c, $table, $geomColumn, $lon, $lat, $radiusMeters, $limit));
-    }
-
-    public function geoadd(
-        string $table,
-        string $nameColumn,
-        string $geomColumn,
-        string $name,
-        float $lon,
-        float $lat,
-        ?PostgresExecutor $conn = null,
-    ): Future {
-        $c = $this->resolveConn($conn);
-        return async(fn() => Utils::geoadd($c, $table, $nameColumn, $geomColumn, $name, $lon, $lat));
-    }
-
-    public function geodist(
-        string $table,
-        string $geomColumn,
-        string $nameColumn,
-        string $nameA,
-        string $nameB,
-        ?PostgresExecutor $conn = null,
-    ): Future {
-        $c = $this->resolveConn($conn);
-        return async(fn() => Utils::geodist($c, $table, $geomColumn, $nameColumn, $nameA, $nameB));
-    }
+    // Phase 5 Redis-compat families: $gl->counters / $gl->zsets / $gl->hashes /
+    // $gl->queues / $gl->geos. The legacy flat methods (incr, hset, zadd,
+    // enqueue, geoadd, …) are gone — see src/Amp/{Counters,Zsets,Hashes,
+    // Queues,Geos}.php for the canonical surfaces.
 
     // Misc
 

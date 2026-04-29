@@ -282,143 +282,10 @@ class InstanceMethodsTest extends TestCase
         $gl->publish('events', 'hello');
     }
 
-    public function testEnqueueDelegates(): void
-    {
-        [$gl, $pdo] = $this->makeGlWithMockPDO();
-        $stmt = $this->makeMockStmt();
-
-        $pdo->method('exec')->willReturn(0);
-        $pdo->method('prepare')->willReturn($stmt);
-
-        $gl->enqueue('jobs', ['task' => 'send_email']);
-        $this->assertTrue(true); // No exception = pass
-    }
-
-    public function testDequeueDelegates(): void
-    {
-        [$gl, $pdo] = $this->makeGlWithMockPDO();
-        $stmt = $this->createMock(\PDOStatement::class);
-        $stmt->method('fetch')->willReturn([json_encode(['task' => 'send_email'])]);
-
-        $pdo->method('query')->willReturn($stmt);
-
-        $result = $gl->dequeue('jobs');
-        $this->assertSame(['task' => 'send_email'], $result);
-    }
-
-    // ========================================================================
-    // Counters instance methods
-    // ========================================================================
-
-    public function testIncrDelegates(): void
-    {
-        [$gl, $pdo] = $this->makeGlWithMockPDO();
-        $stmt = $this->createMock(\PDOStatement::class);
-        $stmt->method('execute')->willReturn(true);
-        $stmt->method('fetchColumn')->willReturn(5);
-
-        $pdo->method('exec')->willReturn(0);
-        $pdo->method('prepare')->willReturn($stmt);
-
-        $result = $gl->incr('counters', 'page_views');
-        $this->assertSame(5, $result);
-    }
-
-    public function testGetCounterDelegates(): void
-    {
-        [$gl, $pdo] = $this->makeGlWithMockPDO();
-        $stmt = $this->createMock(\PDOStatement::class);
-        $stmt->method('execute')->willReturn(true);
-        $stmt->method('fetchColumn')->willReturn(42);
-
-        $pdo->method('prepare')->willReturn($stmt);
-
-        $result = $gl->getCounter('counters', 'page_views');
-        $this->assertSame(42, $result);
-    }
-
-    // ========================================================================
-    // Hash instance methods
-    // ========================================================================
-
-    public function testHsetDelegates(): void
-    {
-        [$gl, $pdo] = $this->makeGlWithMockPDO();
-        $stmt = $this->makeMockStmt();
-
-        $pdo->method('exec')->willReturn(0);
-        $pdo->method('prepare')->willReturn($stmt);
-
-        $gl->hset('cache', 'user:1', 'name', 'Alice');
-        $this->assertTrue(true);
-    }
-
-    public function testHgetDelegates(): void
-    {
-        [$gl, $pdo] = $this->makeGlWithMockPDO();
-        $stmt = $this->createMock(\PDOStatement::class);
-        $stmt->method('execute')->willReturn(true);
-        $stmt->method('fetchColumn')->willReturn('Alice');
-
-        $pdo->method('prepare')->willReturn($stmt);
-
-        $result = $gl->hget('cache', 'user:1', 'name');
-        $this->assertSame('Alice', $result);
-    }
-
-    public function testHgetallDelegates(): void
-    {
-        [$gl, $pdo] = $this->makeGlWithMockPDO();
-        $stmt = $this->createMock(\PDOStatement::class);
-        $stmt->method('execute')->willReturn(true);
-        $stmt->method('fetchColumn')->willReturn('{"name":"Alice","age":"30"}');
-
-        $pdo->method('prepare')->willReturn($stmt);
-
-        $result = $gl->hgetall('cache', 'user:1');
-        $this->assertSame(['name' => 'Alice', 'age' => '30'], $result);
-    }
-
-    // ========================================================================
-    // Sorted Set instance methods
-    // ========================================================================
-
-    public function testZaddDelegates(): void
-    {
-        [$gl, $pdo] = $this->makeGlWithMockPDO();
-        $stmt = $this->makeMockStmt();
-
-        $pdo->method('exec')->willReturn(0);
-        $pdo->method('prepare')->willReturn($stmt);
-
-        $gl->zadd('leaderboard', 'alice', 100.0);
-        $this->assertTrue(true);
-    }
-
-    public function testZrangeDelegates(): void
-    {
-        [$gl, $pdo] = $this->makeGlWithMockPDO();
-        $rows = [['alice', 100.0], ['bob', 90.0]];
-        $stmt = $this->makeMockStmt($rows);
-
-        $pdo->method('prepare')->willReturn($stmt);
-
-        $result = $gl->zrange('leaderboard', 0, 10);
-        $this->assertCount(2, $result);
-    }
-
-    public function testZscoreDelegates(): void
-    {
-        [$gl, $pdo] = $this->makeGlWithMockPDO();
-        $stmt = $this->createMock(\PDOStatement::class);
-        $stmt->method('execute')->willReturn(true);
-        $stmt->method('fetchColumn')->willReturn(100.0);
-
-        $pdo->method('prepare')->willReturn($stmt);
-
-        $result = $gl->zscore('leaderboard', 'alice');
-        $this->assertSame(100.0, $result);
-    }
+    // Phase 5 Redis-compat (counter / zset / hash / queue / geo) is covered
+    // by the per-namespace tests under tests/{Counters,Zsets,Hashes,Queues,
+    // Geos}Test.php. The legacy flat instance methods (`incr`, `hset`,
+    // `zadd`, `enqueue`, `geoadd`, …) were removed in the Phase 5 hard cut.
 
     // ========================================================================
     // Stream instance methods
@@ -507,12 +374,15 @@ class InstanceMethodsTest extends TestCase
         $gl->search('articles', 'title', 'hello');
     }
 
-    public function testIncrThrowsWhenNotConnected(): void
+    public function testCounterIncrThrowsWhenNotConnected(): void
     {
         $gl = new GoldLapel('postgresql://user:pass@host:5432/db');
+        // Seed the cache so the dispatch reaches resolveConn() — that's the
+        // throw point we're guarding here, NOT the patterns fetch.
+        $this->seedDdlCache($gl, 'counter', 'counters', '_goldlapel.counter_counters');
         $this->expectException(RuntimeException::class);
         $this->expectExceptionMessage('Not connected');
-        $gl->incr('counters', 'views');
+        $gl->counters->incr('counters', 'views');
     }
 
     // ========================================================================

@@ -150,296 +150,36 @@ class Utils
         }
     }
 
-    public static function enqueue(\PDO $pdo, string $queueTable, array $payload): void
-    {
-        self::validateIdentifier($queueTable);
-        $pdo->exec("
-            CREATE TABLE IF NOT EXISTS {$queueTable} (
-                id BIGSERIAL PRIMARY KEY,
-                payload JSONB NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )
-        ");
-        $stmt = $pdo->prepare("INSERT INTO {$queueTable} (payload) VALUES (?)");
-        $stmt->execute([json_encode($payload)]);
-    }
+    // ========================================================================
+    // Phase 5 Redis-compat families: counter / zset / hash / queue / geo.
+    //
+    // Each family's helpers consume `$patterns` returned from the proxy's
+    // `/api/ddl/<family>/create` endpoint and translate `$N`-style placeholders
+    // to PDO's `?` via `Ddl::toPdoPlaceholders`. The proxy owns DDL — these
+    // helpers never CREATE TABLE.
+    //
+    // Breaking changes from Phase 4:
+    //   counter — `updated_at` column stamped on every UPDATE
+    //   zset    — `$zsetKey` partitions sorted sets within one namespace
+    //   hash    — row-per-field storage (NOT JSONB-blob-per-key)
+    //   queue   — at-least-once with visibility-timeout (`claim`/`ack`),
+    //             `dequeue` shim removed
+    //   geo     — GEOGRAPHY-native (no `::geography` casts), `add` is
+    //             idempotent on member name
+    // ========================================================================
 
-    public static function dequeue(\PDO $pdo, string $queueTable): ?array
-    {
-        self::validateIdentifier($queueTable);
-        $stmt = $pdo->query("
-            DELETE FROM {$queueTable}
-            WHERE id = (
-                SELECT id FROM {$queueTable}
-                ORDER BY id
-                FOR UPDATE SKIP LOCKED
-                LIMIT 1
-            )
-            RETURNING payload
-        ");
-        $row = $stmt->fetch(\PDO::FETCH_NUM);
-        if ($row === false) {
-            return null;
-        }
-        $value = $row[0];
-        return is_array($value) ? $value : json_decode($value, true);
-    }
-
-    public static function incr(\PDO $pdo, string $table, string $key, int $amount = 1): int
-    {
-        self::validateIdentifier($table);
-        $pdo->exec("
-            CREATE TABLE IF NOT EXISTS {$table} (
-                key TEXT PRIMARY KEY,
-                value BIGINT NOT NULL DEFAULT 0
-            )
-        ");
-        $stmt = $pdo->prepare("
-            INSERT INTO {$table} (key, value) VALUES (?, ?)
-            ON CONFLICT (key) DO UPDATE SET value = {$table}.value + ?
-            RETURNING value
-        ");
-        $stmt->execute([$key, $amount, $amount]);
-        return (int) $stmt->fetchColumn();
-    }
-
-    public static function getCounter(\PDO $pdo, string $table, string $key): int
-    {
-        self::validateIdentifier($table);
-        $stmt = $pdo->prepare("SELECT value FROM {$table} WHERE key = ?");
-        $stmt->execute([$key]);
-        $value = $stmt->fetchColumn();
-        return $value !== false ? (int) $value : 0;
-    }
-
-    public static function zadd(\PDO $pdo, string $table, string $member, float $score): void
-    {
-        self::validateIdentifier($table);
-        $pdo->exec("
-            CREATE TABLE IF NOT EXISTS {$table} (
-                member TEXT PRIMARY KEY,
-                score DOUBLE PRECISION NOT NULL
-            )
-        ");
-        $stmt = $pdo->prepare("
-            INSERT INTO {$table} (member, score) VALUES (?, ?)
-            ON CONFLICT (member) DO UPDATE SET score = EXCLUDED.score
-        ");
-        $stmt->execute([$member, $score]);
-    }
-
-    public static function zincrby(\PDO $pdo, string $table, string $member, float $amount = 1): float
-    {
-        self::validateIdentifier($table);
-        $pdo->exec("
-            CREATE TABLE IF NOT EXISTS {$table} (
-                member TEXT PRIMARY KEY,
-                score DOUBLE PRECISION NOT NULL
-            )
-        ");
-        $stmt = $pdo->prepare("
-            INSERT INTO {$table} (member, score) VALUES (?, ?)
-            ON CONFLICT (member) DO UPDATE SET score = {$table}.score + ?
-            RETURNING score
-        ");
-        $stmt->execute([$member, $amount, $amount]);
-        return (float) $stmt->fetchColumn();
-    }
-
-    public static function zrange(\PDO $pdo, string $table, int $start = 0, int $stop = 10, bool $desc = true): array
-    {
-        self::validateIdentifier($table);
-        $order = $desc ? 'DESC' : 'ASC';
-        $limit = $stop - $start;
-        $stmt = $pdo->prepare("
-            SELECT member, score FROM {$table}
-            ORDER BY score {$order}
-            LIMIT ? OFFSET ?
-        ");
-        $stmt->execute([$limit, $start]);
-        return $stmt->fetchAll(\PDO::FETCH_NUM);
-    }
-
-    public static function zrank(\PDO $pdo, string $table, string $member, bool $desc = true): ?int
-    {
-        self::validateIdentifier($table);
-        $order = $desc ? 'DESC' : 'ASC';
-        $stmt = $pdo->prepare("
-            SELECT rank FROM (
-                SELECT member, ROW_NUMBER() OVER (ORDER BY score {$order}) - 1 AS rank
-                FROM {$table}
-            ) ranked
-            WHERE member = ?
-        ");
-        $stmt->execute([$member]);
-        $value = $stmt->fetchColumn();
-        return $value !== false ? (int) $value : null;
-    }
-
-    public static function zscore(\PDO $pdo, string $table, string $member): ?float
-    {
-        self::validateIdentifier($table);
-        $stmt = $pdo->prepare("SELECT score FROM {$table} WHERE member = ?");
-        $stmt->execute([$member]);
-        $value = $stmt->fetchColumn();
-        return $value !== false ? (float) $value : null;
-    }
-
-    public static function zrem(\PDO $pdo, string $table, string $member): bool
-    {
-        self::validateIdentifier($table);
-        $stmt = $pdo->prepare("DELETE FROM {$table} WHERE member = ?");
-        $stmt->execute([$member]);
-        return $stmt->rowCount() > 0;
-    }
-
-    public static function geoadd(
-        \PDO $pdo,
-        string $table,
-        string $nameColumn,
-        string $geomColumn,
-        string $name,
-        float $lon,
-        float $lat,
-    ): void {
-        self::validateIdentifier($table);
-        self::validateIdentifier($nameColumn);
-        self::validateIdentifier($geomColumn);
-        $pdo->exec("CREATE EXTENSION IF NOT EXISTS postgis");
-        $pdo->exec("
-            CREATE TABLE IF NOT EXISTS {$table} (
-                id BIGSERIAL PRIMARY KEY,
-                {$nameColumn} TEXT NOT NULL,
-                {$geomColumn} GEOMETRY(Point, 4326) NOT NULL
-            )
-        ");
-        $stmt = $pdo->prepare("
-            INSERT INTO {$table} ({$nameColumn}, {$geomColumn})
-            VALUES (?, ST_SetSRID(ST_MakePoint(?, ?), 4326))
-        ");
-        $stmt->execute([$name, $lon, $lat]);
-    }
-
-    public static function georadius(
-        \PDO $pdo,
-        string $table,
-        string $geomColumn,
-        float $lon,
-        float $lat,
-        float $radiusMeters,
-        int $limit = 50,
-    ): array {
-        self::validateIdentifier($table);
-        self::validateIdentifier($geomColumn);
-        $stmt = $pdo->prepare("
-            SELECT *, ST_Distance(
-                {$geomColumn}::geography,
-                ST_SetSRID(ST_MakePoint(?, ?), 4326)::geography
-            ) AS distance_m
-            FROM {$table}
-            WHERE ST_DWithin(
-                {$geomColumn}::geography,
-                ST_SetSRID(ST_MakePoint(?, ?), 4326)::geography,
-                ?
-            )
-            ORDER BY distance_m
-            LIMIT ?
-        ");
-        $stmt->execute([$lon, $lat, $lon, $lat, $radiusMeters, $limit]);
-        return $stmt->fetchAll(\PDO::FETCH_ASSOC);
-    }
-
-    public static function geodist(
-        \PDO $pdo,
-        string $table,
-        string $geomColumn,
-        string $nameColumn,
-        string $nameA,
-        string $nameB,
-    ): ?float {
-        self::validateIdentifier($table);
-        self::validateIdentifier($geomColumn);
-        self::validateIdentifier($nameColumn);
-        $stmt = $pdo->prepare("
-            SELECT ST_Distance(a.{$geomColumn}::geography, b.{$geomColumn}::geography)
-            FROM {$table} a, {$table} b
-            WHERE a.{$nameColumn} = ? AND b.{$nameColumn} = ?
-        ");
-        $stmt->execute([$nameA, $nameB]);
-        $value = $stmt->fetchColumn();
-        return $value !== false ? (float) $value : null;
-    }
-
-    public static function hset(\PDO $pdo, string $table, string $key, string $field, mixed $value): void
-    {
-        self::validateIdentifier($table);
-        $pdo->exec("
-            CREATE TABLE IF NOT EXISTS {$table} (
-                key TEXT PRIMARY KEY,
-                data JSONB NOT NULL DEFAULT '{}'::jsonb
-            )
-        ");
-        $json = json_encode($value);
-        $stmt = $pdo->prepare("
-            INSERT INTO {$table} (key, data) VALUES (?, jsonb_build_object(?, ?::jsonb))
-            ON CONFLICT (key) DO UPDATE SET data = {$table}.data || jsonb_build_object(?, ?::jsonb)
-        ");
-        $stmt->execute([$key, $field, $json, $field, $json]);
-    }
-
-    public static function hget(\PDO $pdo, string $table, string $key, string $field): mixed
-    {
-        self::validateIdentifier($table);
-        $stmt = $pdo->prepare("SELECT data->>? FROM {$table} WHERE key = ?");
-        $stmt->execute([$field, $key]);
-        $value = $stmt->fetchColumn();
-        if ($value === false || $value === null) {
-            return null;
-        }
-        $decoded = json_decode($value, true);
-        return json_last_error() === JSON_ERROR_NONE ? $decoded : $value;
-    }
-
-    public static function hgetall(\PDO $pdo, string $table, string $key): array
-    {
-        self::validateIdentifier($table);
-        $stmt = $pdo->prepare("SELECT data FROM {$table} WHERE key = ?");
-        $stmt->execute([$key]);
-        $value = $stmt->fetchColumn();
-        if ($value === false || $value === null) {
-            return [];
-        }
-        return json_decode($value, true) ?? [];
-    }
-
-    public static function hdel(\PDO $pdo, string $table, string $key, string $field): bool
-    {
-        self::validateIdentifier($table);
-        $stmt = $pdo->prepare("SELECT data ? ? AS existed FROM {$table} WHERE key = ?");
-        $stmt->execute([$field, $key]);
-        $row = $stmt->fetch(\PDO::FETCH_ASSOC);
-        if ($row === false || !$row['existed']) {
-            return false;
-        }
-        $stmt = $pdo->prepare("UPDATE {$table} SET data = data - ? WHERE key = ?");
-        $stmt->execute([$field, $key]);
-        return true;
-    }
-
-    public static function countDistinct(\PDO $pdo, string $table, string $column): int
-    {
-        self::validateIdentifier($table);
-        self::validateIdentifier($column);
-        $stmt = $pdo->query("SELECT COUNT(DISTINCT {$column}) FROM {$table}");
-        return (int) $stmt->fetchColumn();
-    }
-
-    private static function requireStreamPattern(?array $patterns, string $key, string $fn): string
+    /**
+     * Pull a query pattern from the proxy's response and translate `$N → ?`
+     * for PDO. `$family` and `$fn` are only used for an actionable error
+     * message when callers forget `$patterns=` (i.e. they invoked the util
+     * directly rather than via the namespaced API).
+     */
+    private static function requireFamilyPattern(?array $patterns, string $key, string $family, string $fn): string
     {
         if ($patterns === null || !isset($patterns['query_patterns'])) {
             throw new \RuntimeException(
                 "{$fn} requires DDL patterns from the proxy — call via "
-                . "\$gl->{$fn}(...) rather than Utils::{$fn} directly."
+                . "\$gl->{$family}s-><verb>(...) rather than Utils::{$fn} directly."
             );
         }
         $qp = $patterns['query_patterns'];
@@ -451,10 +191,538 @@ class Utils
         return Ddl::toPdoPlaceholders($qp[$key]);
     }
 
+    /**
+     * Decode a JSONB column value into the user's PHP value. PDO/pgsql hands
+     * us the raw JSON text (string). If decoding fails, return the input
+     * unchanged rather than raising — the column may have been written by
+     * something other than this helper, and surfacing a JSON error on
+     * `hashGet` would be user-hostile.
+     */
+    private static function decodeJsonb(mixed $value): mixed
+    {
+        if ($value === null) {
+            return null;
+        }
+        if (!is_string($value)) {
+            return $value;
+        }
+        $decoded = json_decode($value, true);
+        return json_last_error() === JSON_ERROR_NONE ? $decoded : $value;
+    }
+
+    // ----- Counter family ---------------------------------------------------
+
+    public static function counterIncr(\PDO $pdo, string $name, string $key, int $amount = 1, ?array $patterns = null): int
+    {
+        self::validateIdentifier($name);
+        $sql = self::requireFamilyPattern($patterns, 'incr', 'counter', 'counterIncr');
+        $stmt = $pdo->prepare($sql);
+        $stmt->execute([$key, $amount]);
+        return (int) $stmt->fetchColumn();
+    }
+
+    public static function counterDecr(\PDO $pdo, string $name, string $key, int $amount = 1, ?array $patterns = null): int
+    {
+        // Decrement is incr with a negative amount. The proxy's `incr` pattern
+        // adds EXCLUDED.value, so passing a negative drives the value down.
+        return self::counterIncr($pdo, $name, $key, -$amount, $patterns);
+    }
+
+    public static function counterSet(\PDO $pdo, string $name, string $key, int $value, ?array $patterns = null): int
+    {
+        self::validateIdentifier($name);
+        $sql = self::requireFamilyPattern($patterns, 'set', 'counter', 'counterSet');
+        $stmt = $pdo->prepare($sql);
+        $stmt->execute([$key, $value]);
+        return (int) $stmt->fetchColumn();
+    }
+
+    public static function counterGet(\PDO $pdo, string $name, string $key, ?array $patterns = null): int
+    {
+        self::validateIdentifier($name);
+        $sql = self::requireFamilyPattern($patterns, 'get', 'counter', 'counterGet');
+        $stmt = $pdo->prepare($sql);
+        $stmt->execute([$key]);
+        $value = $stmt->fetchColumn();
+        return $value !== false && $value !== null ? (int) $value : 0;
+    }
+
+    public static function counterDelete(\PDO $pdo, string $name, string $key, ?array $patterns = null): bool
+    {
+        self::validateIdentifier($name);
+        $sql = self::requireFamilyPattern($patterns, 'delete', 'counter', 'counterDelete');
+        $stmt = $pdo->prepare($sql);
+        $stmt->execute([$key]);
+        return $stmt->rowCount() > 0;
+    }
+
+    public static function counterCountKeys(\PDO $pdo, string $name, ?array $patterns = null): int
+    {
+        self::validateIdentifier($name);
+        $sql = self::requireFamilyPattern($patterns, 'count_keys', 'counter', 'counterCountKeys');
+        $stmt = $pdo->prepare($sql);
+        $stmt->execute();
+        $value = $stmt->fetchColumn();
+        return $value !== false && $value !== null ? (int) $value : 0;
+    }
+
+    // ----- Sorted-set (zset) family -----------------------------------------
+
+    public static function zsetAdd(\PDO $pdo, string $name, string $zsetKey, string $member, float $score, ?array $patterns = null): float
+    {
+        self::validateIdentifier($name);
+        $sql = self::requireFamilyPattern($patterns, 'zadd', 'zset', 'zsetAdd');
+        $stmt = $pdo->prepare($sql);
+        $stmt->execute([$zsetKey, $member, $score]);
+        return (float) $stmt->fetchColumn();
+    }
+
+    public static function zsetIncrBy(\PDO $pdo, string $name, string $zsetKey, string $member, float $delta = 1.0, ?array $patterns = null): float
+    {
+        self::validateIdentifier($name);
+        $sql = self::requireFamilyPattern($patterns, 'zincrby', 'zset', 'zsetIncrBy');
+        $stmt = $pdo->prepare($sql);
+        $stmt->execute([$zsetKey, $member, $delta]);
+        return (float) $stmt->fetchColumn();
+    }
+
+    public static function zsetScore(\PDO $pdo, string $name, string $zsetKey, string $member, ?array $patterns = null): ?float
+    {
+        self::validateIdentifier($name);
+        $sql = self::requireFamilyPattern($patterns, 'zscore', 'zset', 'zsetScore');
+        $stmt = $pdo->prepare($sql);
+        $stmt->execute([$zsetKey, $member]);
+        $value = $stmt->fetchColumn();
+        return $value !== false && $value !== null ? (float) $value : null;
+    }
+
+    public static function zsetRemove(\PDO $pdo, string $name, string $zsetKey, string $member, ?array $patterns = null): bool
+    {
+        self::validateIdentifier($name);
+        $sql = self::requireFamilyPattern($patterns, 'zrem', 'zset', 'zsetRemove');
+        $stmt = $pdo->prepare($sql);
+        $stmt->execute([$zsetKey, $member]);
+        return $stmt->rowCount() > 0;
+    }
+
+    /**
+     * Members by rank within `$zsetKey`. Returns a list of `[member, score]`
+     * tuples. `$desc=true` orders highest first (leaderboard order). `$start`
+     * and `$stop` are 0-based inclusive bounds Redis-style; SQL converts to
+     * LIMIT/OFFSET.
+     */
+    public static function zsetRange(\PDO $pdo, string $name, string $zsetKey, int $start = 0, int $stop = 10, bool $desc = true, ?array $patterns = null): array
+    {
+        self::validateIdentifier($name);
+        $key = $desc ? 'zrange_desc' : 'zrange_asc';
+        $sql = self::requireFamilyPattern($patterns, $key, 'zset', 'zsetRange');
+        $limit = max(0, $stop - $start + 1);
+        $stmt = $pdo->prepare($sql);
+        $stmt->execute([$zsetKey, $limit, $start]);
+        $rows = $stmt->fetchAll(\PDO::FETCH_NUM);
+        $out = [];
+        foreach ($rows as $r) {
+            $out[] = [$r[0], (float) $r[1]];
+        }
+        return $out;
+    }
+
+    public static function zsetRangeByScore(\PDO $pdo, string $name, string $zsetKey, float $minScore, float $maxScore, int $limit = 100, int $offset = 0, ?array $patterns = null): array
+    {
+        self::validateIdentifier($name);
+        $sql = self::requireFamilyPattern($patterns, 'zrangebyscore', 'zset', 'zsetRangeByScore');
+        $stmt = $pdo->prepare($sql);
+        $stmt->execute([$zsetKey, $minScore, $maxScore, $limit, $offset]);
+        $rows = $stmt->fetchAll(\PDO::FETCH_NUM);
+        $out = [];
+        foreach ($rows as $r) {
+            $out[] = [$r[0], (float) $r[1]];
+        }
+        return $out;
+    }
+
+    public static function zsetRank(\PDO $pdo, string $name, string $zsetKey, string $member, bool $desc = true, ?array $patterns = null): ?int
+    {
+        self::validateIdentifier($name);
+        $key = $desc ? 'zrank_desc' : 'zrank_asc';
+        $sql = self::requireFamilyPattern($patterns, $key, 'zset', 'zsetRank');
+        $stmt = $pdo->prepare($sql);
+        $stmt->execute([$zsetKey, $member]);
+        $value = $stmt->fetchColumn();
+        return $value !== false && $value !== null ? (int) $value : null;
+    }
+
+    public static function zsetCard(\PDO $pdo, string $name, string $zsetKey, ?array $patterns = null): int
+    {
+        self::validateIdentifier($name);
+        $sql = self::requireFamilyPattern($patterns, 'zcard', 'zset', 'zsetCard');
+        $stmt = $pdo->prepare($sql);
+        $stmt->execute([$zsetKey]);
+        $value = $stmt->fetchColumn();
+        return $value !== false && $value !== null ? (int) $value : 0;
+    }
+
+    // ----- Hash family ------------------------------------------------------
+
+    public static function hashSet(\PDO $pdo, string $name, string $hashKey, string $field, mixed $value, ?array $patterns = null): mixed
+    {
+        self::validateIdentifier($name);
+        $sql = self::requireFamilyPattern($patterns, 'hset', 'hash', 'hashSet');
+        $stmt = $pdo->prepare($sql);
+        $stmt->execute([$hashKey, $field, json_encode($value)]);
+        $row = $stmt->fetch(\PDO::FETCH_NUM);
+        if ($row === false) {
+            return null;
+        }
+        return self::decodeJsonb($row[0]);
+    }
+
+    public static function hashGet(\PDO $pdo, string $name, string $hashKey, string $field, ?array $patterns = null): mixed
+    {
+        self::validateIdentifier($name);
+        $sql = self::requireFamilyPattern($patterns, 'hget', 'hash', 'hashGet');
+        $stmt = $pdo->prepare($sql);
+        $stmt->execute([$hashKey, $field]);
+        $row = $stmt->fetch(\PDO::FETCH_NUM);
+        if ($row === false) {
+            return null;
+        }
+        return self::decodeJsonb($row[0]);
+    }
+
+    public static function hashGetAll(\PDO $pdo, string $name, string $hashKey, ?array $patterns = null): array
+    {
+        self::validateIdentifier($name);
+        $sql = self::requireFamilyPattern($patterns, 'hgetall', 'hash', 'hashGetAll');
+        $stmt = $pdo->prepare($sql);
+        $stmt->execute([$hashKey]);
+        $out = [];
+        while (($row = $stmt->fetch(\PDO::FETCH_NUM)) !== false) {
+            $out[(string) $row[0]] = self::decodeJsonb($row[1]);
+        }
+        return $out;
+    }
+
+    public static function hashKeys(\PDO $pdo, string $name, string $hashKey, ?array $patterns = null): array
+    {
+        self::validateIdentifier($name);
+        $sql = self::requireFamilyPattern($patterns, 'hkeys', 'hash', 'hashKeys');
+        $stmt = $pdo->prepare($sql);
+        $stmt->execute([$hashKey]);
+        return array_map(static fn ($r) => (string) $r[0], $stmt->fetchAll(\PDO::FETCH_NUM));
+    }
+
+    public static function hashValues(\PDO $pdo, string $name, string $hashKey, ?array $patterns = null): array
+    {
+        self::validateIdentifier($name);
+        $sql = self::requireFamilyPattern($patterns, 'hvals', 'hash', 'hashValues');
+        $stmt = $pdo->prepare($sql);
+        $stmt->execute([$hashKey]);
+        return array_map(static fn ($r) => self::decodeJsonb($r[0]), $stmt->fetchAll(\PDO::FETCH_NUM));
+    }
+
+    public static function hashExists(\PDO $pdo, string $name, string $hashKey, string $field, ?array $patterns = null): bool
+    {
+        self::validateIdentifier($name);
+        $sql = self::requireFamilyPattern($patterns, 'hexists', 'hash', 'hashExists');
+        $stmt = $pdo->prepare($sql);
+        $stmt->execute([$hashKey, $field]);
+        $value = $stmt->fetchColumn();
+        // Postgres EXISTS returns boolean; PDO can hand it back as 't'/'f',
+        // 1/0, or true/false depending on driver attrs. Coerce defensively.
+        if ($value === false || $value === null) {
+            return false;
+        }
+        if (is_bool($value)) {
+            return $value;
+        }
+        if (is_string($value)) {
+            return $value === 't' || $value === '1' || strcasecmp($value, 'true') === 0;
+        }
+        return (bool) $value;
+    }
+
+    public static function hashDelete(\PDO $pdo, string $name, string $hashKey, string $field, ?array $patterns = null): bool
+    {
+        self::validateIdentifier($name);
+        $sql = self::requireFamilyPattern($patterns, 'hdel', 'hash', 'hashDelete');
+        $stmt = $pdo->prepare($sql);
+        $stmt->execute([$hashKey, $field]);
+        return $stmt->rowCount() > 0;
+    }
+
+    public static function hashLen(\PDO $pdo, string $name, string $hashKey, ?array $patterns = null): int
+    {
+        self::validateIdentifier($name);
+        $sql = self::requireFamilyPattern($patterns, 'hlen', 'hash', 'hashLen');
+        $stmt = $pdo->prepare($sql);
+        $stmt->execute([$hashKey]);
+        $value = $stmt->fetchColumn();
+        return $value !== false && $value !== null ? (int) $value : 0;
+    }
+
+    // ----- Queue family (at-least-once with visibility timeout) -------------
+
+    public static function queueEnqueue(\PDO $pdo, string $name, mixed $payload, ?array $patterns = null): ?int
+    {
+        self::validateIdentifier($name);
+        $sql = self::requireFamilyPattern($patterns, 'enqueue', 'queue', 'queueEnqueue');
+        $stmt = $pdo->prepare($sql);
+        $stmt->execute([json_encode($payload)]);
+        $row = $stmt->fetch(\PDO::FETCH_NUM);
+        if ($row === false) {
+            return null;
+        }
+        return (int) $row[0];
+    }
+
+    /**
+     * Lease the next ready message. Returns `['id' => int, 'payload' => mixed]`
+     * or `null` when the queue is empty. Caller MUST `queueAck($id)` or
+     * `queueAbandon($id)` — otherwise the message becomes visible again
+     * after `$visibilityTimeoutMs` and is redelivered to the next claim.
+     */
+    public static function queueClaim(\PDO $pdo, string $name, int $visibilityTimeoutMs = 30000, ?array $patterns = null): ?array
+    {
+        self::validateIdentifier($name);
+        $sql = self::requireFamilyPattern($patterns, 'claim', 'queue', 'queueClaim');
+        $stmt = $pdo->prepare($sql);
+        $stmt->execute([$visibilityTimeoutMs]);
+        $row = $stmt->fetch(\PDO::FETCH_NUM);
+        if ($row === false) {
+            return null;
+        }
+        return [
+            'id' => (int) $row[0],
+            'payload' => self::decodeJsonb($row[1] ?? null),
+        ];
+    }
+
+    public static function queueAck(\PDO $pdo, string $name, int $messageId, ?array $patterns = null): bool
+    {
+        self::validateIdentifier($name);
+        $sql = self::requireFamilyPattern($patterns, 'ack', 'queue', 'queueAck');
+        $stmt = $pdo->prepare($sql);
+        $stmt->execute([$messageId]);
+        return $stmt->rowCount() > 0;
+    }
+
+    /**
+     * Release a claimed message back to ready immediately (NACK). The
+     * message stays in the queue and is redelivered on the next claim,
+     * without waiting for the visibility timeout to expire.
+     */
+    public static function queueAbandon(\PDO $pdo, string $name, int $messageId, ?array $patterns = null): bool
+    {
+        self::validateIdentifier($name);
+        $sql = self::requireFamilyPattern($patterns, 'nack', 'queue', 'queueAbandon');
+        $stmt = $pdo->prepare($sql);
+        $stmt->execute([$messageId]);
+        $row = $stmt->fetch(\PDO::FETCH_NUM);
+        return $row !== false;
+    }
+
+    public static function queueExtend(\PDO $pdo, string $name, int $messageId, int $additionalMs, ?array $patterns = null): mixed
+    {
+        self::validateIdentifier($name);
+        $sql = self::requireFamilyPattern($patterns, 'extend', 'queue', 'queueExtend');
+        $stmt = $pdo->prepare($sql);
+        // Proxy contract: $1=id, $2=additional_ms (source order). PDO `?`
+        // binding fills positionally — pass [id, additional_ms].
+        $stmt->execute([$messageId, $additionalMs]);
+        $row = $stmt->fetch(\PDO::FETCH_NUM);
+        if ($row === false) {
+            return null;
+        }
+        return $row[0];
+    }
+
+    public static function queuePeek(\PDO $pdo, string $name, ?array $patterns = null): ?array
+    {
+        self::validateIdentifier($name);
+        $sql = self::requireFamilyPattern($patterns, 'peek', 'queue', 'queuePeek');
+        $stmt = $pdo->prepare($sql);
+        $stmt->execute();
+        $row = $stmt->fetch(\PDO::FETCH_NUM);
+        if ($row === false) {
+            return null;
+        }
+        return [
+            'id' => (int) $row[0],
+            'payload' => self::decodeJsonb($row[1] ?? null),
+            'visible_at' => $row[2] ?? null,
+            'status' => $row[3] ?? null,
+            'created_at' => $row[4] ?? null,
+        ];
+    }
+
+    public static function queueCountReady(\PDO $pdo, string $name, ?array $patterns = null): int
+    {
+        self::validateIdentifier($name);
+        $sql = self::requireFamilyPattern($patterns, 'count_ready', 'queue', 'queueCountReady');
+        $stmt = $pdo->prepare($sql);
+        $stmt->execute();
+        $value = $stmt->fetchColumn();
+        return $value !== false && $value !== null ? (int) $value : 0;
+    }
+
+    public static function queueCountClaimed(\PDO $pdo, string $name, ?array $patterns = null): int
+    {
+        self::validateIdentifier($name);
+        $sql = self::requireFamilyPattern($patterns, 'count_claimed', 'queue', 'queueCountClaimed');
+        $stmt = $pdo->prepare($sql);
+        $stmt->execute();
+        $value = $stmt->fetchColumn();
+        return $value !== false && $value !== null ? (int) $value : 0;
+    }
+
+    // ----- Geo family (PostGIS GEOGRAPHY-native) ----------------------------
+
+    /**
+     * Distance-unit conversion factors. Proxy returns/accepts meters always
+     * (GEOGRAPHY default); wrappers translate at the edge so callers can ask
+     * in km/mi/ft.
+     */
+    private const GEO_UNIT_FACTORS = [
+        'm' => 1.0,
+        'km' => 1000.0,
+        'mi' => 1609.344,
+        'ft' => 0.3048,
+    ];
+
+    private static function geoToMeters(float $value, string $unit): float
+    {
+        if (!isset(self::GEO_UNIT_FACTORS[$unit])) {
+            throw new \InvalidArgumentException(
+                "Unknown distance unit: '{$unit}' (choose m/km/mi/ft)"
+            );
+        }
+        return $value * self::GEO_UNIT_FACTORS[$unit];
+    }
+
+    private static function geoFromMeters(float $meters, string $unit): float
+    {
+        if (!isset(self::GEO_UNIT_FACTORS[$unit])) {
+            throw new \InvalidArgumentException(
+                "Unknown distance unit: '{$unit}' (choose m/km/mi/ft)"
+            );
+        }
+        return $meters / self::GEO_UNIT_FACTORS[$unit];
+    }
+
+    /**
+     * Set-or-update a member's lon/lat. Idempotent on the member name
+     * (TEXT PRIMARY KEY); re-adding updates the location. Returns the
+     * just-stored `[lon, lat]` array.
+     */
+    public static function geoAdd(\PDO $pdo, string $name, string $member, float $lon, float $lat, ?array $patterns = null): ?array
+    {
+        self::validateIdentifier($name);
+        $sql = self::requireFamilyPattern($patterns, 'geoadd', 'geo', 'geoAdd');
+        $stmt = $pdo->prepare($sql);
+        $stmt->execute([$member, $lon, $lat]);
+        $row = $stmt->fetch(\PDO::FETCH_NUM);
+        if ($row === false) {
+            return null;
+        }
+        return [(float) $row[0], (float) $row[1]];
+    }
+
+    public static function geoPos(\PDO $pdo, string $name, string $member, ?array $patterns = null): ?array
+    {
+        self::validateIdentifier($name);
+        $sql = self::requireFamilyPattern($patterns, 'geopos', 'geo', 'geoPos');
+        $stmt = $pdo->prepare($sql);
+        $stmt->execute([$member]);
+        $row = $stmt->fetch(\PDO::FETCH_NUM);
+        if ($row === false) {
+            return null;
+        }
+        return [(float) $row[0], (float) $row[1]];
+    }
+
+    public static function geoDist(\PDO $pdo, string $name, string $memberA, string $memberB, string $unit = 'm', ?array $patterns = null): ?float
+    {
+        self::validateIdentifier($name);
+        $sql = self::requireFamilyPattern($patterns, 'geodist', 'geo', 'geoDist');
+        $stmt = $pdo->prepare($sql);
+        $stmt->execute([$memberA, $memberB]);
+        $value = $stmt->fetchColumn();
+        if ($value === false || $value === null) {
+            return null;
+        }
+        return self::geoFromMeters((float) $value, $unit);
+    }
+
+    /**
+     * Members within `$radius` of (`$lon`, `$lat`). Returns a list of dicts
+     * with `member`, `lon`, `lat`, `distance_m`.
+     *
+     * Proxy contract: `$1=lon, $2=lat, $3=radius_m, $4=limit`. The proxy's
+     * CTE-anchor pattern means each `$N` appears exactly once in the SQL —
+     * after `$N → ?` translation we bind in `[lon, lat, radius_m, limit]`
+     * order, matching both the source and the binding contract.
+     */
+    public static function geoRadius(\PDO $pdo, string $name, float $lon, float $lat, float $radius, string $unit = 'm', int $limit = 50, ?array $patterns = null): array
+    {
+        self::validateIdentifier($name);
+        $sql = self::requireFamilyPattern($patterns, 'georadius_with_dist', 'geo', 'geoRadius');
+        $radiusM = self::geoToMeters($radius, $unit);
+        $stmt = $pdo->prepare($sql);
+        $stmt->execute([$lon, $lat, $radiusM, $limit]);
+        return $stmt->fetchAll(\PDO::FETCH_ASSOC);
+    }
+
+    /**
+     * Members within `$radius` of `$member`'s location. Returns a list of
+     * dicts with `member`, `lon`, `lat`, `distance_m`.
+     *
+     * Proxy contract: `$1`+`$2` both bind the anchor member name (one for the
+     * join, one for the self-exclusion); `$3=radius_m, $4=limit`. After
+     * `$N → ?` translation, source-text order yields four `?` markers, so
+     * we bind `[member, member, radius_m, limit]`.
+     */
+    public static function geoRadiusByMember(\PDO $pdo, string $name, string $member, float $radius, string $unit = 'm', int $limit = 50, ?array $patterns = null): array
+    {
+        self::validateIdentifier($name);
+        $sql = self::requireFamilyPattern($patterns, 'geosearch_member', 'geo', 'geoRadiusByMember');
+        $radiusM = self::geoToMeters($radius, $unit);
+        $stmt = $pdo->prepare($sql);
+        $stmt->execute([$member, $member, $radiusM, $limit]);
+        return $stmt->fetchAll(\PDO::FETCH_ASSOC);
+    }
+
+    public static function geoRemove(\PDO $pdo, string $name, string $member, ?array $patterns = null): bool
+    {
+        self::validateIdentifier($name);
+        $sql = self::requireFamilyPattern($patterns, 'geo_remove', 'geo', 'geoRemove');
+        $stmt = $pdo->prepare($sql);
+        $stmt->execute([$member]);
+        return $stmt->rowCount() > 0;
+    }
+
+    public static function geoCount(\PDO $pdo, string $name, ?array $patterns = null): int
+    {
+        self::validateIdentifier($name);
+        $sql = self::requireFamilyPattern($patterns, 'geo_count', 'geo', 'geoCount');
+        $stmt = $pdo->prepare($sql);
+        $stmt->execute();
+        $value = $stmt->fetchColumn();
+        return $value !== false && $value !== null ? (int) $value : 0;
+    }
+
+    public static function countDistinct(\PDO $pdo, string $table, string $column): int
+    {
+        self::validateIdentifier($table);
+        self::validateIdentifier($column);
+        $stmt = $pdo->query("SELECT COUNT(DISTINCT {$column}) FROM {$table}");
+        return (int) $stmt->fetchColumn();
+    }
+
     public static function streamAdd(\PDO $pdo, string $stream, array $payload, ?array $patterns = null): int
     {
         self::validateIdentifier($stream);
-        $sql = self::requireStreamPattern($patterns, 'insert', 'streamAdd');
+        $sql = self::requireFamilyPattern($patterns, 'insert', 'stream', 'streamAdd');
         // JSONB binding through PDO: cast at the SQL site.
         $withCast = str_replace('VALUES (?)', 'VALUES (?::jsonb)', $sql);
         $stmt = $pdo->prepare($withCast);
@@ -465,7 +733,7 @@ class Utils
     public static function streamCreateGroup(\PDO $pdo, string $stream, string $group, ?array $patterns = null): void
     {
         self::validateIdentifier($stream);
-        $sql = self::requireStreamPattern($patterns, 'create_group', 'streamCreateGroup');
+        $sql = self::requireFamilyPattern($patterns, 'create_group', 'stream', 'streamCreateGroup');
         $stmt = $pdo->prepare($sql);
         $stmt->execute([$group]);
     }
@@ -473,10 +741,10 @@ class Utils
     public static function streamRead(\PDO $pdo, string $stream, string $group, string $consumer, int $count = 1, ?array $patterns = null): array
     {
         self::validateIdentifier($stream);
-        $cursorSql = self::requireStreamPattern($patterns, 'group_get_cursor', 'streamRead');
-        $readSql = self::requireStreamPattern($patterns, 'read_since', 'streamRead');
-        $advanceSql = self::requireStreamPattern($patterns, 'group_advance_cursor', 'streamRead');
-        $pendingSql = self::requireStreamPattern($patterns, 'pending_insert', 'streamRead');
+        $cursorSql = self::requireFamilyPattern($patterns, 'group_get_cursor', 'stream', 'streamRead');
+        $readSql = self::requireFamilyPattern($patterns, 'read_since', 'stream', 'streamRead');
+        $advanceSql = self::requireFamilyPattern($patterns, 'group_advance_cursor', 'stream', 'streamRead');
+        $pendingSql = self::requireFamilyPattern($patterns, 'pending_insert', 'stream', 'streamRead');
 
         $pdo->beginTransaction();
         try {
@@ -523,7 +791,7 @@ class Utils
     public static function streamAck(\PDO $pdo, string $stream, string $group, int $messageId, ?array $patterns = null): bool
     {
         self::validateIdentifier($stream);
-        $sql = self::requireStreamPattern($patterns, 'ack', 'streamAck');
+        $sql = self::requireFamilyPattern($patterns, 'ack', 'stream', 'streamAck');
         $stmt = $pdo->prepare($sql);
         $stmt->execute([$group, $messageId]);
         return $stmt->rowCount() > 0;
@@ -532,8 +800,8 @@ class Utils
     public static function streamClaim(\PDO $pdo, string $stream, string $group, string $consumer, int $minIdleMs = 60000, ?array $patterns = null): array
     {
         self::validateIdentifier($stream);
-        $claimSql = self::requireStreamPattern($patterns, 'claim', 'streamClaim');
-        $readByIdSql = self::requireStreamPattern($patterns, 'read_by_id', 'streamClaim');
+        $claimSql = self::requireFamilyPattern($patterns, 'claim', 'stream', 'streamClaim');
+        $readByIdSql = self::requireFamilyPattern($patterns, 'read_by_id', 'stream', 'streamClaim');
 
         $stmt = $pdo->prepare($claimSql);
         $stmt->execute([$consumer, $group, $minIdleMs]);
