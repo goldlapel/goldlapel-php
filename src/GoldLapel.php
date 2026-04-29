@@ -127,6 +127,19 @@ class GoldLapel
     public readonly Streams $streams;
 
     /**
+     * Phase 5 Redis-compat sub-APIs. Each issues `/api/ddl/<family>/create`
+     * (idempotent) on first use of a name and shares the pattern cache held
+     * on this client. The legacy flat `incr`, `hset`, `zadd`, `enqueue`,
+     * `geoadd`, … methods are gone — see src/{Counters,Zsets,Hashes,
+     * Queues,Geos}.php for the canonical surfaces.
+     */
+    public readonly Counters $counters;
+    public readonly Zsets $zsets;
+    public readonly Hashes $hashes;
+    public readonly Queues $queues;
+    public readonly Geos $geos;
+
+    /**
      * Constructor — use GoldLapel::start() to create and start an instance.
      * Accepts a canonical-surface options array (same shape as start()).
      *
@@ -187,15 +200,18 @@ class GoldLapel
         $tag = isset($options['mesh_tag']) ? (string) $options['mesh_tag'] : '';
         $this->meshTag = $tag === '' ? null : $tag;
 
-        // Nested namespaces — see src/Documents.php and src/Streams.php.
-        // These are the canonical schema-to-core sub-API instances. Each
-        // holds a back-reference to this client for shared state (license,
-        // dashboard token, PDO, DDL pattern cache). Other namespaces (cache,
-        // search, queues, counters, hashes, zsets, geo, auth, ...) stay flat
-        // for now; they migrate to nested form one-at-a-time as their own
-        // schema-to-core phase fires.
+        // Nested namespaces — see src/Documents.php, src/Streams.php, plus
+        // the Phase 5 Redis-compat families under src/{Counters,Zsets,
+        // Hashes,Queues,Geos}.php. Each holds a back-reference to this
+        // client for shared state (license, dashboard token, PDO, DDL
+        // pattern cache).
         $this->documents = new Documents($this);
         $this->streams = new Streams($this);
+        $this->counters = new Counters($this);
+        $this->zsets = new Zsets($this);
+        $this->hashes = new Hashes($this);
+        $this->queues = new Queues($this);
+        $this->geos = new Geos($this);
     }
 
     /**
@@ -423,7 +439,7 @@ class GoldLapel
      * Example:
      *     $gl->using($pdo, function ($gl) {
      *         $pdo->beginTransaction();
-     *         $gl->docInsert('events', ['type' => 'order.created']);
+     *         $gl->documents->insert('events', ['type' => 'order.created']);
      *         $pdo->commit();
      *     });
      */
@@ -947,7 +963,7 @@ class GoldLapel
         Utils::createSearchConfig($this->resolveConn($conn), $name, $copyFrom);
     }
 
-    // Pub/Sub & Queue
+    // Pub/Sub
 
     public function publish(string $channel, string $message, ?\PDO $conn = null): void
     {
@@ -959,123 +975,10 @@ class GoldLapel
         Utils::subscribe($this->resolveConn($conn), $channel, $callback);
     }
 
-    public function enqueue(string $queueTable, array $payload, ?\PDO $conn = null): void
-    {
-        Utils::enqueue($this->resolveConn($conn), $queueTable, $payload);
-    }
-
-    public function dequeue(string $queueTable, ?\PDO $conn = null): ?array
-    {
-        return Utils::dequeue($this->resolveConn($conn), $queueTable);
-    }
-
-    // Counters
-
-    public function incr(string $table, string $key, int $amount = 1, ?\PDO $conn = null): int
-    {
-        return Utils::incr($this->resolveConn($conn), $table, $key, $amount);
-    }
-
-    public function getCounter(string $table, string $key, ?\PDO $conn = null): int
-    {
-        return Utils::getCounter($this->resolveConn($conn), $table, $key);
-    }
-
-    // Hash
-
-    public function hset(string $table, string $key, string $field, mixed $value, ?\PDO $conn = null): void
-    {
-        Utils::hset($this->resolveConn($conn), $table, $key, $field, $value);
-    }
-
-    public function hget(string $table, string $key, string $field, ?\PDO $conn = null): mixed
-    {
-        return Utils::hget($this->resolveConn($conn), $table, $key, $field);
-    }
-
-    public function hgetall(string $table, string $key, ?\PDO $conn = null): array
-    {
-        return Utils::hgetall($this->resolveConn($conn), $table, $key);
-    }
-
-    public function hdel(string $table, string $key, string $field, ?\PDO $conn = null): bool
-    {
-        return Utils::hdel($this->resolveConn($conn), $table, $key, $field);
-    }
-
-    // Sorted Sets
-
-    public function zadd(string $table, string $member, float $score, ?\PDO $conn = null): void
-    {
-        Utils::zadd($this->resolveConn($conn), $table, $member, $score);
-    }
-
-    public function zincrby(string $table, string $member, float $amount = 1, ?\PDO $conn = null): float
-    {
-        return Utils::zincrby($this->resolveConn($conn), $table, $member, $amount);
-    }
-
-    public function zrange(
-        string $table,
-        int $start = 0,
-        int $stop = 10,
-        bool $desc = true,
-        ?\PDO $conn = null,
-    ): array {
-        return Utils::zrange($this->resolveConn($conn), $table, $start, $stop, $desc);
-    }
-
-    public function zrank(string $table, string $member, bool $desc = true, ?\PDO $conn = null): ?int
-    {
-        return Utils::zrank($this->resolveConn($conn), $table, $member, $desc);
-    }
-
-    public function zscore(string $table, string $member, ?\PDO $conn = null): ?float
-    {
-        return Utils::zscore($this->resolveConn($conn), $table, $member);
-    }
-
-    public function zrem(string $table, string $member, ?\PDO $conn = null): bool
-    {
-        return Utils::zrem($this->resolveConn($conn), $table, $member);
-    }
-
-    // Geo
-
-    public function georadius(
-        string $table,
-        string $geomColumn,
-        float $lon,
-        float $lat,
-        float $radiusMeters,
-        int $limit = 50,
-        ?\PDO $conn = null,
-    ): array {
-        return Utils::georadius($this->resolveConn($conn), $table, $geomColumn, $lon, $lat, $radiusMeters, $limit);
-    }
-
-    public function geoadd(
-        string $table,
-        string $nameColumn,
-        string $geomColumn,
-        string $name,
-        float $lon,
-        float $lat,
-        ?\PDO $conn = null,
-    ): void {
-        Utils::geoadd($this->resolveConn($conn), $table, $nameColumn, $geomColumn, $name, $lon, $lat);
-    }
-
-    public function geodist(
-        string $table,
-        string $geomColumn,
-        string $nameColumn,
-        string $nameA,
-        string $nameB,
-        ?\PDO $conn = null,
-    ): ?float {
-        return Utils::geodist($this->resolveConn($conn), $table, $geomColumn, $nameColumn, $nameA, $nameB);
-    }
+    // Phase 5 Redis-compat families: $gl->counters / $gl->zsets / $gl->hashes /
+    // $gl->queues / $gl->geos. The legacy flat methods (incr, hset, zadd,
+    // enqueue, geoadd, …) are gone — see src/{Counters,Zsets,Hashes,
+    // Queues,Geos}.php for the canonical surfaces.
 
     // Misc
 

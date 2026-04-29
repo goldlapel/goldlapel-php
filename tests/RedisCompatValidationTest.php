@@ -7,8 +7,13 @@ use PHPUnit\Framework\Attributes\AllowMockObjectsWithoutExpectations;
 use PHPUnit\Framework\TestCase;
 
 /**
- * Regression: Redis-compat helpers must reject injection-shaped identifier args.
- * See v0.2 security review finding C1.
+ * Regression: identifier-style helpers must reject injection-shaped name
+ * args. See v0.2 security review finding C1.
+ *
+ * After Phase 5 of schema-to-core, the legacy flat helpers (`incr`,
+ * `hset`, `zadd`, `enqueue`, `geoadd`, …) are gone — the proxy owns DDL
+ * and the wrapper dispatches via `Utils::counter*`, `Utils::zset*`, etc.
+ * Identifier-validation parity is preserved across the new helpers below.
  */
 #[AllowMockObjectsWithoutExpectations]
 class RedisCompatValidationTest extends TestCase
@@ -33,90 +38,6 @@ class RedisCompatValidationTest extends TestCase
         Utils::subscribe($this->pdo(), self::BAD, function () {});
     }
 
-    public function testEnqueueRejectsBad(): void
-    {
-        $this->expectException(\InvalidArgumentException::class);
-        Utils::enqueue($this->pdo(), self::BAD, []);
-    }
-
-    public function testDequeueRejectsBad(): void
-    {
-        $this->expectException(\InvalidArgumentException::class);
-        Utils::dequeue($this->pdo(), self::BAD);
-    }
-
-    public function testIncrRejectsBad(): void
-    {
-        $this->expectException(\InvalidArgumentException::class);
-        Utils::incr($this->pdo(), self::BAD, 'k');
-    }
-
-    public function testGetCounterRejectsBad(): void
-    {
-        $this->expectException(\InvalidArgumentException::class);
-        Utils::getCounter($this->pdo(), self::BAD, 'k');
-    }
-
-    public function testZaddRejectsBad(): void
-    {
-        $this->expectException(\InvalidArgumentException::class);
-        Utils::zadd($this->pdo(), self::BAD, 'm', 1.0);
-    }
-
-    public function testZincrbyRejectsBad(): void
-    {
-        $this->expectException(\InvalidArgumentException::class);
-        Utils::zincrby($this->pdo(), self::BAD, 'm');
-    }
-
-    public function testZrangeRejectsBad(): void
-    {
-        $this->expectException(\InvalidArgumentException::class);
-        Utils::zrange($this->pdo(), self::BAD);
-    }
-
-    public function testZrankRejectsBad(): void
-    {
-        $this->expectException(\InvalidArgumentException::class);
-        Utils::zrank($this->pdo(), self::BAD, 'm');
-    }
-
-    public function testZscoreRejectsBad(): void
-    {
-        $this->expectException(\InvalidArgumentException::class);
-        Utils::zscore($this->pdo(), self::BAD, 'm');
-    }
-
-    public function testZremRejectsBad(): void
-    {
-        $this->expectException(\InvalidArgumentException::class);
-        Utils::zrem($this->pdo(), self::BAD, 'm');
-    }
-
-    public function testHsetRejectsBad(): void
-    {
-        $this->expectException(\InvalidArgumentException::class);
-        Utils::hset($this->pdo(), self::BAD, 'k', 'f', 'v');
-    }
-
-    public function testHgetRejectsBad(): void
-    {
-        $this->expectException(\InvalidArgumentException::class);
-        Utils::hget($this->pdo(), self::BAD, 'k', 'f');
-    }
-
-    public function testHgetallRejectsBad(): void
-    {
-        $this->expectException(\InvalidArgumentException::class);
-        Utils::hgetall($this->pdo(), self::BAD, 'k');
-    }
-
-    public function testHdelRejectsBad(): void
-    {
-        $this->expectException(\InvalidArgumentException::class);
-        Utils::hdel($this->pdo(), self::BAD, 'k', 'f');
-    }
-
     public function testCountDistinctRejectsBadTable(): void
     {
         $this->expectException(\InvalidArgumentException::class);
@@ -129,41 +50,117 @@ class RedisCompatValidationTest extends TestCase
         Utils::countDistinct($this->pdo(), 'tbl', self::BAD);
     }
 
-    public function testGeoaddRejectsBadTable(): void
+    // ---- Phase 5 family helpers ----
+
+    public function testCounterIncrRejectsBad(): void
     {
         $this->expectException(\InvalidArgumentException::class);
-        Utils::geoadd($this->pdo(), self::BAD, 'name', 'geom', 'x', 0.0, 0.0);
+        Utils::counterIncr($this->pdo(), self::BAD, 'k');
     }
 
-    public function testGeoaddRejectsBadNameColumn(): void
+    public function testCounterGetRejectsBad(): void
     {
         $this->expectException(\InvalidArgumentException::class);
-        Utils::geoadd($this->pdo(), 'tbl', self::BAD, 'geom', 'x', 0.0, 0.0);
+        Utils::counterGet($this->pdo(), self::BAD, 'k');
     }
 
-    public function testGeoaddRejectsBadGeomColumn(): void
+    public function testZsetAddRejectsBad(): void
     {
         $this->expectException(\InvalidArgumentException::class);
-        Utils::geoadd($this->pdo(), 'tbl', 'name', self::BAD, 'x', 0.0, 0.0);
+        Utils::zsetAdd($this->pdo(), self::BAD, 'k', 'm', 1.0);
     }
 
-    public function testGeoradiusRejectsBadTable(): void
+    public function testZsetIncrByRejectsBad(): void
     {
         $this->expectException(\InvalidArgumentException::class);
-        Utils::georadius($this->pdo(), self::BAD, 'geom', 0.0, 0.0, 100.0);
+        Utils::zsetIncrBy($this->pdo(), self::BAD, 'k', 'm');
     }
 
-    public function testGeoradiusRejectsBadGeomColumn(): void
+    public function testZsetRangeRejectsBad(): void
     {
         $this->expectException(\InvalidArgumentException::class);
-        Utils::georadius($this->pdo(), 'tbl', self::BAD, 0.0, 0.0, 100.0);
+        Utils::zsetRange($this->pdo(), self::BAD, 'k');
     }
 
-    public function testGeodistRejectsBadTable(): void
+    public function testZsetRankRejectsBad(): void
     {
         $this->expectException(\InvalidArgumentException::class);
-        Utils::geodist($this->pdo(), self::BAD, 'geom', 'name', 'a', 'b');
+        Utils::zsetRank($this->pdo(), self::BAD, 'k', 'm');
     }
+
+    public function testZsetScoreRejectsBad(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        Utils::zsetScore($this->pdo(), self::BAD, 'k', 'm');
+    }
+
+    public function testZsetRemoveRejectsBad(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        Utils::zsetRemove($this->pdo(), self::BAD, 'k', 'm');
+    }
+
+    public function testHashSetRejectsBad(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        Utils::hashSet($this->pdo(), self::BAD, 'k', 'f', 'v');
+    }
+
+    public function testHashGetRejectsBad(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        Utils::hashGet($this->pdo(), self::BAD, 'k', 'f');
+    }
+
+    public function testHashGetAllRejectsBad(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        Utils::hashGetAll($this->pdo(), self::BAD, 'k');
+    }
+
+    public function testHashDeleteRejectsBad(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        Utils::hashDelete($this->pdo(), self::BAD, 'k', 'f');
+    }
+
+    public function testQueueEnqueueRejectsBad(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        Utils::queueEnqueue($this->pdo(), self::BAD, []);
+    }
+
+    public function testQueueClaimRejectsBad(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        Utils::queueClaim($this->pdo(), self::BAD);
+    }
+
+    public function testQueueAckRejectsBad(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        Utils::queueAck($this->pdo(), self::BAD, 1);
+    }
+
+    public function testGeoAddRejectsBad(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        Utils::geoAdd($this->pdo(), self::BAD, 'm', 0.0, 0.0);
+    }
+
+    public function testGeoRadiusRejectsBad(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        Utils::geoRadius($this->pdo(), self::BAD, 0.0, 0.0, 100.0);
+    }
+
+    public function testGeoDistRejectsBad(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        Utils::geoDist($this->pdo(), self::BAD, 'a', 'b');
+    }
+
+    // ---- Stream helpers (kept from Phase 4) ----
 
     public function testStreamAddRejectsBad(): void
     {

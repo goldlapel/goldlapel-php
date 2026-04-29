@@ -473,7 +473,7 @@ class Utils
     }
 
     // ========================================================================
-    // Pub/Sub & Queue
+    // Pub/Sub
     // ========================================================================
 
     public static function publish(PostgresExecutor $conn, string $channel, string $message): void
@@ -505,327 +505,456 @@ class Utils
         }
     }
 
-    public static function enqueue(PostgresExecutor $conn, string $queueTable, array $payload): void
+    // ========================================================================
+    // Phase 5 Redis-compat families (counter / zset / hash / queue / geo)
+    //
+    // The proxy owns DDL — these helpers consume `$patterns` returned from
+    // `/api/ddl/<family>/create` and translate `$N → ?` via Ddl::toPdoPlaceholders,
+    // then translate back to `$N` for amphp inside `self::exec()`.
+    // ========================================================================
+
+    /**
+     * Pull a query pattern from the proxy's response and translate `$N → ?`.
+     * The downstream `self::exec()` call re-translates `?` back to `$N` for
+     * amphp — yes, it's a round-trip, but it keeps a single source of truth
+     * for SQL strings (sync stays the canonical reference).
+     */
+    private static function requireFamilyPattern(?array $patterns, string $key, string $family, string $fn): string
     {
-        SyncUtils::validateIdentifier($queueTable);
-        $conn->query("
-            CREATE TABLE IF NOT EXISTS {$queueTable} (
-                id BIGSERIAL PRIMARY KEY,
-                payload JSONB NOT NULL,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-            )
-        ");
-        self::exec($conn, "INSERT INTO {$queueTable} (payload) VALUES (?)", [json_encode($payload)]);
+        if ($patterns === null || !isset($patterns['query_patterns'])) {
+            throw new \RuntimeException(
+                "{$fn} requires DDL patterns from the proxy — call via "
+                . "\$gl->{$family}s-><verb>(...) rather than Utils::{$fn} directly."
+            );
+        }
+        $qp = $patterns['query_patterns'];
+        if (!isset($qp[$key])) {
+            throw new \RuntimeException("DDL API response missing pattern '{$key}' for {$fn}");
+        }
+        return \GoldLapel\Ddl::toPdoPlaceholders($qp[$key]);
     }
 
-    public static function dequeue(PostgresExecutor $conn, string $queueTable): ?array
+    /**
+     * Decode a JSONB column value the wrapper got back. amphp/postgres hands
+     * us JSONB columns as strings (just like sync PDO). Decode if it's a
+     * string; otherwise pass through. If decoding fails, return the input
+     * unchanged.
+     */
+    private static function decodeJsonb(mixed $value): mixed
     {
-        SyncUtils::validateIdentifier($queueTable);
-        $row = self::fetchOne($conn, "
-            DELETE FROM {$queueTable}
-            WHERE id = (
-                SELECT id FROM {$queueTable}
-                ORDER BY id
-                FOR UPDATE SKIP LOCKED
-                LIMIT 1
-            )
-            RETURNING payload
-        ");
-        if ($row === null) {
-            return null;
-        }
-        $value = $row['payload'] ?? reset($row);
-        return is_array($value) ? $value : json_decode($value, true);
-    }
-
-    // ========================================================================
-    // Counters
-    // ========================================================================
-
-    public static function incr(
-        PostgresExecutor $conn,
-        string $table,
-        string $key,
-        int $amount = 1,
-    ): int {
-        SyncUtils::validateIdentifier($table);
-        $conn->query("
-            CREATE TABLE IF NOT EXISTS {$table} (
-                key TEXT PRIMARY KEY,
-                value BIGINT NOT NULL DEFAULT 0
-            )
-        ");
-        $value = self::fetchColumn($conn, "
-            INSERT INTO {$table} (key, value) VALUES (?, ?)
-            ON CONFLICT (key) DO UPDATE SET value = {$table}.value + ?
-            RETURNING value
-        ", [$key, $amount, $amount]);
-        return (int) $value;
-    }
-
-    public static function getCounter(
-        PostgresExecutor $conn,
-        string $table,
-        string $key,
-    ): int {
-        SyncUtils::validateIdentifier($table);
-        $value = self::fetchColumn($conn, "SELECT value FROM {$table} WHERE key = ?", [$key]);
-        return $value !== null ? (int) $value : 0;
-    }
-
-    // ========================================================================
-    // Sorted Sets
-    // ========================================================================
-
-    public static function zadd(
-        PostgresExecutor $conn,
-        string $table,
-        string $member,
-        float $score,
-    ): void {
-        SyncUtils::validateIdentifier($table);
-        $conn->query("
-            CREATE TABLE IF NOT EXISTS {$table} (
-                member TEXT PRIMARY KEY,
-                score DOUBLE PRECISION NOT NULL
-            )
-        ");
-        self::exec($conn, "
-            INSERT INTO {$table} (member, score) VALUES (?, ?)
-            ON CONFLICT (member) DO UPDATE SET score = EXCLUDED.score
-        ", [$member, $score]);
-    }
-
-    public static function zincrby(
-        PostgresExecutor $conn,
-        string $table,
-        string $member,
-        float $amount = 1,
-    ): float {
-        SyncUtils::validateIdentifier($table);
-        $conn->query("
-            CREATE TABLE IF NOT EXISTS {$table} (
-                member TEXT PRIMARY KEY,
-                score DOUBLE PRECISION NOT NULL
-            )
-        ");
-        $value = self::fetchColumn($conn, "
-            INSERT INTO {$table} (member, score) VALUES (?, ?)
-            ON CONFLICT (member) DO UPDATE SET score = {$table}.score + ?
-            RETURNING score
-        ", [$member, $amount, $amount]);
-        return (float) $value;
-    }
-
-    public static function zrange(
-        PostgresExecutor $conn,
-        string $table,
-        int $start = 0,
-        int $stop = 10,
-        bool $desc = true,
-    ): array {
-        SyncUtils::validateIdentifier($table);
-        $order = $desc ? 'DESC' : 'ASC';
-        $limit = $stop - $start;
-        $rows = self::fetchAll($conn, "
-            SELECT member, score FROM {$table}
-            ORDER BY score {$order}
-            LIMIT ? OFFSET ?
-        ", [$limit, $start]);
-        // Sync returns FETCH_NUM; mirror the shape — list of [member, score].
-        $out = [];
-        foreach ($rows as $r) {
-            $out[] = [$r['member'], $r['score']];
-        }
-        return $out;
-    }
-
-    public static function zrank(
-        PostgresExecutor $conn,
-        string $table,
-        string $member,
-        bool $desc = true,
-    ): ?int {
-        SyncUtils::validateIdentifier($table);
-        $order = $desc ? 'DESC' : 'ASC';
-        $value = self::fetchColumn($conn, "
-            SELECT rank FROM (
-                SELECT member, ROW_NUMBER() OVER (ORDER BY score {$order}) - 1 AS rank
-                FROM {$table}
-            ) ranked
-            WHERE member = ?
-        ", [$member]);
-        return $value !== null ? (int) $value : null;
-    }
-
-    public static function zscore(
-        PostgresExecutor $conn,
-        string $table,
-        string $member,
-    ): ?float {
-        SyncUtils::validateIdentifier($table);
-        $value = self::fetchColumn($conn, "SELECT score FROM {$table} WHERE member = ?", [$member]);
-        return $value !== null ? (float) $value : null;
-    }
-
-    public static function zrem(
-        PostgresExecutor $conn,
-        string $table,
-        string $member,
-    ): bool {
-        SyncUtils::validateIdentifier($table);
-        $result = self::exec($conn, "DELETE FROM {$table} WHERE member = ?", [$member]);
-        return ($result->getRowCount() ?? 0) > 0;
-    }
-
-    // ========================================================================
-    // Geo
-    // ========================================================================
-
-    public static function geoadd(
-        PostgresExecutor $conn,
-        string $table,
-        string $nameColumn,
-        string $geomColumn,
-        string $name,
-        float $lon,
-        float $lat,
-    ): void {
-        SyncUtils::validateIdentifier($table);
-        SyncUtils::validateIdentifier($nameColumn);
-        SyncUtils::validateIdentifier($geomColumn);
-        $conn->query("CREATE EXTENSION IF NOT EXISTS postgis");
-        $conn->query("
-            CREATE TABLE IF NOT EXISTS {$table} (
-                id BIGSERIAL PRIMARY KEY,
-                {$nameColumn} TEXT NOT NULL,
-                {$geomColumn} GEOMETRY(Point, 4326) NOT NULL
-            )
-        ");
-        self::exec($conn, "
-            INSERT INTO {$table} ({$nameColumn}, {$geomColumn})
-            VALUES (?, ST_SetSRID(ST_MakePoint(?, ?), 4326))
-        ", [$name, $lon, $lat]);
-    }
-
-    public static function georadius(
-        PostgresExecutor $conn,
-        string $table,
-        string $geomColumn,
-        float $lon,
-        float $lat,
-        float $radiusMeters,
-        int $limit = 50,
-    ): array {
-        SyncUtils::validateIdentifier($table);
-        SyncUtils::validateIdentifier($geomColumn);
-        return self::fetchAll($conn, "
-            SELECT *, ST_Distance(
-                {$geomColumn}::geography,
-                ST_SetSRID(ST_MakePoint(?, ?), 4326)::geography
-            ) AS distance_m
-            FROM {$table}
-            WHERE ST_DWithin(
-                {$geomColumn}::geography,
-                ST_SetSRID(ST_MakePoint(?, ?), 4326)::geography,
-                ?
-            )
-            ORDER BY distance_m
-            LIMIT ?
-        ", [$lon, $lat, $lon, $lat, $radiusMeters, $limit]);
-    }
-
-    public static function geodist(
-        PostgresExecutor $conn,
-        string $table,
-        string $geomColumn,
-        string $nameColumn,
-        string $nameA,
-        string $nameB,
-    ): ?float {
-        SyncUtils::validateIdentifier($table);
-        SyncUtils::validateIdentifier($geomColumn);
-        SyncUtils::validateIdentifier($nameColumn);
-        $value = self::fetchColumn($conn, "
-            SELECT ST_Distance(a.{$geomColumn}::geography, b.{$geomColumn}::geography)
-            FROM {$table} a, {$table} b
-            WHERE a.{$nameColumn} = ? AND b.{$nameColumn} = ?
-        ", [$nameA, $nameB]);
-        return $value !== null ? (float) $value : null;
-    }
-
-    // ========================================================================
-    // Hash
-    // ========================================================================
-
-    public static function hset(
-        PostgresExecutor $conn,
-        string $table,
-        string $key,
-        string $field,
-        mixed $value,
-    ): void {
-        SyncUtils::validateIdentifier($table);
-        $conn->query("
-            CREATE TABLE IF NOT EXISTS {$table} (
-                key TEXT PRIMARY KEY,
-                data JSONB NOT NULL DEFAULT '{}'::jsonb
-            )
-        ");
-        $json = json_encode($value);
-        // Explicit ::text casts needed: amphp/postgres uses libpq's
-        // prepared-statement path which asks the server to infer parameter
-        // types. jsonb_build_object is polymorphic, so the server can't
-        // infer that $2 is text — add the cast.
-        self::exec($conn, "
-            INSERT INTO {$table} (key, data) VALUES (?, jsonb_build_object(?::text, ?::jsonb))
-            ON CONFLICT (key) DO UPDATE SET data = {$table}.data || jsonb_build_object(?::text, ?::jsonb)
-        ", [$key, $field, $json, $field, $json]);
-    }
-
-    public static function hget(
-        PostgresExecutor $conn,
-        string $table,
-        string $key,
-        string $field,
-    ): mixed {
-        SyncUtils::validateIdentifier($table);
-        $value = self::fetchColumn($conn, "SELECT data->>? FROM {$table} WHERE key = ?", [$field, $key]);
         if ($value === null) {
             return null;
+        }
+        if (!is_string($value)) {
+            return $value;
         }
         $decoded = json_decode($value, true);
         return json_last_error() === JSON_ERROR_NONE ? $decoded : $value;
     }
 
-    public static function hgetall(
-        PostgresExecutor $conn,
-        string $table,
-        string $key,
-    ): array {
-        SyncUtils::validateIdentifier($table);
-        $value = self::fetchColumn($conn, "SELECT data FROM {$table} WHERE key = ?", [$key]);
-        if ($value === null) {
-            return [];
-        }
-        // amphp returns jsonb columns as text strings — decode to match sync
-        // behavior (sync json_decodes the PDO-returned string).
-        return is_string($value) ? (json_decode($value, true) ?? []) : (array) $value;
+    // ----- Counter family ---------------------------------------------------
+
+    public static function counterIncr(PostgresExecutor $conn, string $name, string $key, int $amount = 1, ?array $patterns = null): int
+    {
+        SyncUtils::validateIdentifier($name);
+        $sql = self::requireFamilyPattern($patterns, 'incr', 'counter', 'counterIncr');
+        $value = self::fetchColumn($conn, $sql, [$key, $amount]);
+        return (int) $value;
     }
 
-    public static function hdel(
-        PostgresExecutor $conn,
-        string $table,
-        string $key,
-        string $field,
-    ): bool {
-        SyncUtils::validateIdentifier($table);
-        $row = self::fetchOne($conn, "SELECT data ? ? AS existed FROM {$table} WHERE key = ?", [$field, $key]);
-        if ($row === null || !$row['existed']) {
+    public static function counterDecr(PostgresExecutor $conn, string $name, string $key, int $amount = 1, ?array $patterns = null): int
+    {
+        return self::counterIncr($conn, $name, $key, -$amount, $patterns);
+    }
+
+    public static function counterSet(PostgresExecutor $conn, string $name, string $key, int $value, ?array $patterns = null): int
+    {
+        SyncUtils::validateIdentifier($name);
+        $sql = self::requireFamilyPattern($patterns, 'set', 'counter', 'counterSet');
+        $stored = self::fetchColumn($conn, $sql, [$key, $value]);
+        return (int) $stored;
+    }
+
+    public static function counterGet(PostgresExecutor $conn, string $name, string $key, ?array $patterns = null): int
+    {
+        SyncUtils::validateIdentifier($name);
+        $sql = self::requireFamilyPattern($patterns, 'get', 'counter', 'counterGet');
+        $value = self::fetchColumn($conn, $sql, [$key]);
+        return $value !== null ? (int) $value : 0;
+    }
+
+    public static function counterDelete(PostgresExecutor $conn, string $name, string $key, ?array $patterns = null): bool
+    {
+        SyncUtils::validateIdentifier($name);
+        $sql = self::requireFamilyPattern($patterns, 'delete', 'counter', 'counterDelete');
+        $result = self::exec($conn, $sql, [$key]);
+        return ($result->getRowCount() ?? 0) > 0;
+    }
+
+    public static function counterCountKeys(PostgresExecutor $conn, string $name, ?array $patterns = null): int
+    {
+        SyncUtils::validateIdentifier($name);
+        $sql = self::requireFamilyPattern($patterns, 'count_keys', 'counter', 'counterCountKeys');
+        $value = self::fetchColumn($conn, $sql);
+        return $value !== null ? (int) $value : 0;
+    }
+
+    // ----- Sorted-set (zset) family -----------------------------------------
+
+    public static function zsetAdd(PostgresExecutor $conn, string $name, string $zsetKey, string $member, float $score, ?array $patterns = null): float
+    {
+        SyncUtils::validateIdentifier($name);
+        $sql = self::requireFamilyPattern($patterns, 'zadd', 'zset', 'zsetAdd');
+        $value = self::fetchColumn($conn, $sql, [$zsetKey, $member, $score]);
+        return (float) $value;
+    }
+
+    public static function zsetIncrBy(PostgresExecutor $conn, string $name, string $zsetKey, string $member, float $delta = 1.0, ?array $patterns = null): float
+    {
+        SyncUtils::validateIdentifier($name);
+        $sql = self::requireFamilyPattern($patterns, 'zincrby', 'zset', 'zsetIncrBy');
+        $value = self::fetchColumn($conn, $sql, [$zsetKey, $member, $delta]);
+        return (float) $value;
+    }
+
+    public static function zsetScore(PostgresExecutor $conn, string $name, string $zsetKey, string $member, ?array $patterns = null): ?float
+    {
+        SyncUtils::validateIdentifier($name);
+        $sql = self::requireFamilyPattern($patterns, 'zscore', 'zset', 'zsetScore');
+        $value = self::fetchColumn($conn, $sql, [$zsetKey, $member]);
+        return $value !== null ? (float) $value : null;
+    }
+
+    public static function zsetRemove(PostgresExecutor $conn, string $name, string $zsetKey, string $member, ?array $patterns = null): bool
+    {
+        SyncUtils::validateIdentifier($name);
+        $sql = self::requireFamilyPattern($patterns, 'zrem', 'zset', 'zsetRemove');
+        $result = self::exec($conn, $sql, [$zsetKey, $member]);
+        return ($result->getRowCount() ?? 0) > 0;
+    }
+
+    public static function zsetRange(PostgresExecutor $conn, string $name, string $zsetKey, int $start = 0, int $stop = 10, bool $desc = true, ?array $patterns = null): array
+    {
+        SyncUtils::validateIdentifier($name);
+        $key = $desc ? 'zrange_desc' : 'zrange_asc';
+        $sql = self::requireFamilyPattern($patterns, $key, 'zset', 'zsetRange');
+        $limit = max(0, $stop - $start + 1);
+        $rows = self::fetchAll($conn, $sql, [$zsetKey, $limit, $start]);
+        $out = [];
+        foreach ($rows as $r) {
+            $out[] = [$r['member'], (float) $r['score']];
+        }
+        return $out;
+    }
+
+    public static function zsetRangeByScore(PostgresExecutor $conn, string $name, string $zsetKey, float $minScore, float $maxScore, int $limit = 100, int $offset = 0, ?array $patterns = null): array
+    {
+        SyncUtils::validateIdentifier($name);
+        $sql = self::requireFamilyPattern($patterns, 'zrangebyscore', 'zset', 'zsetRangeByScore');
+        $rows = self::fetchAll($conn, $sql, [$zsetKey, $minScore, $maxScore, $limit, $offset]);
+        $out = [];
+        foreach ($rows as $r) {
+            $out[] = [$r['member'], (float) $r['score']];
+        }
+        return $out;
+    }
+
+    public static function zsetRank(PostgresExecutor $conn, string $name, string $zsetKey, string $member, bool $desc = true, ?array $patterns = null): ?int
+    {
+        SyncUtils::validateIdentifier($name);
+        $key = $desc ? 'zrank_desc' : 'zrank_asc';
+        $sql = self::requireFamilyPattern($patterns, $key, 'zset', 'zsetRank');
+        $value = self::fetchColumn($conn, $sql, [$zsetKey, $member]);
+        return $value !== null ? (int) $value : null;
+    }
+
+    public static function zsetCard(PostgresExecutor $conn, string $name, string $zsetKey, ?array $patterns = null): int
+    {
+        SyncUtils::validateIdentifier($name);
+        $sql = self::requireFamilyPattern($patterns, 'zcard', 'zset', 'zsetCard');
+        $value = self::fetchColumn($conn, $sql, [$zsetKey]);
+        return $value !== null ? (int) $value : 0;
+    }
+
+    // ----- Hash family ------------------------------------------------------
+
+    public static function hashSet(PostgresExecutor $conn, string $name, string $hashKey, string $field, mixed $value, ?array $patterns = null): mixed
+    {
+        SyncUtils::validateIdentifier($name);
+        $sql = self::requireFamilyPattern($patterns, 'hset', 'hash', 'hashSet');
+        $row = self::fetchOne($conn, $sql, [$hashKey, $field, json_encode($value)]);
+        if ($row === null) {
+            return null;
+        }
+        return self::decodeJsonb(reset($row));
+    }
+
+    public static function hashGet(PostgresExecutor $conn, string $name, string $hashKey, string $field, ?array $patterns = null): mixed
+    {
+        SyncUtils::validateIdentifier($name);
+        $sql = self::requireFamilyPattern($patterns, 'hget', 'hash', 'hashGet');
+        $value = self::fetchColumn($conn, $sql, [$hashKey, $field]);
+        return self::decodeJsonb($value);
+    }
+
+    public static function hashGetAll(PostgresExecutor $conn, string $name, string $hashKey, ?array $patterns = null): array
+    {
+        SyncUtils::validateIdentifier($name);
+        $sql = self::requireFamilyPattern($patterns, 'hgetall', 'hash', 'hashGetAll');
+        $rows = self::fetchAll($conn, $sql, [$hashKey]);
+        $out = [];
+        foreach ($rows as $r) {
+            $out[(string) $r['field']] = self::decodeJsonb($r['value'] ?? null);
+        }
+        return $out;
+    }
+
+    public static function hashKeys(PostgresExecutor $conn, string $name, string $hashKey, ?array $patterns = null): array
+    {
+        SyncUtils::validateIdentifier($name);
+        $sql = self::requireFamilyPattern($patterns, 'hkeys', 'hash', 'hashKeys');
+        $rows = self::fetchAll($conn, $sql, [$hashKey]);
+        return array_map(static fn ($r) => (string) $r['field'], $rows);
+    }
+
+    public static function hashValues(PostgresExecutor $conn, string $name, string $hashKey, ?array $patterns = null): array
+    {
+        SyncUtils::validateIdentifier($name);
+        $sql = self::requireFamilyPattern($patterns, 'hvals', 'hash', 'hashValues');
+        $rows = self::fetchAll($conn, $sql, [$hashKey]);
+        return array_map(static fn ($r) => self::decodeJsonb($r['value'] ?? null), $rows);
+    }
+
+    public static function hashExists(PostgresExecutor $conn, string $name, string $hashKey, string $field, ?array $patterns = null): bool
+    {
+        SyncUtils::validateIdentifier($name);
+        $sql = self::requireFamilyPattern($patterns, 'hexists', 'hash', 'hashExists');
+        $value = self::fetchColumn($conn, $sql, [$hashKey, $field]);
+        if ($value === null) {
             return false;
         }
-        self::exec($conn, "UPDATE {$table} SET data = data - ? WHERE key = ?", [$field, $key]);
-        return true;
+        if (is_bool($value)) {
+            return $value;
+        }
+        if (is_string($value)) {
+            return $value === 't' || $value === '1' || strcasecmp($value, 'true') === 0;
+        }
+        return (bool) $value;
+    }
+
+    public static function hashDelete(PostgresExecutor $conn, string $name, string $hashKey, string $field, ?array $patterns = null): bool
+    {
+        SyncUtils::validateIdentifier($name);
+        $sql = self::requireFamilyPattern($patterns, 'hdel', 'hash', 'hashDelete');
+        $result = self::exec($conn, $sql, [$hashKey, $field]);
+        return ($result->getRowCount() ?? 0) > 0;
+    }
+
+    public static function hashLen(PostgresExecutor $conn, string $name, string $hashKey, ?array $patterns = null): int
+    {
+        SyncUtils::validateIdentifier($name);
+        $sql = self::requireFamilyPattern($patterns, 'hlen', 'hash', 'hashLen');
+        $value = self::fetchColumn($conn, $sql, [$hashKey]);
+        return $value !== null ? (int) $value : 0;
+    }
+
+    // ----- Queue family (at-least-once with visibility timeout) -------------
+
+    public static function queueEnqueue(PostgresExecutor $conn, string $name, mixed $payload, ?array $patterns = null): ?int
+    {
+        SyncUtils::validateIdentifier($name);
+        $sql = self::requireFamilyPattern($patterns, 'enqueue', 'queue', 'queueEnqueue');
+        $row = self::fetchOne($conn, $sql, [json_encode($payload)]);
+        if ($row === null) {
+            return null;
+        }
+        return (int) reset($row);
+    }
+
+    public static function queueClaim(PostgresExecutor $conn, string $name, int $visibilityTimeoutMs = 30000, ?array $patterns = null): ?array
+    {
+        SyncUtils::validateIdentifier($name);
+        $sql = self::requireFamilyPattern($patterns, 'claim', 'queue', 'queueClaim');
+        $row = self::fetchOne($conn, $sql, [$visibilityTimeoutMs]);
+        if ($row === null) {
+            return null;
+        }
+        return [
+            'id' => (int) ($row['id'] ?? 0),
+            'payload' => self::decodeJsonb($row['payload'] ?? null),
+        ];
+    }
+
+    public static function queueAck(PostgresExecutor $conn, string $name, int $messageId, ?array $patterns = null): bool
+    {
+        SyncUtils::validateIdentifier($name);
+        $sql = self::requireFamilyPattern($patterns, 'ack', 'queue', 'queueAck');
+        $result = self::exec($conn, $sql, [$messageId]);
+        return ($result->getRowCount() ?? 0) > 0;
+    }
+
+    public static function queueAbandon(PostgresExecutor $conn, string $name, int $messageId, ?array $patterns = null): bool
+    {
+        SyncUtils::validateIdentifier($name);
+        $sql = self::requireFamilyPattern($patterns, 'nack', 'queue', 'queueAbandon');
+        $row = self::fetchOne($conn, $sql, [$messageId]);
+        return $row !== null;
+    }
+
+    public static function queueExtend(PostgresExecutor $conn, string $name, int $messageId, int $additionalMs, ?array $patterns = null): mixed
+    {
+        SyncUtils::validateIdentifier($name);
+        $sql = self::requireFamilyPattern($patterns, 'extend', 'queue', 'queueExtend');
+        // Proxy contract: $1=id, $2=additional_ms (source order). After
+        // `$N → ?` bindings appear in source order — bind [id, additional_ms].
+        $row = self::fetchOne($conn, $sql, [$messageId, $additionalMs]);
+        if ($row === null) {
+            return null;
+        }
+        return reset($row);
+    }
+
+    public static function queuePeek(PostgresExecutor $conn, string $name, ?array $patterns = null): ?array
+    {
+        SyncUtils::validateIdentifier($name);
+        $sql = self::requireFamilyPattern($patterns, 'peek', 'queue', 'queuePeek');
+        $row = self::fetchOne($conn, $sql);
+        if ($row === null) {
+            return null;
+        }
+        return [
+            'id' => (int) ($row['id'] ?? 0),
+            'payload' => self::decodeJsonb($row['payload'] ?? null),
+            'visible_at' => $row['visible_at'] ?? null,
+            'status' => $row['status'] ?? null,
+            'created_at' => $row['created_at'] ?? null,
+        ];
+    }
+
+    public static function queueCountReady(PostgresExecutor $conn, string $name, ?array $patterns = null): int
+    {
+        SyncUtils::validateIdentifier($name);
+        $sql = self::requireFamilyPattern($patterns, 'count_ready', 'queue', 'queueCountReady');
+        $value = self::fetchColumn($conn, $sql);
+        return $value !== null ? (int) $value : 0;
+    }
+
+    public static function queueCountClaimed(PostgresExecutor $conn, string $name, ?array $patterns = null): int
+    {
+        SyncUtils::validateIdentifier($name);
+        $sql = self::requireFamilyPattern($patterns, 'count_claimed', 'queue', 'queueCountClaimed');
+        $value = self::fetchColumn($conn, $sql);
+        return $value !== null ? (int) $value : 0;
+    }
+
+    // ----- Geo family (PostGIS GEOGRAPHY-native) ----------------------------
+
+    private const GEO_UNIT_FACTORS = [
+        'm' => 1.0,
+        'km' => 1000.0,
+        'mi' => 1609.344,
+        'ft' => 0.3048,
+    ];
+
+    private static function geoToMeters(float $value, string $unit): float
+    {
+        if (!isset(self::GEO_UNIT_FACTORS[$unit])) {
+            throw new \InvalidArgumentException(
+                "Unknown distance unit: '{$unit}' (choose m/km/mi/ft)"
+            );
+        }
+        return $value * self::GEO_UNIT_FACTORS[$unit];
+    }
+
+    private static function geoFromMeters(float $meters, string $unit): float
+    {
+        if (!isset(self::GEO_UNIT_FACTORS[$unit])) {
+            throw new \InvalidArgumentException(
+                "Unknown distance unit: '{$unit}' (choose m/km/mi/ft)"
+            );
+        }
+        return $meters / self::GEO_UNIT_FACTORS[$unit];
+    }
+
+    public static function geoAdd(PostgresExecutor $conn, string $name, string $member, float $lon, float $lat, ?array $patterns = null): ?array
+    {
+        SyncUtils::validateIdentifier($name);
+        $sql = self::requireFamilyPattern($patterns, 'geoadd', 'geo', 'geoAdd');
+        $row = self::fetchOne($conn, $sql, [$member, $lon, $lat]);
+        if ($row === null) {
+            return null;
+        }
+        return [(float) ($row['lon'] ?? 0.0), (float) ($row['lat'] ?? 0.0)];
+    }
+
+    public static function geoPos(PostgresExecutor $conn, string $name, string $member, ?array $patterns = null): ?array
+    {
+        SyncUtils::validateIdentifier($name);
+        $sql = self::requireFamilyPattern($patterns, 'geopos', 'geo', 'geoPos');
+        $row = self::fetchOne($conn, $sql, [$member]);
+        if ($row === null) {
+            return null;
+        }
+        return [(float) ($row['lon'] ?? 0.0), (float) ($row['lat'] ?? 0.0)];
+    }
+
+    public static function geoDist(PostgresExecutor $conn, string $name, string $memberA, string $memberB, string $unit = 'm', ?array $patterns = null): ?float
+    {
+        SyncUtils::validateIdentifier($name);
+        $sql = self::requireFamilyPattern($patterns, 'geodist', 'geo', 'geoDist');
+        $value = self::fetchColumn($conn, $sql, [$memberA, $memberB]);
+        if ($value === null) {
+            return null;
+        }
+        return self::geoFromMeters((float) $value, $unit);
+    }
+
+    /**
+     * Members within `$radius` of (`$lon`, `$lat`).
+     *
+     * Proxy contract: `$1=lon, $2=lat, $3=radius_m, $4=limit`. The proxy's
+     * CTE-anchor pattern means each `$N` appears exactly once in the SQL —
+     * after `$N → ?` translation we bind `[lon, lat, radius_m, limit]` in
+     * source order.
+     */
+    public static function geoRadius(PostgresExecutor $conn, string $name, float $lon, float $lat, float $radius, string $unit = 'm', int $limit = 50, ?array $patterns = null): array
+    {
+        SyncUtils::validateIdentifier($name);
+        $sql = self::requireFamilyPattern($patterns, 'georadius_with_dist', 'geo', 'geoRadius');
+        $radiusM = self::geoToMeters($radius, $unit);
+        return self::fetchAll($conn, $sql, [$lon, $lat, $radiusM, $limit]);
+    }
+
+    /**
+     * Members within `$radius` of `$member`'s location.
+     *
+     * Proxy contract: `$1`+`$2` both bind the anchor member name (one for the
+     * join, one for the self-exclusion); `$3=radius_m, $4=limit`. After
+     * `$N → ?` translation, source-text order yields four `?` markers, so we
+     * bind `[member, member, radius_m, limit]`.
+     */
+    public static function geoRadiusByMember(PostgresExecutor $conn, string $name, string $member, float $radius, string $unit = 'm', int $limit = 50, ?array $patterns = null): array
+    {
+        SyncUtils::validateIdentifier($name);
+        $sql = self::requireFamilyPattern($patterns, 'geosearch_member', 'geo', 'geoRadiusByMember');
+        $radiusM = self::geoToMeters($radius, $unit);
+        return self::fetchAll($conn, $sql, [$member, $member, $radiusM, $limit]);
+    }
+
+    public static function geoRemove(PostgresExecutor $conn, string $name, string $member, ?array $patterns = null): bool
+    {
+        SyncUtils::validateIdentifier($name);
+        $sql = self::requireFamilyPattern($patterns, 'geo_remove', 'geo', 'geoRemove');
+        $result = self::exec($conn, $sql, [$member]);
+        return ($result->getRowCount() ?? 0) > 0;
+    }
+
+    public static function geoCount(PostgresExecutor $conn, string $name, ?array $patterns = null): int
+    {
+        SyncUtils::validateIdentifier($name);
+        $sql = self::requireFamilyPattern($patterns, 'geo_count', 'geo', 'geoCount');
+        $value = self::fetchColumn($conn, $sql);
+        return $value !== null ? (int) $value : 0;
     }
 
     // ========================================================================
@@ -875,25 +1004,10 @@ class Utils
     // Streams
     // ========================================================================
 
-    private static function requireStreamPattern(?array $patterns, string $key, string $fn): string
-    {
-        if ($patterns === null || !isset($patterns['query_patterns'])) {
-            throw new \RuntimeException(
-                "{$fn} requires DDL patterns from the proxy — call via "
-                . "\$gl->{$fn}(...) rather than Utils::{$fn} directly."
-            );
-        }
-        $qp = $patterns['query_patterns'];
-        if (!isset($qp[$key])) {
-            throw new \RuntimeException("DDL API response missing pattern '{$key}' for {$fn}");
-        }
-        return \GoldLapel\Ddl::toPdoPlaceholders($qp[$key]);
-    }
-
     public static function streamAdd(PostgresExecutor $conn, string $stream, array $payload, ?array $patterns = null): int
     {
         SyncUtils::validateIdentifier($stream);
-        $sql = self::requireStreamPattern($patterns, 'insert', 'streamAdd');
+        $sql = self::requireFamilyPattern($patterns, 'insert', 'stream', 'streamAdd');
         $withCast = str_replace('VALUES (?)', 'VALUES (?::jsonb)', $sql);
         $id = self::fetchColumn($conn, $withCast, [json_encode($payload)]);
         return (int) $id;
@@ -902,7 +1016,7 @@ class Utils
     public static function streamCreateGroup(PostgresExecutor $conn, string $stream, string $group, ?array $patterns = null): void
     {
         SyncUtils::validateIdentifier($stream);
-        $sql = self::requireStreamPattern($patterns, 'create_group', 'streamCreateGroup');
+        $sql = self::requireFamilyPattern($patterns, 'create_group', 'stream', 'streamCreateGroup');
         self::exec($conn, $sql, [$group]);
     }
 
@@ -920,10 +1034,10 @@ class Utils
         ?array $patterns = null,
     ): array {
         SyncUtils::validateIdentifier($stream);
-        $cursorSql = self::requireStreamPattern($patterns, 'group_get_cursor', 'streamRead');
-        $readSql = self::requireStreamPattern($patterns, 'read_since', 'streamRead');
-        $advanceSql = self::requireStreamPattern($patterns, 'group_advance_cursor', 'streamRead');
-        $pendingSql = self::requireStreamPattern($patterns, 'pending_insert', 'streamRead');
+        $cursorSql = self::requireFamilyPattern($patterns, 'group_get_cursor', 'stream', 'streamRead');
+        $readSql = self::requireFamilyPattern($patterns, 'read_since', 'stream', 'streamRead');
+        $advanceSql = self::requireFamilyPattern($patterns, 'group_advance_cursor', 'stream', 'streamRead');
+        $pendingSql = self::requireFamilyPattern($patterns, 'pending_insert', 'stream', 'streamRead');
 
         $tx = $conn->beginTransaction();
         try {
@@ -971,7 +1085,7 @@ class Utils
         ?array $patterns = null,
     ): bool {
         SyncUtils::validateIdentifier($stream);
-        $sql = self::requireStreamPattern($patterns, 'ack', 'streamAck');
+        $sql = self::requireFamilyPattern($patterns, 'ack', 'stream', 'streamAck');
         $result = self::exec($conn, $sql, [$group, $messageId]);
         return ($result->getRowCount() ?? 0) > 0;
     }
@@ -985,8 +1099,8 @@ class Utils
         ?array $patterns = null,
     ): array {
         SyncUtils::validateIdentifier($stream);
-        $claimSql = self::requireStreamPattern($patterns, 'claim', 'streamClaim');
-        $readByIdSql = self::requireStreamPattern($patterns, 'read_by_id', 'streamClaim');
+        $claimSql = self::requireFamilyPattern($patterns, 'claim', 'stream', 'streamClaim');
+        $readByIdSql = self::requireFamilyPattern($patterns, 'read_by_id', 'stream', 'streamClaim');
 
         $claimedRows = self::fetchAll($conn, $claimSql, [$consumer, $group, $minIdleMs]);
         $claimed = array_map(fn($r) => (int) $r['message_id'], $claimedRows);

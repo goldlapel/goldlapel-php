@@ -199,43 +199,40 @@ class IntegrationTest extends TestCase
     {
         $port = $this->uniqPort();
         $gl = GoldLapel::start(self::$upstream, ['proxy_port' => $port, 'silent' => true])->await();
-        $table = 'amp_counters_' . bin2hex(random_bytes(4));
+        $name = 'amp_counters_' . bin2hex(random_bytes(4));
         try {
-            $v1 = $gl->incr($table, 'orders')->await();
-            $v2 = $gl->incr($table, 'orders', 5)->await();
+            $v1 = $gl->counters->incr($name, 'orders')->await();
+            $v2 = $gl->counters->incr($name, 'orders', 5)->await();
             $this->assertSame(1, $v1);
             $this->assertSame(6, $v2);
-            $this->assertSame(6, $gl->getCounter($table, 'orders')->await());
+            $this->assertSame(6, $gl->counters->get($name, 'orders')->await());
         } finally {
-            $this->cleanup($table, $gl);
             $gl->stop()->await();
         }
     }
 
-    public function testHashOperationsIncludingHdel(): void
+    public function testHashOperationsIncludingDelete(): void
     {
-        // Exercises the jsonb `?` operator in hdel + hget round-trip.
         $port = $this->uniqPort();
         $gl = GoldLapel::start(self::$upstream, ['proxy_port' => $port, 'silent' => true])->await();
-        $table = 'amp_hash_' . bin2hex(random_bytes(4));
+        $name = 'amp_hash_' . bin2hex(random_bytes(4));
         try {
-            $gl->hset($table, 'user:1', 'name', 'alice')->await();
-            $gl->hset($table, 'user:1', 'age', 30)->await();
-            $this->assertSame('alice', $gl->hget($table, 'user:1', 'name')->await());
-            $this->assertSame(30, $gl->hget($table, 'user:1', 'age')->await());
+            $gl->hashes->set($name, 'user:1', 'name', 'alice')->await();
+            $gl->hashes->set($name, 'user:1', 'age', 30)->await();
+            $this->assertSame('alice', $gl->hashes->get($name, 'user:1', 'name')->await());
+            $this->assertSame(30, $gl->hashes->get($name, 'user:1', 'age')->await());
 
-            $deleted = $gl->hdel($table, 'user:1', 'name')->await();
+            $deleted = $gl->hashes->delete($name, 'user:1', 'name')->await();
             $this->assertTrue($deleted);
-            $this->assertNull($gl->hget($table, 'user:1', 'name')->await());
+            $this->assertNull($gl->hashes->get($name, 'user:1', 'name')->await());
 
-            $notDeleted = $gl->hdel($table, 'user:1', 'nonexistent')->await();
+            $notDeleted = $gl->hashes->delete($name, 'user:1', 'nonexistent')->await();
             $this->assertFalse($notDeleted);
 
-            $all = $gl->hgetall($table, 'user:1')->await();
+            $all = $gl->hashes->getAll($name, 'user:1')->await();
             $this->assertArrayHasKey('age', $all);
             $this->assertArrayNotHasKey('name', $all);
         } finally {
-            $this->cleanup($table, $gl);
             $gl->stop()->await();
         }
     }
@@ -250,17 +247,16 @@ class IntegrationTest extends TestCase
             $tx = $gl->connection()->beginTransaction();
             $result = $gl->using($tx, function ($gl) use ($coll, $cnt) {
                 $gl->documents->insert($coll, ['type' => 'signup'])->await();
-                $gl->incr($cnt, 'signups')->await();
+                $gl->counters->incr($cnt, 'signups')->await();
                 return 'ok';
             })->await();
             $this->assertSame('ok', $result);
             $tx->commit();
 
             $this->assertSame(1, $gl->documents->count($coll)->await());
-            $this->assertSame(1, $gl->getCounter($cnt, 'signups')->await());
+            $this->assertSame(1, $gl->counters->get($cnt, 'signups')->await());
         } finally {
             $this->cleanup($coll, $gl);
-            $this->cleanup($cnt, $gl);
             $gl->stop()->await();
         }
     }

@@ -23,6 +23,11 @@ final class Ddl
     private const SUPPORTED_VERSIONS = [
         'stream' => 'v1',
         'doc_store' => 'v1',
+        'counter' => 'v1',
+        'zset' => 'v1',
+        'hash' => 'v1',
+        'queue' => 'v1',
+        'geo' => 'v1',
     ];
 
     public static function supportedVersion(string $family): string
