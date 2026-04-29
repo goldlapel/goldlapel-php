@@ -94,6 +94,19 @@ class GoldLapel
     private static bool $cleanupRegistered = false;
 
     /**
+     * Documents sub-API — `$gl->documents-><verb>(...)`. Holds a back-reference
+     * to this client; reads dashboard token / port / cache through it.
+     * Schema-to-core Phase 4: doc-store DDL is owned by the proxy.
+     */
+    public readonly Documents $documents;
+
+    /**
+     * Streams sub-API — `$gl->streams-><verb>(...)`. Holds a back-reference
+     * to this client; reads dashboard token / port / cache through it.
+     */
+    public readonly Streams $streams;
+
+    /**
      * Stream the startup banner is written to. Defaults to STDERR; tests
      * can swap this for a php://memory stream (or a userland stream
      * wrapper) to capture output, or to inject a throwing write to
@@ -132,6 +145,13 @@ class GoldLapel
         // Leave structured-config validation to SyncGoldLapel::configToArgs()
         // at spawn time — same contract as the sync wrapper pre-rollout.
         $this->scopedConn = new FiberLocal(static fn () => null);
+
+        // Nested namespaces — see src/Amp/Documents.php and src/Amp/Streams.php.
+        // These are the canonical schema-to-core sub-API instances. Each
+        // holds a back-reference to this client for shared state (license,
+        // dashboard token, PDO/PostgresExecutor, DDL pattern cache).
+        $this->documents = new Documents($this);
+        $this->streams = new Streams($this);
     }
 
     /**
@@ -578,6 +598,41 @@ class GoldLapel
     }
 
     /**
+     * Public alias of resolveConn() for the sub-API namespace classes
+     * (GoldLapel\Amp\Documents, GoldLapel\Amp\Streams). PHP doesn't have
+     * package-private visibility, so we expose with a `Public` suffix to
+     * discourage user code from calling it directly.
+     *
+     * @internal Used only by GoldLapel\Amp\Documents and GoldLapel\Amp\Streams.
+     */
+    public function resolveConnPublic(?PostgresExecutor $conn): PostgresExecutor
+    {
+        return $this->resolveConn($conn);
+    }
+
+    /**
+     * Dashboard token provisioned by start(). Used by the Documents/Streams
+     * sub-API namespaces to authenticate with the proxy's DDL endpoints.
+     * Mirrors the sync `dashboardToken()` accessor.
+     */
+    public function dashboardToken(): ?string
+    {
+        return $this->dashboardToken;
+    }
+
+    /**
+     * Per-instance DDL pattern cache (passed by reference). Used by the
+     * Documents/Streams sub-API namespaces so `Ddl::fetchPatterns` can
+     * read/write the same array. Mirrors the sync `&ddlCache()` accessor.
+     *
+     * @return array<string, array<string, mixed>> by-reference
+     */
+    public function &ddlCache(): array
+    {
+        return $this->ddlCache;
+    }
+
+    /**
      * Convert a `postgres://user:pass@host:port/db` URL to the
      * space-separated `host=... port=... user=... password=... dbname=...`
      * keyword form that Amp\Postgres\PostgresConfig::fromString() expects.
@@ -672,181 +727,7 @@ class GoldLapel
     // `->await()`. SQL work happens on the resolved executor.
     // ------------------------------------------------------------------
 
-    // Document Store
-
-    public function docInsert(string $collection, array $document, ?PostgresExecutor $conn = null): Future
-    {
-        $c = $this->resolveConn($conn);
-        return async(fn() => Utils::docInsert($c, $collection, $document));
-    }
-
-    public function docInsertMany(string $collection, array $documents, ?PostgresExecutor $conn = null): Future
-    {
-        $c = $this->resolveConn($conn);
-        return async(fn() => Utils::docInsertMany($c, $collection, $documents));
-    }
-
-    public function docFind(
-        string $collection,
-        ?array $filter = null,
-        ?array $sort = null,
-        ?int $limit = null,
-        ?int $skip = null,
-        ?PostgresExecutor $conn = null,
-    ): Future {
-        $c = $this->resolveConn($conn);
-        return async(fn() => Utils::docFind($c, $collection, $filter, $sort, $limit, $skip));
-    }
-
-    public function docFindOne(string $collection, ?array $filter = null, ?PostgresExecutor $conn = null): Future
-    {
-        $c = $this->resolveConn($conn);
-        return async(fn() => Utils::docFindOne($c, $collection, $filter));
-    }
-
-    public function docUpdate(string $collection, array $filter, array $update, ?PostgresExecutor $conn = null): Future
-    {
-        $c = $this->resolveConn($conn);
-        return async(fn() => Utils::docUpdate($c, $collection, $filter, $update));
-    }
-
-    public function docUpdateOne(string $collection, array $filter, array $update, ?PostgresExecutor $conn = null): Future
-    {
-        $c = $this->resolveConn($conn);
-        return async(fn() => Utils::docUpdateOne($c, $collection, $filter, $update));
-    }
-
-    public function docDelete(string $collection, array $filter, ?PostgresExecutor $conn = null): Future
-    {
-        $c = $this->resolveConn($conn);
-        return async(fn() => Utils::docDelete($c, $collection, $filter));
-    }
-
-    public function docDeleteOne(string $collection, array $filter, ?PostgresExecutor $conn = null): Future
-    {
-        $c = $this->resolveConn($conn);
-        return async(fn() => Utils::docDeleteOne($c, $collection, $filter));
-    }
-
-    public function docCount(string $collection, ?array $filter = null, ?PostgresExecutor $conn = null): Future
-    {
-        $c = $this->resolveConn($conn);
-        return async(fn() => Utils::docCount($c, $collection, $filter));
-    }
-
-    public function docCreateIndex(string $collection, ?array $keys = null, ?PostgresExecutor $conn = null): Future
-    {
-        $c = $this->resolveConn($conn);
-        return async(fn() => Utils::docCreateIndex($c, $collection, $keys));
-    }
-
-    public function docAggregate(string $collection, array $pipeline, ?PostgresExecutor $conn = null): Future
-    {
-        $c = $this->resolveConn($conn);
-        return async(fn() => Utils::docAggregate($c, $collection, $pipeline));
-    }
-
-    /**
-     * Install the change-stream trigger and (optionally) run a long-lived
-     * listener. If $callback is non-null, the Future blocks until the
-     * listener stops; this requires a full PostgresConnection as the
-     * executor.
-     */
-    public function docWatch(string $collection, ?callable $callback = null, ?PostgresExecutor $conn = null): Future
-    {
-        // Resolve in the caller's fiber so the fiber-local `using()` scope
-        // is honoured (inner async() spawns a fresh fiber with its own
-        // empty FiberLocal slot).
-        $c = $this->resolveConn($conn);
-        if (!$c instanceof PostgresConnection) {
-            throw new \InvalidArgumentException(
-                'docWatch requires a PostgresConnection (LISTEN is not supported on transactions).'
-            );
-        }
-        return async(fn() => Utils::docWatch($c, $collection, $callback));
-    }
-
-    public function docUnwatch(string $collection, ?PostgresExecutor $conn = null): Future
-    {
-        $c = $this->resolveConn($conn);
-        return async(fn() => Utils::docUnwatch($c, $collection));
-    }
-
-    public function docCreateTtlIndex(
-        string $collection,
-        int $expireAfterSeconds,
-        string $field = 'created_at',
-        ?PostgresExecutor $conn = null,
-    ): Future {
-        $c = $this->resolveConn($conn);
-        return async(fn() => Utils::docCreateTtlIndex($c, $collection, $expireAfterSeconds, $field));
-    }
-
-    public function docRemoveTtlIndex(string $collection, ?PostgresExecutor $conn = null): Future
-    {
-        $c = $this->resolveConn($conn);
-        return async(fn() => Utils::docRemoveTtlIndex($c, $collection));
-    }
-
-    public function docCreateCollection(string $collection, bool $unlogged = false, ?PostgresExecutor $conn = null): Future
-    {
-        $c = $this->resolveConn($conn);
-        return async(fn() => Utils::docCreateCollection($c, $collection, $unlogged));
-    }
-
-    public function docCreateCapped(string $collection, int $maxDocuments, ?PostgresExecutor $conn = null): Future
-    {
-        $c = $this->resolveConn($conn);
-        return async(fn() => Utils::docCreateCapped($c, $collection, $maxDocuments));
-    }
-
-    public function docRemoveCap(string $collection, ?PostgresExecutor $conn = null): Future
-    {
-        $c = $this->resolveConn($conn);
-        return async(fn() => Utils::docRemoveCap($c, $collection));
-    }
-
-    /**
-     * Returns an Amp\Pipeline\ConcurrentIterator<array> — iterate with
-     * foreach inside a fiber. The call itself is synchronous (no Future
-     * wrap) because the iterator is the awaitable. Requires a full
-     * PostgresConnection (cursor needs its own transaction).
-     */
-    public function docFindCursor(
-        string $collection,
-        ?array $filter = null,
-        ?array $sort = null,
-        ?int $limit = null,
-        ?int $skip = null,
-        int $batchSize = 100,
-        ?PostgresExecutor $conn = null,
-    ): \Amp\Pipeline\ConcurrentIterator {
-        $c = $this->resolveConn($conn);
-        if (!$c instanceof PostgresConnection) {
-            throw new \InvalidArgumentException(
-                'docFindCursor requires a PostgresConnection (cursor-in-transaction).'
-            );
-        }
-        return Utils::docFindCursor($c, $collection, $filter, $sort, $limit, $skip, $batchSize);
-    }
-
-    public function docFindOneAndUpdate(string $collection, array $filter, array $update, ?PostgresExecutor $conn = null): Future
-    {
-        $c = $this->resolveConn($conn);
-        return async(fn() => Utils::docFindOneAndUpdate($c, $collection, $filter, $update));
-    }
-
-    public function docFindOneAndDelete(string $collection, array $filter, ?PostgresExecutor $conn = null): Future
-    {
-        $c = $this->resolveConn($conn);
-        return async(fn() => Utils::docFindOneAndDelete($c, $collection, $filter));
-    }
-
-    public function docDistinct(string $collection, string $field, ?array $filter = null, ?PostgresExecutor $conn = null): Future
-    {
-        $c = $this->resolveConn($conn);
-        return async(fn() => Utils::docDistinct($c, $collection, $field, $filter));
-    }
+    // Document Store: $gl->documents-><verb>(...). See src/Amp/Documents.php.
 
     // Search
 
@@ -1108,64 +989,7 @@ class GoldLapel
         return async(fn() => Utils::script($c, $luaCode, ...$args));
     }
 
-    // Streams — proxy-owned DDL. First call fetches canonical query patterns
-    // from /api/ddl/stream/create; cache is keyed on (family, name) per instance.
-
-    private function streamPatterns(string $stream): array
-    {
-        $token = $this->dashboardToken ?? \GoldLapel\Ddl::tokenFromEnvOrFile();
-        return \GoldLapel\Ddl::fetchPatterns($this->ddlCache, 'stream', $stream, $this->dashboardPort, $token);
-    }
-
-    public function streamAdd(string $stream, array $payload, ?PostgresExecutor $conn = null): Future
-    {
-        $patterns = $this->streamPatterns($stream);
-        $c = $this->resolveConn($conn);
-        return async(fn() => Utils::streamAdd($c, $stream, $payload, $patterns));
-    }
-
-    public function streamCreateGroup(string $stream, string $group, ?PostgresExecutor $conn = null): Future
-    {
-        $patterns = $this->streamPatterns($stream);
-        $c = $this->resolveConn($conn);
-        return async(fn() => Utils::streamCreateGroup($c, $stream, $group, $patterns));
-    }
-
-    public function streamRead(
-        string $stream,
-        string $group,
-        string $consumer,
-        int $count = 1,
-        ?PostgresExecutor $conn = null,
-    ): Future {
-        $patterns = $this->streamPatterns($stream);
-        $c = $this->resolveConn($conn);
-        if (!$c instanceof PostgresConnection) {
-            throw new \InvalidArgumentException(
-                'streamRead requires a PostgresConnection (opens its own transaction).'
-            );
-        }
-        return async(fn() => Utils::streamRead($c, $stream, $group, $consumer, $count, $patterns));
-    }
-
-    public function streamAck(string $stream, string $group, int $messageId, ?PostgresExecutor $conn = null): Future
-    {
-        $patterns = $this->streamPatterns($stream);
-        $c = $this->resolveConn($conn);
-        return async(fn() => Utils::streamAck($c, $stream, $group, $messageId, $patterns));
-    }
-
-    public function streamClaim(
-        string $stream,
-        string $group,
-        string $consumer,
-        int $minIdleMs = 60000,
-        ?PostgresExecutor $conn = null,
-    ): Future {
-        $patterns = $this->streamPatterns($stream);
-        $c = $this->resolveConn($conn);
-        return async(fn() => Utils::streamClaim($c, $stream, $group, $consumer, $minIdleMs, $patterns));
-    }
+    // Streams: $gl->streams-><verb>(...). See src/Amp/Streams.php.
 
     // Percolate
 

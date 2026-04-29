@@ -56,7 +56,7 @@ class StreamsIntegrationTest extends TestCase
             'silent' => true,
         ]);
         try {
-            $gl->streamAdd($name, ['type' => 'click']);
+            $gl->streams->add($name, ['type' => 'click']);
 
             $direct = new \PDO(self::_toPdoDsn(self::$pgUrl));
             $stmt = $direct->prepare(
@@ -87,7 +87,7 @@ class StreamsIntegrationTest extends TestCase
             'silent' => true,
         ]);
         try {
-            $gl->streamAdd($name, ['type' => 'click']);
+            $gl->streams->add($name, ['type' => 'click']);
             $direct = new \PDO(self::_toPdoDsn(self::$pgUrl));
             $stmt = $direct->prepare(
                 "SELECT family, name, schema_version FROM _goldlapel.schema_meta "
@@ -113,16 +113,16 @@ class StreamsIntegrationTest extends TestCase
             'silent' => true,
         ]);
         try {
-            $gl->streamCreateGroup($name, 'workers');
-            $gl->streamAdd($name, ['i' => 1]);
-            $gl->streamAdd($name, ['i' => 2]);
-            $msgs = $gl->streamRead($name, 'workers', 'c', 10);
+            $gl->streams->createGroup($name, 'workers');
+            $gl->streams->add($name, ['i' => 1]);
+            $gl->streams->add($name, ['i' => 2]);
+            $msgs = $gl->streams->read($name, 'workers', 'c', 10);
             $this->assertCount(2, $msgs);
             $this->assertSame(['i' => 1], $msgs[0]['payload']);
 
-            $ok = $gl->streamAck($name, 'workers', (int) $msgs[0]['id']);
+            $ok = $gl->streams->ack($name, 'workers', (int) $msgs[0]['id']);
             $this->assertTrue($ok);
-            $again = $gl->streamAck($name, 'workers', (int) $msgs[0]['id']);
+            $again = $gl->streams->ack($name, 'workers', (int) $msgs[0]['id']);
             $this->assertFalse($again);
         } finally {
             $gl->stop();

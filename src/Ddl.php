@@ -22,6 +22,7 @@ final class Ddl
 {
     private const SUPPORTED_VERSIONS = [
         'stream' => 'v1',
+        'doc_store' => 'v1',
     ];
 
     public static function supportedVersion(string $family): string
@@ -60,8 +61,15 @@ final class Ddl
     /**
      * Fetch (and cache) the canonical {tables, query_patterns} for a helper.
      *
+     * `$options` is a per-family creation-options bag (e.g. doc_store accepts
+     * `['unlogged' => true]`). Only used on the first call for a given
+     * (family, name) — subsequent calls are no-op DDL on the proxy side
+     * (CREATE TABLE IF NOT EXISTS), so options on later calls are silently
+     * ignored. Wrappers don't migrate storage type.
+     *
      * @param array<string, array<string, mixed>> $cache passed by reference;
      *                                            caller supplies the per-instance cache.
+     * @param array<string, mixed>|null $options per-family creation options
      * @return array{tables: array<string, string>, query_patterns: array<string, string>}
      */
     public static function fetchPatterns(
@@ -69,7 +77,8 @@ final class Ddl
         string $family,
         string $name,
         int $dashboardPort,
-        ?string $dashboardToken
+        ?string $dashboardToken,
+        ?array $options = null
     ): array {
         $key = $family . ':' . $name;
         if (isset($cache[$key])) {
@@ -90,10 +99,14 @@ final class Ddl
         }
 
         $url = "http://127.0.0.1:{$dashboardPort}/api/ddl/{$family}/create";
-        $body = json_encode([
+        $payload = [
             'name' => $name,
             'schema_version' => self::supportedVersion($family),
-        ]);
+        ];
+        if ($options !== null && $options !== []) {
+            $payload['options'] = $options;
+        }
+        $body = json_encode($payload);
 
         [$status, $parsed, $raw] = self::postJson($url, $dashboardToken, $body);
 

@@ -1123,47 +1123,87 @@ class Utils
         return [$expr, $params];
     }
 
-    private static function ensureCollection(\PDO $pdo, string $collection, bool $unlogged = false): void
+    /**
+     * Resolve the canonical doc-store table name from proxy-fetched patterns.
+     *
+     * Returns the FQ table name (e.g. `_goldlapel.doc_users`). Throws if
+     * `$patterns` is null — the wrapper API never builds DDL itself anymore;
+     * `$gl->documents-><verb>(...)` always supplies patterns.
+     */
+    private static function docTable(?array $patterns): string
     {
-        $prefix = $unlogged ? 'CREATE UNLOGGED TABLE' : 'CREATE TABLE';
-        $pdo->exec(
-            "{$prefix} IF NOT EXISTS {$collection} ("
-            . "_id UUID PRIMARY KEY DEFAULT gen_random_uuid(), "
-            . "data JSONB NOT NULL, "
-            . "created_at TIMESTAMPTZ DEFAULT NOW())"
-        );
+        if ($patterns === null || !isset($patterns['tables']['main'])) {
+            throw new \RuntimeException(
+                'doc* utils now require DDL patterns from the proxy — call via '
+                . '`$gl->documents-><verb>(...)` rather than the Utils function directly.'
+            );
+        }
+        return $patterns['tables']['main'];
+    }
+
+    /**
+     * Build a deterministic auxiliary index/trigger/function name keyed off
+     * a (possibly schema-qualified) table reference. Strips any `schema.`
+     * prefix so the name doesn't contain a dot — Postgres rejects those
+     * without quoting.
+     */
+    private static function docAuxName(string $table, string $suffix): string
+    {
+        $parts = explode('.', $table);
+        $bare = end($parts);
+        return "{$bare}_{$suffix}";
     }
 
     /**
      * Explicitly create a collection table. Like MongoDB createCollection().
      * Optionally creates an UNLOGGED table for high-throughput ephemeral data.
      * UNLOGGED tables are not crash-safe but significantly faster for writes.
+     *
+     * Phase 4 of schema-to-core: the proxy owns DDL. The DocumentsAPI sub-API
+     * (`$gl->documents`) issues the `/api/ddl/doc_store/create` call before
+     * dispatching here, so by the time this runs the canonical table already
+     * exists. We accept `?array $patterns` to keep the signature aligned with
+     * every other doc* helper and to fail loud if a caller pokes at the util
+     * directly without going through the namespace.
      */
-    public static function docCreateCollection(\PDO $pdo, string $collection, bool $unlogged = false): void
-    {
+    public static function docCreateCollection(
+        \PDO $pdo,
+        string $collection,
+        bool $unlogged = false,
+        ?array $patterns = null,
+    ): void {
         self::validateIdentifier($collection);
-        self::ensureCollection($pdo, $collection, $unlogged);
+        self::docTable($patterns); // validates patterns; no further work needed
+        // No-op on this side — the proxy already executed the DDL.
     }
 
-    public static function docInsert(\PDO $pdo, string $collection, array $document): array
-    {
+    public static function docInsert(
+        \PDO $pdo,
+        string $collection,
+        array $document,
+        ?array $patterns = null,
+    ): array {
         self::validateIdentifier($collection);
-        self::ensureCollection($pdo, $collection);
+        $table = self::docTable($patterns);
         $stmt = $pdo->prepare(
-            "INSERT INTO {$collection} (data) VALUES (?::jsonb) RETURNING _id, data, created_at"
+            "INSERT INTO {$table} (data) VALUES (?::jsonb) RETURNING _id, data, created_at"
         );
         $stmt->execute([json_encode($document)]);
         return $stmt->fetch(\PDO::FETCH_ASSOC);
     }
 
-    public static function docInsertMany(\PDO $pdo, string $collection, array $documents): array
-    {
+    public static function docInsertMany(
+        \PDO $pdo,
+        string $collection,
+        array $documents,
+        ?array $patterns = null,
+    ): array {
         self::validateIdentifier($collection);
-        self::ensureCollection($pdo, $collection);
+        $table = self::docTable($patterns);
         $placeholders = implode(', ', array_map(fn() => '(?::jsonb)', $documents));
         $params = array_map(fn($d) => json_encode($d), $documents);
         $stmt = $pdo->prepare(
-            "INSERT INTO {$collection} (data) VALUES {$placeholders} RETURNING _id, data, created_at"
+            "INSERT INTO {$table} (data) VALUES {$placeholders} RETURNING _id, data, created_at"
         );
         $stmt->execute($params);
         return $stmt->fetchAll(\PDO::FETCH_ASSOC);
@@ -1176,10 +1216,12 @@ class Utils
         ?array $sort = null,
         ?int $limit = null,
         ?int $skip = null,
+        ?array $patterns = null,
     ): array {
         self::validateIdentifier($collection);
+        $table = self::docTable($patterns);
         [$clause, $params] = self::buildFilter($filter);
-        $sql = "SELECT _id, data, created_at FROM {$collection}";
+        $sql = "SELECT _id, data, created_at FROM {$table}";
         if ($clause !== '') {
             $sql .= " WHERE {$clause}";
         }
@@ -1214,10 +1256,12 @@ class Utils
         ?int $limit = null,
         ?int $skip = null,
         int $batchSize = 100,
+        ?array $patterns = null,
     ): \Generator {
         self::validateIdentifier($collection);
+        $table = self::docTable($patterns);
         [$clause, $params] = self::buildFilter($filter);
-        $sql = "SELECT _id, data, created_at FROM {$collection}";
+        $sql = "SELECT _id, data, created_at FROM {$table}";
         if ($clause !== '') {
             $sql .= " WHERE {$clause}";
         }
@@ -1263,11 +1307,16 @@ class Utils
         }
     }
 
-    public static function docFindOne(\PDO $pdo, string $collection, ?array $filter = null): ?array
-    {
+    public static function docFindOne(
+        \PDO $pdo,
+        string $collection,
+        ?array $filter = null,
+        ?array $patterns = null,
+    ): ?array {
         self::validateIdentifier($collection);
+        $table = self::docTable($patterns);
         [$clause, $params] = self::buildFilter($filter);
-        $sql = "SELECT _id, data, created_at FROM {$collection}";
+        $sql = "SELECT _id, data, created_at FROM {$table}";
         if ($clause !== '') {
             $sql .= " WHERE {$clause}";
         }
@@ -1278,68 +1327,95 @@ class Utils
         return $row !== false ? $row : null;
     }
 
-    public static function docUpdate(\PDO $pdo, string $collection, array $filter, array $update): int
-    {
+    public static function docUpdate(
+        \PDO $pdo,
+        string $collection,
+        array $filter,
+        array $update,
+        ?array $patterns = null,
+    ): int {
         self::validateIdentifier($collection);
+        $table = self::docTable($patterns);
         [$clause, $filterParams] = self::buildFilter($filter);
         [$updateExpr, $updateParams] = self::buildUpdate($update);
         $where = $clause !== '' ? $clause : 'TRUE';
         $allParams = [...$updateParams, ...$filterParams];
         $stmt = $pdo->prepare(
-            "UPDATE {$collection} SET data = {$updateExpr} WHERE {$where}"
+            "UPDATE {$table} SET data = {$updateExpr} WHERE {$where}"
         );
         $stmt->execute($allParams);
         return $stmt->rowCount();
     }
 
-    public static function docUpdateOne(\PDO $pdo, string $collection, array $filter, array $update): int
-    {
+    public static function docUpdateOne(
+        \PDO $pdo,
+        string $collection,
+        array $filter,
+        array $update,
+        ?array $patterns = null,
+    ): int {
         self::validateIdentifier($collection);
+        $table = self::docTable($patterns);
         [$clause, $filterParams] = self::buildFilter($filter);
         [$updateExpr, $updateParams] = self::buildUpdate($update);
         $where = $clause !== '' ? $clause : 'TRUE';
         $allParams = [...$filterParams, ...$updateParams];
         $stmt = $pdo->prepare(
             "WITH target AS ("
-            . "SELECT _id FROM {$collection} WHERE {$where} LIMIT 1"
-            . ") UPDATE {$collection} SET data = {$updateExpr} "
-            . "FROM target WHERE {$collection}._id = target._id"
+            . "SELECT _id FROM {$table} WHERE {$where} LIMIT 1"
+            . ") UPDATE {$table} SET data = {$updateExpr} "
+            . "FROM target WHERE {$table}._id = target._id"
         );
         $stmt->execute($allParams);
         return $stmt->rowCount();
     }
 
-    public static function docDelete(\PDO $pdo, string $collection, array $filter): int
-    {
+    public static function docDelete(
+        \PDO $pdo,
+        string $collection,
+        array $filter,
+        ?array $patterns = null,
+    ): int {
         self::validateIdentifier($collection);
+        $table = self::docTable($patterns);
         [$clause, $params] = self::buildFilter($filter);
         $where = $clause !== '' ? $clause : 'TRUE';
         $stmt = $pdo->prepare(
-            "DELETE FROM {$collection} WHERE {$where}"
+            "DELETE FROM {$table} WHERE {$where}"
         );
         $stmt->execute($params);
         return $stmt->rowCount();
     }
 
-    public static function docDeleteOne(\PDO $pdo, string $collection, array $filter): int
-    {
+    public static function docDeleteOne(
+        \PDO $pdo,
+        string $collection,
+        array $filter,
+        ?array $patterns = null,
+    ): int {
         self::validateIdentifier($collection);
+        $table = self::docTable($patterns);
         [$clause, $params] = self::buildFilter($filter);
         $where = $clause !== '' ? $clause : 'TRUE';
         $stmt = $pdo->prepare(
             "WITH target AS ("
-            . "SELECT _id FROM {$collection} WHERE {$where} LIMIT 1"
-            . ") DELETE FROM {$collection} USING target WHERE {$collection}._id = target._id"
+            . "SELECT _id FROM {$table} WHERE {$where} LIMIT 1"
+            . ") DELETE FROM {$table} USING target WHERE {$table}._id = target._id"
         );
         $stmt->execute($params);
         return $stmt->rowCount();
     }
 
-    public static function docCount(\PDO $pdo, string $collection, ?array $filter = null): int
-    {
+    public static function docCount(
+        \PDO $pdo,
+        string $collection,
+        ?array $filter = null,
+        ?array $patterns = null,
+    ): int {
         self::validateIdentifier($collection);
+        $table = self::docTable($patterns);
         [$clause, $params] = self::buildFilter($filter);
-        $sql = "SELECT COUNT(*) FROM {$collection}";
+        $sql = "SELECT COUNT(*) FROM {$table}";
         if ($clause !== '') {
             $sql .= " WHERE {$clause}";
         }
@@ -1348,17 +1424,23 @@ class Utils
         return (int) $stmt->fetchColumn();
     }
 
-    public static function docFindOneAndUpdate(\PDO $pdo, string $collection, array $filter, array $update): ?array
-    {
+    public static function docFindOneAndUpdate(
+        \PDO $pdo,
+        string $collection,
+        array $filter,
+        array $update,
+        ?array $patterns = null,
+    ): ?array {
         self::validateIdentifier($collection);
+        $table = self::docTable($patterns);
         [$clause, $filterParams] = self::buildFilter($filter);
         [$updateExpr, $updateParams] = self::buildUpdate($update);
         $cteWhere = $clause !== '' ? " WHERE {$clause}" : '';
         $sql = "WITH target AS ("
-            . "SELECT _id FROM {$collection}{$cteWhere} LIMIT 1"
-            . ") UPDATE {$collection} SET data = {$updateExpr} FROM target "
-            . "WHERE {$collection}._id = target._id "
-            . "RETURNING {$collection}._id, {$collection}.data, {$collection}.created_at";
+            . "SELECT _id FROM {$table}{$cteWhere} LIMIT 1"
+            . ") UPDATE {$table} SET data = {$updateExpr} FROM target "
+            . "WHERE {$table}._id = target._id "
+            . "RETURNING {$table}._id, {$table}.data, {$table}.created_at";
         $allParams = [...$filterParams, ...$updateParams];
         $stmt = $pdo->prepare($sql);
         $stmt->execute($allParams);
@@ -1366,27 +1448,38 @@ class Utils
         return $row !== false ? $row : null;
     }
 
-    public static function docFindOneAndDelete(\PDO $pdo, string $collection, array $filter): ?array
-    {
+    public static function docFindOneAndDelete(
+        \PDO $pdo,
+        string $collection,
+        array $filter,
+        ?array $patterns = null,
+    ): ?array {
         self::validateIdentifier($collection);
+        $table = self::docTable($patterns);
         [$clause, $filterParams] = self::buildFilter($filter);
         $cteWhere = $clause !== '' ? " WHERE {$clause}" : '';
         $sql = "WITH target AS ("
-            . "SELECT _id FROM {$collection}{$cteWhere} LIMIT 1"
-            . ") DELETE FROM {$collection} USING target "
-            . "WHERE {$collection}._id = target._id "
-            . "RETURNING {$collection}._id, {$collection}.data, {$collection}.created_at";
+            . "SELECT _id FROM {$table}{$cteWhere} LIMIT 1"
+            . ") DELETE FROM {$table} USING target "
+            . "WHERE {$table}._id = target._id "
+            . "RETURNING {$table}._id, {$table}.data, {$table}.created_at";
         $stmt = $pdo->prepare($sql);
         $stmt->execute($filterParams);
         $row = $stmt->fetch(\PDO::FETCH_ASSOC);
         return $row !== false ? $row : null;
     }
 
-    public static function docDistinct(\PDO $pdo, string $collection, string $field, ?array $filter = null): array
-    {
+    public static function docDistinct(
+        \PDO $pdo,
+        string $collection,
+        string $field,
+        ?array $filter = null,
+        ?array $patterns = null,
+    ): array {
         self::validateIdentifier($collection);
+        $table = self::docTable($patterns);
         $fieldExpr = self::fieldPath($field);
-        $sql = "SELECT DISTINCT {$fieldExpr} FROM {$collection}";
+        $sql = "SELECT DISTINCT {$fieldExpr} FROM {$table}";
         $params = [];
         $whereParts = ["{$fieldExpr} IS NOT NULL"];
         [$filterClause, $filterParams] = self::buildFilter($filter);
@@ -1400,9 +1493,23 @@ class Utils
         return array_column($stmt->fetchAll(\PDO::FETCH_NUM), 0);
     }
 
-    public static function docAggregate(\PDO $pdo, string $collection, array $pipeline): array
-    {
+    /**
+     * Run a Mongo-style aggregation pipeline on a doc-store collection.
+     *
+     * `$lookupTables` is an optional `[user_collection => canonical_proxy_table]`
+     * map that resolves `$lookup.from` references to their proxy-canonical FQ
+     * tables (e.g. `_goldlapel.doc_orders`). Supplied by `Documents::aggregate`;
+     * direct callers may omit it (in which case `from` is used verbatim).
+     */
+    public static function docAggregate(
+        \PDO $pdo,
+        string $collection,
+        array $pipeline,
+        ?array $patterns = null,
+        ?array $lookupTables = null,
+    ): array {
         self::validateIdentifier($collection);
+        $table = self::docTable($patterns);
 
         if (empty($pipeline)) {
             return [];
@@ -1517,7 +1624,13 @@ class Utils
                 throw new \InvalidArgumentException("Invalid field name: {$asField}");
             }
 
-            $lookupSqls[] = "COALESCE((SELECT json_agg({$from}.data) FROM {$from} WHERE {$from}.data->>'{$foreignField}' = {$collection}.data->>'{$localField}'), '[]'::json) AS {$asField}";
+            // Resolve `from` to its canonical proxy table when the documents
+            // sub-API supplied a lookup map (Phase 4 schema-to-core). Direct
+            // util callers without a map keep the legacy public-schema name.
+            $fromTable = ($lookupTables !== null && isset($lookupTables[$from]))
+                ? $lookupTables[$from]
+                : $from;
+            $lookupSqls[] = "COALESCE((SELECT json_agg(_lk.data) FROM {$fromTable} _lk WHERE _lk.data->>'{$foreignField}' = {$table}.data->>'{$localField}'), '[]'::json) AS {$asField}";
         }
 
         // Build WHERE clause
@@ -1585,7 +1698,7 @@ class Utils
             $allParts = array_merge($projectParts, $lookupSqls);
             $selectFields = $allParts;
 
-            $sql = "SELECT " . implode(', ', $selectFields) . " FROM {$collection}";
+            $sql = "SELECT " . implode(', ', $selectFields) . " FROM {$table}";
 
             if ($unwindField !== null) {
                 $sql .= " CROSS JOIN jsonb_array_elements_text(data->'{$unwindField}') AS {$unwindAlias}";
@@ -1725,7 +1838,7 @@ class Utils
             }
 
             $allParts = array_merge($selectFields, $lookupSqls);
-            $sql = "SELECT " . implode(', ', $allParts) . " FROM {$collection}";
+            $sql = "SELECT " . implode(', ', $allParts) . " FROM {$table}";
 
             if ($unwindField !== null) {
                 $sql .= " CROSS JOIN jsonb_array_elements_text(data->'{$unwindField}') AS {$unwindAlias}";
@@ -1762,7 +1875,7 @@ class Utils
         } else {
             // No $project, no $group — default columns
             $baseParts = array_merge(['_id', 'data', 'created_at'], $lookupSqls);
-            $sql = "SELECT " . implode(', ', $baseParts) . " FROM {$collection}";
+            $sql = "SELECT " . implode(', ', $baseParts) . " FROM {$table}";
 
             if ($unwindField !== null) {
                 $sql .= " CROSS JOIN jsonb_array_elements_text(data->'{$unwindField}') AS {$unwindAlias}";
@@ -1803,12 +1916,18 @@ class Utils
         return $stmt->fetchAll(\PDO::FETCH_ASSOC);
     }
 
-    public static function docCreateIndex(\PDO $pdo, string $collection, ?array $keys = null): void
-    {
+    public static function docCreateIndex(
+        \PDO $pdo,
+        string $collection,
+        ?array $keys = null,
+        ?array $patterns = null,
+    ): void {
         self::validateIdentifier($collection);
+        $table = self::docTable($patterns);
         if ($keys === null || count($keys) === 0) {
+            $idx = self::docAuxName($table, 'data_gin');
             $pdo->exec(
-                "CREATE INDEX IF NOT EXISTS {$collection}_data_gin ON {$collection} USING GIN (data)"
+                "CREATE INDEX IF NOT EXISTS {$idx} ON {$table} USING GIN (data)"
             );
             return;
         }
@@ -1818,9 +1937,10 @@ class Utils
             }
             $order = $dir === -1 ? 'DESC' : 'ASC';
             $safeName = str_replace('.', '_', $key);
+            $idx = self::docAuxName($table, "{$safeName}_idx");
             $pdo->exec(
-                "CREATE INDEX IF NOT EXISTS {$collection}_{$safeName}_idx "
-                . "ON {$collection} ((data->>'{$key}') {$order})"
+                "CREATE INDEX IF NOT EXISTS {$idx} "
+                . "ON {$table} ((data->>'{$key}') {$order})"
             );
         }
     }
@@ -1829,9 +1949,17 @@ class Utils
     // Change Streams (Watch)
     // ========================================================================
 
-    public static function docWatch(\PDO $pdo, string $collection, ?callable $callback = null): void
-    {
+    public static function docWatch(
+        \PDO $pdo,
+        string $collection,
+        ?callable $callback = null,
+        ?array $patterns = null,
+    ): void {
         self::validateIdentifier($collection);
+        $table = self::docTable($patterns);
+        // Channel/function/trigger names key off the user's collection name
+        // (validated identifier — safe to interpolate). Triggers fire on the
+        // canonical proxy table.
         $channel = "{$collection}_changes";
         $funcName = "{$collection}_notify_fn";
         $triggerName = "{$collection}_notify_trg";
@@ -1857,21 +1985,25 @@ class Utils
         // across the product, so this is safe and matches the Go wrapper.
         $pdo->exec(
             "CREATE OR REPLACE TRIGGER {$triggerName} "
-            . "AFTER INSERT OR UPDATE OR DELETE ON {$collection} "
+            . "AFTER INSERT OR UPDATE OR DELETE ON {$table} "
             . "FOR EACH ROW EXECUTE FUNCTION {$funcName}()"
         );
 
         $pdo->exec("LISTEN {$channel}");
     }
 
-    public static function docUnwatch(\PDO $pdo, string $collection): void
-    {
+    public static function docUnwatch(
+        \PDO $pdo,
+        string $collection,
+        ?array $patterns = null,
+    ): void {
         self::validateIdentifier($collection);
+        $table = self::docTable($patterns);
         $channel = "{$collection}_changes";
         $funcName = "{$collection}_notify_fn";
         $triggerName = "{$collection}_notify_trg";
 
-        $pdo->exec("DROP TRIGGER IF EXISTS {$triggerName} ON {$collection}");
+        $pdo->exec("DROP TRIGGER IF EXISTS {$triggerName} ON {$table}");
         $pdo->exec("DROP FUNCTION IF EXISTS {$funcName}()");
         $pdo->exec("UNLISTEN {$channel}");
     }
@@ -1880,25 +2012,31 @@ class Utils
     // TTL Indexes
     // ========================================================================
 
-    public static function docCreateTtlIndex(\PDO $pdo, string $collection, int $expireAfterSeconds, string $field = 'created_at'): void
-    {
+    public static function docCreateTtlIndex(
+        \PDO $pdo,
+        string $collection,
+        int $expireAfterSeconds,
+        string $field = 'created_at',
+        ?array $patterns = null,
+    ): void {
         self::validateIdentifier($collection);
         self::validateIdentifier($field);
         if ($expireAfterSeconds <= 0) {
             throw new \InvalidArgumentException('expireAfterSeconds must be a positive integer');
         }
+        $table = self::docTable($patterns);
 
-        $idxName = "{$collection}_ttl_idx";
+        $idxName = self::docAuxName($table, 'ttl_idx');
         $funcName = "{$collection}_ttl_fn";
         $triggerName = "{$collection}_ttl_trg";
 
-        $pdo->exec("CREATE INDEX IF NOT EXISTS {$idxName} ON {$collection} ({$field})");
+        $pdo->exec("CREATE INDEX IF NOT EXISTS {$idxName} ON {$table} ({$field})");
 
         $pdo->exec("
             CREATE OR REPLACE FUNCTION {$funcName}()
             RETURNS TRIGGER LANGUAGE plpgsql AS \$\$
             BEGIN
-                DELETE FROM {$collection} WHERE {$field} < NOW() - INTERVAL '{$expireAfterSeconds} seconds';
+                DELETE FROM {$table} WHERE {$field} < NOW() - INTERVAL '{$expireAfterSeconds} seconds';
                 RETURN NEW;
             END;
             \$\$
@@ -1908,20 +2046,24 @@ class Utils
         // See docWatch for rationale.
         $pdo->exec(
             "CREATE OR REPLACE TRIGGER {$triggerName} "
-            . "BEFORE INSERT ON {$collection} "
+            . "BEFORE INSERT ON {$table} "
             . "FOR EACH ROW EXECUTE FUNCTION {$funcName}()"
         );
     }
 
-    public static function docRemoveTtlIndex(\PDO $pdo, string $collection): void
-    {
+    public static function docRemoveTtlIndex(
+        \PDO $pdo,
+        string $collection,
+        ?array $patterns = null,
+    ): void {
         self::validateIdentifier($collection);
+        $table = self::docTable($patterns);
 
-        $idxName = "{$collection}_ttl_idx";
+        $idxName = self::docAuxName($table, 'ttl_idx');
         $funcName = "{$collection}_ttl_fn";
         $triggerName = "{$collection}_ttl_trg";
 
-        $pdo->exec("DROP TRIGGER IF EXISTS {$triggerName} ON {$collection}");
+        $pdo->exec("DROP TRIGGER IF EXISTS {$triggerName} ON {$table}");
         $pdo->exec("DROP FUNCTION IF EXISTS {$funcName}()");
         $pdo->exec("DROP INDEX IF EXISTS {$idxName}");
     }
@@ -1930,14 +2072,20 @@ class Utils
     // Capped Collections
     // ========================================================================
 
-    public static function docCreateCapped(\PDO $pdo, string $collection, int $maxDocuments): void
-    {
+    public static function docCreateCapped(
+        \PDO $pdo,
+        string $collection,
+        int $maxDocuments,
+        ?array $patterns = null,
+    ): void {
         self::validateIdentifier($collection);
         if ($maxDocuments <= 0) {
             throw new \InvalidArgumentException('maxDocuments must be a positive integer');
         }
-
-        self::ensureCollection($pdo, $collection);
+        // The underlying doc-store table is already materialized by the
+        // proxy (Documents::patterns issues create on first call). This
+        // call only adds the cap trigger + supporting bookkeeping.
+        $table = self::docTable($patterns);
 
         $funcName = "{$collection}_cap_fn";
         $triggerName = "{$collection}_cap_trg";
@@ -1946,10 +2094,10 @@ class Utils
             CREATE OR REPLACE FUNCTION {$funcName}()
             RETURNS TRIGGER LANGUAGE plpgsql AS \$\$
             BEGIN
-                DELETE FROM {$collection} WHERE _id IN (
-                    SELECT _id FROM {$collection}
+                DELETE FROM {$table} WHERE _id IN (
+                    SELECT _id FROM {$table}
                     ORDER BY created_at ASC, _id ASC
-                    LIMIT GREATEST((SELECT COUNT(*) FROM {$collection}) - {$maxDocuments}, 0)
+                    LIMIT GREATEST((SELECT COUNT(*) FROM {$table}) - {$maxDocuments}, 0)
                 );
                 RETURN NEW;
             END;
@@ -1960,19 +2108,23 @@ class Utils
         // See docWatch for rationale.
         $pdo->exec(
             "CREATE OR REPLACE TRIGGER {$triggerName} "
-            . "AFTER INSERT ON {$collection} "
+            . "AFTER INSERT ON {$table} "
             . "FOR EACH ROW EXECUTE FUNCTION {$funcName}()"
         );
     }
 
-    public static function docRemoveCap(\PDO $pdo, string $collection): void
-    {
+    public static function docRemoveCap(
+        \PDO $pdo,
+        string $collection,
+        ?array $patterns = null,
+    ): void {
         self::validateIdentifier($collection);
+        $table = self::docTable($patterns);
 
         $funcName = "{$collection}_cap_fn";
         $triggerName = "{$collection}_cap_trg";
 
-        $pdo->exec("DROP TRIGGER IF EXISTS {$triggerName} ON {$collection}");
+        $pdo->exec("DROP TRIGGER IF EXISTS {$triggerName} ON {$table}");
         $pdo->exec("DROP FUNCTION IF EXISTS {$funcName}()");
     }
 }

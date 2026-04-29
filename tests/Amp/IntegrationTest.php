@@ -152,19 +152,19 @@ class IntegrationTest extends TestCase
         $gl = GoldLapel::start(self::$upstream, ['proxy_port' => $port, 'silent' => true])->await();
         $coll = $this->uniqColl();
         try {
-            $inserted = $gl->docInsert($coll, ['name' => 'alice', 'age' => 30])->await();
+            $inserted = $gl->documents->insert($coll, ['name' => 'alice', 'age' => 30])->await();
             $this->assertArrayHasKey('_id', $inserted);
 
-            $one = $gl->docFindOne($coll, ['name' => 'alice'])->await();
+            $one = $gl->documents->findOne($coll, ['name' => 'alice'])->await();
             $this->assertNotNull($one);
 
-            $count = $gl->docCount($coll)->await();
+            $count = $gl->documents->count($coll)->await();
             $this->assertSame(1, $count);
 
-            $affected = $gl->docUpdate($coll, ['name' => 'alice'], ['$set' => ['age' => 31]])->await();
+            $affected = $gl->documents->update($coll, ['name' => 'alice'], ['$set' => ['age' => 31]])->await();
             $this->assertSame(1, $affected);
 
-            $one = $gl->docFindOne($coll, ['name' => 'alice'])->await();
+            $one = $gl->documents->findOne($coll, ['name' => 'alice'])->await();
             $data = is_string($one['data']) ? json_decode($one['data'], true) : $one['data'];
             $this->assertSame(31, $data['age']);
         } finally {
@@ -181,13 +181,13 @@ class IntegrationTest extends TestCase
         $gl = GoldLapel::start(self::$upstream, ['proxy_port' => $port, 'silent' => true])->await();
         $coll = $this->uniqColl();
         try {
-            $gl->docInsert($coll, ['email' => 'a@b.com', 'name' => 'alice'])->await();
-            $gl->docInsert($coll, ['name' => 'bob'])->await();
+            $gl->documents->insert($coll, ['email' => 'a@b.com', 'name' => 'alice'])->await();
+            $gl->documents->insert($coll, ['name' => 'bob'])->await();
 
-            $withEmail = $gl->docFind($coll, ['email' => ['$exists' => true]])->await();
+            $withEmail = $gl->documents->find($coll, ['email' => ['$exists' => true]])->await();
             $this->assertCount(1, $withEmail);
 
-            $noEmail = $gl->docFind($coll, ['email' => ['$exists' => false]])->await();
+            $noEmail = $gl->documents->find($coll, ['email' => ['$exists' => false]])->await();
             $this->assertCount(1, $noEmail);
         } finally {
             $this->cleanup($coll, $gl);
@@ -249,14 +249,14 @@ class IntegrationTest extends TestCase
         try {
             $tx = $gl->connection()->beginTransaction();
             $result = $gl->using($tx, function ($gl) use ($coll, $cnt) {
-                $gl->docInsert($coll, ['type' => 'signup'])->await();
+                $gl->documents->insert($coll, ['type' => 'signup'])->await();
                 $gl->incr($cnt, 'signups')->await();
                 return 'ok';
             })->await();
             $this->assertSame('ok', $result);
             $tx->commit();
 
-            $this->assertSame(1, $gl->docCount($coll)->await());
+            $this->assertSame(1, $gl->documents->count($coll)->await());
             $this->assertSame(1, $gl->getCounter($cnt, 'signups')->await());
         } finally {
             $this->cleanup($coll, $gl);
@@ -276,9 +276,9 @@ class IntegrationTest extends TestCase
             for ($i = 0; $i < 25; $i++) {
                 $docs[] = ['i' => $i];
             }
-            $gl->docInsertMany($coll, $docs)->await();
+            $gl->documents->insertMany($coll, $docs)->await();
 
-            $iter = $gl->docFindCursor($coll, null, ['i' => 1], null, null, 7);
+            $iter = $gl->documents->findCursor($coll, null, ['i' => 1], null, null, 7);
             $count = 0;
             foreach ($iter as $row) {
                 $count++;
@@ -333,17 +333,17 @@ class IntegrationTest extends TestCase
         $gl = GoldLapel::start(self::$upstream, ['proxy_port' => $port, 'silent' => true])->await();
         $stream = 'amp_str_' . bin2hex(random_bytes(4));
         try {
-            $gl->streamCreateGroup($stream, 'workers')->await();
-            $id1 = $gl->streamAdd($stream, ['task' => 'a'])->await();
-            $id2 = $gl->streamAdd($stream, ['task' => 'b'])->await();
+            $gl->streams->createGroup($stream, 'workers')->await();
+            $id1 = $gl->streams->add($stream, ['task' => 'a'])->await();
+            $id2 = $gl->streams->add($stream, ['task' => 'b'])->await();
             $this->assertGreaterThan(0, $id1);
             $this->assertGreaterThan($id1, $id2);
 
-            $msgs = $gl->streamRead($stream, 'workers', 'w1', 10)->await();
+            $msgs = $gl->streams->read($stream, 'workers', 'w1', 10)->await();
             $this->assertCount(2, $msgs);
             $this->assertSame(['task' => 'a'], $msgs[0]['payload']);
 
-            $acked = $gl->streamAck($stream, 'workers', (int) $msgs[0]['id'])->await();
+            $acked = $gl->streams->ack($stream, 'workers', (int) $msgs[0]['id'])->await();
             $this->assertTrue($acked);
         } finally {
             $this->cleanup($stream, $gl);

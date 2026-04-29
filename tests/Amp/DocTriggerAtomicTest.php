@@ -54,6 +54,14 @@ class DocTriggerAtomicTest extends TestCase
         return $exec;
     }
 
+    private function fakePatterns(string $collection): array
+    {
+        return [
+            'tables' => ['main' => $collection],
+            'query_patterns' => [],
+        ];
+    }
+
     public function testDocWatchEmitsAtomicCreateOrReplaceTrigger(): void
     {
         $captured = [];
@@ -61,7 +69,7 @@ class DocTriggerAtomicTest extends TestCase
 
         // No callback — docWatch should return after setting up the
         // function + trigger without entering the listen loop.
-        Utils::docWatch($conn, 'orders');
+        Utils::docWatch($conn, 'orders', patterns: $this->fakePatterns('orders'));
 
         $joined = implode("\n---\n", $captured);
 
@@ -83,7 +91,7 @@ class DocTriggerAtomicTest extends TestCase
         $captured = [];
         $exec = $this->makeExecutor($captured);
 
-        Utils::docCreateTtlIndex($exec, 'sessions', 3600);
+        Utils::docCreateTtlIndex($exec, 'sessions', 3600, patterns: $this->fakePatterns('sessions'));
 
         $joined = implode("\n---\n", $captured);
 
@@ -101,7 +109,7 @@ class DocTriggerAtomicTest extends TestCase
         $captured = [];
         $exec = $this->makeExecutor($captured);
 
-        Utils::docCreateCapped($exec, 'logs', 1000);
+        Utils::docCreateCapped($exec, 'logs', 1000, patterns: $this->fakePatterns('logs'));
 
         $joined = implode("\n---\n", $captured);
 

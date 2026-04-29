@@ -21,7 +21,24 @@ class InstanceMethodsTest extends TestCase
         $ref->setAccessible(true);
         $ref->setValue($gl, $pdo);
 
+        // Pre-populate the per-instance DDL cache so $gl->documents-><verb>
+        // doesn't try to round-trip to a non-running dashboard. Tests assert
+        // SQL substrings using the user collection name as the table name.
+        $this->seedDdlCache($gl, 'doc_store', 'users', 'users');
+
         return [$gl, $pdo];
+    }
+
+    private function seedDdlCache(GoldLapel $gl, string $family, string $name, string $table): void
+    {
+        $ref = new \ReflectionProperty(GoldLapel::class, 'ddlCache');
+        $ref->setAccessible(true);
+        $cache = $ref->getValue($gl);
+        $cache["{$family}:{$name}"] = [
+            'tables' => ['main' => $table],
+            'query_patterns' => [],
+        ];
+        $ref->setValue($gl, $cache);
     }
 
     private function makeMockStmt(array $rows = [], int $rowCount = 0): \PDOStatement
@@ -79,10 +96,9 @@ class InstanceMethodsTest extends TestCase
         $row = ['_id' => 'abc', 'data' => '{"name":"Alice"}', 'created_at' => '2026-01-01'];
         $stmt = $this->makeMockStmt([$row]);
 
-        $pdo->method('exec')->willReturn(0);
         $pdo->method('prepare')->willReturn($stmt);
 
-        $result = $gl->docInsert('users', ['name' => 'Alice']);
+        $result = $gl->documents->insert('users', ['name' => 'Alice']);
         $this->assertSame('abc', $result['_id']);
     }
 
@@ -95,10 +111,9 @@ class InstanceMethodsTest extends TestCase
         ];
         $stmt = $this->makeMockStmt($rows);
 
-        $pdo->method('exec')->willReturn(0);
         $pdo->method('prepare')->willReturn($stmt);
 
-        $result = $gl->docInsertMany('users', [['n' => 'A'], ['n' => 'B']]);
+        $result = $gl->documents->insertMany('users', [['n' => 'A'], ['n' => 'B']]);
         $this->assertCount(2, $result);
     }
 
@@ -110,7 +125,7 @@ class InstanceMethodsTest extends TestCase
 
         $pdo->method('prepare')->willReturn($stmt);
 
-        $result = $gl->docFind('users', ['name' => 'Alice']);
+        $result = $gl->documents->find('users', ['name' => 'Alice']);
         $this->assertCount(1, $result);
     }
 
@@ -122,7 +137,7 @@ class InstanceMethodsTest extends TestCase
 
         $pdo->method('prepare')->willReturn($stmt);
 
-        $result = $gl->docFindOne('users', ['name' => 'Alice']);
+        $result = $gl->documents->findOne('users', ['name' => 'Alice']);
         $this->assertSame('abc', $result['_id']);
     }
 
@@ -133,7 +148,7 @@ class InstanceMethodsTest extends TestCase
 
         $pdo->method('prepare')->willReturn($stmt);
 
-        $count = $gl->docUpdate('users', ['active' => true], ['active' => false]);
+        $count = $gl->documents->update('users', ['active' => true], ['active' => false]);
         $this->assertSame(2, $count);
     }
 
@@ -144,7 +159,7 @@ class InstanceMethodsTest extends TestCase
 
         $pdo->method('prepare')->willReturn($stmt);
 
-        $count = $gl->docUpdateOne('users', ['name' => 'Alice'], ['name' => 'Bob']);
+        $count = $gl->documents->updateOne('users', ['name' => 'Alice'], ['name' => 'Bob']);
         $this->assertSame(1, $count);
     }
 
@@ -155,7 +170,7 @@ class InstanceMethodsTest extends TestCase
 
         $pdo->method('prepare')->willReturn($stmt);
 
-        $count = $gl->docDelete('users', ['active' => false]);
+        $count = $gl->documents->delete('users', ['active' => false]);
         $this->assertSame(3, $count);
     }
 
@@ -166,7 +181,7 @@ class InstanceMethodsTest extends TestCase
 
         $pdo->method('prepare')->willReturn($stmt);
 
-        $count = $gl->docDeleteOne('users', ['name' => 'Alice']);
+        $count = $gl->documents->deleteOne('users', ['name' => 'Alice']);
         $this->assertSame(1, $count);
     }
 
@@ -179,7 +194,7 @@ class InstanceMethodsTest extends TestCase
 
         $pdo->method('prepare')->willReturn($stmt);
 
-        $count = $gl->docCount('users');
+        $count = $gl->documents->count('users');
         $this->assertSame(42, $count);
     }
 
@@ -192,7 +207,7 @@ class InstanceMethodsTest extends TestCase
                 return str_contains($sql, 'CREATE INDEX IF NOT EXISTS users_data_gin');
             }));
 
-        $gl->docCreateIndex('users');
+        $gl->documents->createIndex('users');
     }
 
     public function testDocAggregateDelegates(): void
@@ -203,7 +218,7 @@ class InstanceMethodsTest extends TestCase
 
         $pdo->method('prepare')->willReturn($stmt);
 
-        $result = $gl->docAggregate('users', [
+        $result = $gl->documents->aggregate('users', [
             ['$group' => ['_id' => '$city', 'total' => ['$count' => true]]],
         ]);
         $this->assertCount(1, $result);
@@ -419,8 +434,8 @@ class InstanceMethodsTest extends TestCase
         $pdo->method('exec')->willReturn(0);
         $pdo->method('prepare')->willReturn($stmt);
 
-        // Stream DDL patterns now come from the proxy's /api/ddl/* endpoint.
-        // Pre-populate the per-instance cache so streamAdd doesn't try to
+        // Stream DDL patterns come from the proxy's /api/ddl/* endpoint.
+        // Pre-populate the per-instance cache so streams->add doesn't try to
         // POST to a non-running dashboard in this unit test.
         $refl = new \ReflectionClass($gl);
         $prop = $refl->getProperty('ddlCache');
@@ -434,7 +449,7 @@ class InstanceMethodsTest extends TestCase
             ],
         ]);
 
-        $id = $gl->streamAdd('events', ['type' => 'click']);
+        $id = $gl->streams->add('events', ['type' => 'click']);
         $this->assertSame(1, $id);
     }
 
@@ -478,9 +493,10 @@ class InstanceMethodsTest extends TestCase
     public function testInstanceMethodThrowsWhenNotConnected(): void
     {
         $gl = new GoldLapel('postgresql://user:pass@host:5432/db');
+        $this->seedDdlCache($gl, 'doc_store', 'users', 'users');
         $this->expectException(RuntimeException::class);
         $this->expectExceptionMessage('Not connected');
-        $gl->docInsert('users', ['name' => 'Alice']);
+        $gl->documents->insert('users', ['name' => 'Alice']);
     }
 
     public function testSearchThrowsWhenNotConnected(): void
@@ -500,29 +516,9 @@ class InstanceMethodsTest extends TestCase
     }
 
     // ========================================================================
-    // Regression: methods that were previously missing from the instance API
-    // (docDistinct, docFindCursor, docFindOneAndDelete, docFindOneAndUpdate)
+    // Documents namespace verbs that need conn override coverage at the
+    // instance level (distinct, findOneAndUpdate, findOneAndDelete, findCursor).
     // ========================================================================
-
-    public function testDocDistinctMethodExists(): void
-    {
-        $this->assertTrue(method_exists(GoldLapel::class, 'docDistinct'));
-    }
-
-    public function testDocFindCursorMethodExists(): void
-    {
-        $this->assertTrue(method_exists(GoldLapel::class, 'docFindCursor'));
-    }
-
-    public function testDocFindOneAndDeleteMethodExists(): void
-    {
-        $this->assertTrue(method_exists(GoldLapel::class, 'docFindOneAndDelete'));
-    }
-
-    public function testDocFindOneAndUpdateMethodExists(): void
-    {
-        $this->assertTrue(method_exists(GoldLapel::class, 'docFindOneAndUpdate'));
-    }
 
     public function testDocDistinctDelegatesToUtilsWithResolvedConn(): void
     {
@@ -536,7 +532,7 @@ class InstanceMethodsTest extends TestCase
             ->method('prepare')
             ->willReturn($stmt);
 
-        $result = $gl->docDistinct('users', 'city');
+        $result = $gl->documents->distinct('users', 'city');
         $this->assertSame(['NYC', 'LA'], $result);
     }
 
@@ -554,7 +550,7 @@ class InstanceMethodsTest extends TestCase
             ->method('prepare')
             ->willReturn($stmt);
 
-        $gl->docDistinct('users', 'city', null, conn: $overridePdo);
+        $gl->documents->distinct('users', 'city', null, conn: $overridePdo);
     }
 
     public function testDocFindOneAndUpdateDelegatesToUtilsWithResolvedConn(): void
@@ -569,7 +565,7 @@ class InstanceMethodsTest extends TestCase
             ->method('prepare')
             ->willReturn($stmt);
 
-        $result = $gl->docFindOneAndUpdate('users', ['name' => 'Alice'], ['name' => 'Bob']);
+        $result = $gl->documents->findOneAndUpdate('users', ['name' => 'Alice'], ['name' => 'Bob']);
         $this->assertSame('abc', $result['_id']);
     }
 
@@ -587,7 +583,7 @@ class InstanceMethodsTest extends TestCase
             ->method('prepare')
             ->willReturn($stmt);
 
-        $result = $gl->docFindOneAndUpdate('users', ['x' => 1], ['y' => 2], conn: $overridePdo);
+        $result = $gl->documents->findOneAndUpdate('users', ['x' => 1], ['y' => 2], conn: $overridePdo);
         $this->assertNull($result);
     }
 
@@ -603,7 +599,7 @@ class InstanceMethodsTest extends TestCase
             ->method('prepare')
             ->willReturn($stmt);
 
-        $result = $gl->docFindOneAndDelete('users', ['name' => 'Alice']);
+        $result = $gl->documents->findOneAndDelete('users', ['name' => 'Alice']);
         $this->assertSame('abc', $result['_id']);
     }
 
@@ -621,14 +617,14 @@ class InstanceMethodsTest extends TestCase
             ->method('prepare')
             ->willReturn($stmt);
 
-        $result = $gl->docFindOneAndDelete('users', ['x' => 1], conn: $overridePdo);
+        $result = $gl->documents->findOneAndDelete('users', ['x' => 1], conn: $overridePdo);
         $this->assertNull($result);
     }
 
     public function testDocFindCursorDelegatesToUtilsWithResolvedConn(): void
     {
         [$gl, $pdo] = $this->makeGlWithMockPDO();
-        // docFindCursor opens a server-side cursor: DECLARE via prepare(),
+        // findCursor opens a server-side cursor: DECLARE via prepare(),
         // then FETCH via query() in a loop.
         $declareStmt = $this->createMock(\PDOStatement::class);
         $declareStmt->method('execute')->willReturn(true);
@@ -647,7 +643,7 @@ class InstanceMethodsTest extends TestCase
             ->method('query')
             ->willReturn($fetchStmt);
 
-        $gen = $gl->docFindCursor('users');
+        $gen = $gl->documents->findCursor('users');
         $this->assertInstanceOf(\Generator::class, $gen);
 
         $rows = iterator_to_array($gen, false);
@@ -677,7 +673,7 @@ class InstanceMethodsTest extends TestCase
             ->method('query')
             ->willReturn($fetchStmt);
 
-        $gen = $gl->docFindCursor('users', conn: $overridePdo);
+        $gen = $gl->documents->findCursor('users', conn: $overridePdo);
         // Drain the generator so the override PDO is exercised.
         iterator_to_array($gen, false);
     }
