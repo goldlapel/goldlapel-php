@@ -47,7 +47,7 @@ class QueuesTest extends TestCase
                 'enqueue' => "INSERT INTO {$main} (payload) VALUES (\$1::jsonb) RETURNING id, created_at",
                 'claim' => "WITH next_msg AS ( SELECT id FROM {$main} WHERE status = 'ready' AND visible_at <= NOW() ORDER BY visible_at, id FOR UPDATE SKIP LOCKED LIMIT 1 ) UPDATE {$main} SET status = 'claimed', visible_at = NOW() + INTERVAL '1 millisecond' * \$1 FROM next_msg WHERE {$main}.id = next_msg.id RETURNING {$main}.id, {$main}.payload, {$main}.visible_at, {$main}.created_at",
                 'ack' => "DELETE FROM {$main} WHERE id = \$1",
-                'extend' => "UPDATE {$main} SET visible_at = visible_at + INTERVAL '1 millisecond' * \$2 WHERE id = \$1 AND status = 'claimed' RETURNING visible_at",
+                'extend' => "WITH target AS (SELECT \$1::bigint AS id, \$2::bigint AS additional_ms) UPDATE {$main} m SET visible_at = m.visible_at + INTERVAL '1 millisecond' * target.additional_ms FROM target WHERE m.id = target.id AND m.status = 'claimed' RETURNING m.visible_at",
                 'nack' => "UPDATE {$main} SET status = 'ready', visible_at = NOW() WHERE id = \$1 AND status = 'claimed' RETURNING id",
                 'peek' => "SELECT id, payload, visible_at, status, created_at FROM {$main} WHERE status = 'ready' AND visible_at <= NOW() ORDER BY visible_at, id LIMIT 1",
                 'count_ready' => "SELECT COUNT(*) FROM {$main} WHERE status = 'ready' AND visible_at <= NOW()",

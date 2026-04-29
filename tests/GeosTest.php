@@ -55,7 +55,7 @@ class GeosTest extends TestCase
                 // for the join, one for the self-exclusion), $3=radius_m,
                 // $4=limit. Source order is $1,$2,$3,$4 — matching the
                 // `[member, member, radius_m, limit]` bind contract.
-                'geosearch_member' => "WITH anchor AS (SELECT location FROM {$main} WHERE member = \$1) SELECT b.member, ST_X(b.location::geometry) AS lon, ST_Y(b.location::geometry) AS lat, ST_Distance(b.location, anchor.location) AS distance_m FROM {$main} b, anchor WHERE b.member <> \$2 AND ST_DWithin(b.location, anchor.location, \$3) ORDER BY distance_m LIMIT \$4",
+                'geosearch_member' => "SELECT b.member, ST_X(b.location::geometry) AS lon, ST_Y(b.location::geometry) AS lat, ST_Distance(b.location, a.location) AS distance_m FROM {$main} a, {$main} b WHERE a.member = \$1 AND b.member <> \$2 AND ST_DWithin(b.location, a.location, \$3) ORDER BY distance_m LIMIT \$4",
                 'geo_remove' => "DELETE FROM {$main} WHERE member = \$1",
                 'geo_count' => "SELECT COUNT(*) FROM {$main}",
             ],
