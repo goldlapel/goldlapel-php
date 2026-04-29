@@ -25,25 +25,37 @@ class DocTest extends TestCase
         return $stmt;
     }
 
+    /**
+     * Build the canonical patterns array as if returned by Ddl::fetchPatterns
+     * for a doc-store collection. Tests use the user-supplied collection
+     * name as the table name (the real Ddl response would normally rewrite
+     * this to `_goldlapel.doc_<name>`, but in unit tests we want the SQL
+     * substring checks to read naturally as `FROM users` rather than
+     * `FROM _goldlapel.doc_users`).
+     */
+    private function fakePatterns(string $collection): array
+    {
+        return [
+            'tables' => ['main' => $collection],
+            'query_patterns' => [],
+        ];
+    }
+
     // ========================================================================
     // docInsert
     // ========================================================================
 
-    public function testDocInsertEnsuresCollectionAndInserts(): void
+    public function testDocInsertUsesCanonicalTableAndInserts(): void
     {
         $row = ['_id' => 'abc-123', 'data' => '{"name":"Alice"}', 'created_at' => '2026-01-01'];
 
         $pdo = $this->makeMockPDO();
         $stmt = $this->makeMockStmt([$row]);
 
-        $pdo->expects($this->once())->method('exec')
-            ->with($this->callback(function (string $sql) {
-                $this->assertStringContainsString('CREATE TABLE IF NOT EXISTS users', $sql);
-                $this->assertStringContainsString('_id UUID PRIMARY KEY', $sql);
-                $this->assertStringContainsString('data JSONB NOT NULL', $sql);
-                $this->assertStringContainsString('created_at TIMESTAMPTZ', $sql);
-                return true;
-            }));
+        // Phase 4 schema-to-core: utils never issue CREATE TABLE — the proxy
+        // owns DDL. Calling Utils::docInsert with patterns must NOT trigger
+        // any exec() (no DDL fallback), only prepare().
+        $pdo->expects($this->never())->method('exec');
 
         $pdo->expects($this->once())->method('prepare')
             ->with($this->callback(function (string $sql) {
@@ -57,8 +69,19 @@ class DocTest extends TestCase
         $stmt->expects($this->once())->method('execute')
             ->with([json_encode(['name' => 'Alice'])]);
 
-        $result = Utils::docInsert($pdo, 'users', ['name' => 'Alice']);
+        $result = Utils::docInsert($pdo, 'users', ['name' => 'Alice'], patterns: $this->fakePatterns('users'));
         $this->assertSame($row, $result);
+    }
+
+    public function testDocInsertRejectsCallWithoutPatterns(): void
+    {
+        // Hard cut: Utils::doc* now require patterns from the proxy. Direct
+        // util callers must come through `$gl->documents-><verb>` so the
+        // sub-API can fetch & cache canonical DDL.
+        $pdo = $this->makeMockPDO();
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('require DDL patterns from the proxy');
+        Utils::docInsert($pdo, 'users', ['name' => 'Alice']);
     }
 
     public function testDocInsertInvalidCollection(): void
@@ -66,7 +89,7 @@ class DocTest extends TestCase
         $pdo = $this->makeMockPDO();
         $this->expectException(\InvalidArgumentException::class);
         $this->expectExceptionMessage('Invalid identifier');
-        Utils::docInsert($pdo, 'DROP TABLE x; --', ['a' => 1]);
+        Utils::docInsert($pdo, 'DROP TABLE x; --', ['a' => 1], patterns: $this->fakePatterns('DROP TABLE x; --'));
     }
 
     // ========================================================================
@@ -96,7 +119,7 @@ class DocTest extends TestCase
         $stmt->expects($this->once())->method('execute')
             ->with([json_encode(['x' => 1]), json_encode(['x' => 2])]);
 
-        $result = Utils::docInsertMany($pdo, 'items', [['x' => 1], ['x' => 2]]);
+        $result = Utils::docInsertMany($pdo, 'items', [['x' => 1], ['x' => 2]], patterns: $this->fakePatterns('items'));
         $this->assertCount(2, $result);
     }
 
@@ -113,14 +136,14 @@ class DocTest extends TestCase
             }))
             ->willReturn($stmt);
 
-        Utils::docInsertMany($pdo, 'items', [['name' => 'solo']]);
+        Utils::docInsertMany($pdo, 'items', [['name' => 'solo']], patterns: $this->fakePatterns('items'));
     }
 
     public function testDocInsertManyInvalidCollection(): void
     {
         $pdo = $this->makeMockPDO();
         $this->expectException(\InvalidArgumentException::class);
-        Utils::docInsertMany($pdo, '1bad', [['a' => 1]]);
+        Utils::docInsertMany($pdo, '1bad', [['a' => 1]], patterns: $this->fakePatterns('1bad'));
     }
 
     // ========================================================================
@@ -144,7 +167,7 @@ class DocTest extends TestCase
         $stmt->expects($this->once())->method('execute')
             ->with([json_encode(['active' => true])]);
 
-        $result = Utils::docFind($pdo, 'users', ['active' => true]);
+        $result = Utils::docFind($pdo, 'users', ['active' => true], patterns: $this->fakePatterns('users'));
         $this->assertCount(1, $result);
     }
 
@@ -162,7 +185,7 @@ class DocTest extends TestCase
 
         $stmt->expects($this->once())->method('execute')->with([]);
 
-        Utils::docFind($pdo, 'users');
+        Utils::docFind($pdo, 'users', patterns: $this->fakePatterns('users'));
     }
 
     public function testDocFindEmptyFilter(): void
@@ -176,7 +199,7 @@ class DocTest extends TestCase
             }))
             ->willReturn($stmt);
 
-        Utils::docFind($pdo, 'users', []);
+        Utils::docFind($pdo, 'users', [], patterns: $this->fakePatterns('users'));
     }
 
     public function testDocFindWithSortLimitSkip(): void
@@ -195,7 +218,7 @@ class DocTest extends TestCase
         $stmt->expects($this->once())->method('execute')
             ->with([json_encode(['active' => true]), 10, 20]);
 
-        Utils::docFind($pdo, 'users', ['active' => true], ['name' => 1, 'age' => -1], 10, 20);
+        Utils::docFind($pdo, 'users', ['active' => true], ['name' => 1, 'age' => -1], 10, 20, patterns: $this->fakePatterns('users'));
     }
 
     public function testDocFindLimitSkipWithoutFilter(): void
@@ -214,7 +237,7 @@ class DocTest extends TestCase
         $stmt->expects($this->once())->method('execute')
             ->with([5, 0]);
 
-        Utils::docFind($pdo, 'users', null, null, 5, 0);
+        Utils::docFind($pdo, 'users', null, null, 5, 0, patterns: $this->fakePatterns('users'));
     }
 
     public function testDocFindInvalidSortKey(): void
@@ -224,14 +247,14 @@ class DocTest extends TestCase
         $pdo->method('prepare')->willReturn($stmt);
         $this->expectException(\InvalidArgumentException::class);
         $this->expectExceptionMessage('Invalid sort key');
-        Utils::docFind($pdo, 'users', [], ['DROP;--' => 1]);
+        Utils::docFind($pdo, 'users', [], ['DROP;--' => 1], patterns: $this->fakePatterns('users'));
     }
 
     public function testDocFindInvalidCollection(): void
     {
         $pdo = $this->makeMockPDO();
         $this->expectException(\InvalidArgumentException::class);
-        Utils::docFind($pdo, 'bad table', []);
+        Utils::docFind($pdo, 'bad table', [], patterns: $this->fakePatterns('bad table'));
     }
 
     // ========================================================================
@@ -256,7 +279,7 @@ class DocTest extends TestCase
         $stmt->expects($this->once())->method('execute')
             ->with([json_encode(['name' => 'Bob'])]);
 
-        $result = Utils::docFindOne($pdo, 'users', ['name' => 'Bob']);
+        $result = Utils::docFindOne($pdo, 'users', ['name' => 'Bob'], patterns: $this->fakePatterns('users'));
         $this->assertSame($row, $result);
     }
 
@@ -268,7 +291,7 @@ class DocTest extends TestCase
         $stmt->method('fetch')->willReturn(false);
         $pdo->method('prepare')->willReturn($stmt);
 
-        $result = Utils::docFindOne($pdo, 'users', ['name' => 'Nobody']);
+        $result = Utils::docFindOne($pdo, 'users', ['name' => 'Nobody'], patterns: $this->fakePatterns('users'));
         $this->assertNull($result);
     }
 
@@ -284,14 +307,14 @@ class DocTest extends TestCase
             }))
             ->willReturn($stmt);
 
-        Utils::docFindOne($pdo, 'users', []);
+        Utils::docFindOne($pdo, 'users', [], patterns: $this->fakePatterns('users'));
     }
 
     public function testDocFindOneInvalidCollection(): void
     {
         $pdo = $this->makeMockPDO();
         $this->expectException(\InvalidArgumentException::class);
-        Utils::docFindOne($pdo, 'bad;table', []);
+        Utils::docFindOne($pdo, 'bad;table', [], patterns: $this->fakePatterns('bad;table'));
     }
 
     // ========================================================================
@@ -313,7 +336,7 @@ class DocTest extends TestCase
         $stmt->expects($this->once())->method('execute')
             ->with([json_encode(['active' => true]), json_encode(['active' => false])]);
 
-        $result = Utils::docUpdate($pdo, 'users', ['active' => false], ['active' => true]);
+        $result = Utils::docUpdate($pdo, 'users', ['active' => false], ['active' => true], patterns: $this->fakePatterns('users'));
         $this->assertSame(3, $result);
     }
 
@@ -323,7 +346,7 @@ class DocTest extends TestCase
         $stmt = $this->makeMockStmt([], 0);
         $pdo->method('prepare')->willReturn($stmt);
 
-        $result = Utils::docUpdate($pdo, 'users', ['x' => 1], ['x' => 2]);
+        $result = Utils::docUpdate($pdo, 'users', ['x' => 1], ['x' => 2], patterns: $this->fakePatterns('users'));
         $this->assertSame(0, $result);
     }
 
@@ -331,7 +354,7 @@ class DocTest extends TestCase
     {
         $pdo = $this->makeMockPDO();
         $this->expectException(\InvalidArgumentException::class);
-        Utils::docUpdate($pdo, '1bad', [], []);
+        Utils::docUpdate($pdo, '1bad', [], [], patterns: $this->fakePatterns('1bad'));
     }
 
     // ========================================================================
@@ -355,7 +378,7 @@ class DocTest extends TestCase
         $stmt->expects($this->once())->method('execute')
             ->with([json_encode(['name' => 'Alice']), json_encode(['age' => 30])]);
 
-        $result = Utils::docUpdateOne($pdo, 'users', ['name' => 'Alice'], ['age' => 30]);
+        $result = Utils::docUpdateOne($pdo, 'users', ['name' => 'Alice'], ['age' => 30], patterns: $this->fakePatterns('users'));
         $this->assertSame(1, $result);
     }
 
@@ -363,7 +386,7 @@ class DocTest extends TestCase
     {
         $pdo = $this->makeMockPDO();
         $this->expectException(\InvalidArgumentException::class);
-        Utils::docUpdateOne($pdo, 'DROP; --', [], []);
+        Utils::docUpdateOne($pdo, 'DROP; --', [], [], patterns: $this->fakePatterns('DROP; --'));
     }
 
     // ========================================================================
@@ -385,7 +408,7 @@ class DocTest extends TestCase
         $stmt->expects($this->once())->method('execute')
             ->with([json_encode(['archived' => true])]);
 
-        $result = Utils::docDelete($pdo, 'users', ['archived' => true]);
+        $result = Utils::docDelete($pdo, 'users', ['archived' => true], patterns: $this->fakePatterns('users'));
         $this->assertSame(5, $result);
     }
 
@@ -395,7 +418,7 @@ class DocTest extends TestCase
         $stmt = $this->makeMockStmt([], 0);
         $pdo->method('prepare')->willReturn($stmt);
 
-        $result = Utils::docDelete($pdo, 'users', ['x' => 1]);
+        $result = Utils::docDelete($pdo, 'users', ['x' => 1], patterns: $this->fakePatterns('users'));
         $this->assertSame(0, $result);
     }
 
@@ -403,7 +426,7 @@ class DocTest extends TestCase
     {
         $pdo = $this->makeMockPDO();
         $this->expectException(\InvalidArgumentException::class);
-        Utils::docDelete($pdo, 'bad table', []);
+        Utils::docDelete($pdo, 'bad table', [], patterns: $this->fakePatterns('bad table'));
     }
 
     // ========================================================================
@@ -427,7 +450,7 @@ class DocTest extends TestCase
         $stmt->expects($this->once())->method('execute')
             ->with([json_encode(['name' => 'Alice'])]);
 
-        $result = Utils::docDeleteOne($pdo, 'users', ['name' => 'Alice']);
+        $result = Utils::docDeleteOne($pdo, 'users', ['name' => 'Alice'], patterns: $this->fakePatterns('users'));
         $this->assertSame(1, $result);
     }
 
@@ -435,7 +458,7 @@ class DocTest extends TestCase
     {
         $pdo = $this->makeMockPDO();
         $this->expectException(\InvalidArgumentException::class);
-        Utils::docDeleteOne($pdo, '1no', []);
+        Utils::docDeleteOne($pdo, '1no', [], patterns: $this->fakePatterns('1no'));
     }
 
     // ========================================================================
@@ -459,7 +482,7 @@ class DocTest extends TestCase
         $stmt->expects($this->once())->method('execute')
             ->with([json_encode(['active' => true])]);
 
-        $result = Utils::docCount($pdo, 'users', ['active' => true]);
+        $result = Utils::docCount($pdo, 'users', ['active' => true], patterns: $this->fakePatterns('users'));
         $this->assertSame(42, $result);
     }
 
@@ -479,7 +502,7 @@ class DocTest extends TestCase
 
         $stmt->expects($this->once())->method('execute')->with([]);
 
-        $result = Utils::docCount($pdo, 'users');
+        $result = Utils::docCount($pdo, 'users', patterns: $this->fakePatterns('users'));
         $this->assertSame(100, $result);
     }
 
@@ -496,7 +519,7 @@ class DocTest extends TestCase
             }))
             ->willReturn($stmt);
 
-        Utils::docCount($pdo, 'users', []);
+        Utils::docCount($pdo, 'users', [], patterns: $this->fakePatterns('users'));
     }
 
     public function testDocCountReturnsInt(): void
@@ -507,7 +530,7 @@ class DocTest extends TestCase
         $stmt->method('fetchColumn')->willReturn('999');
         $pdo->method('prepare')->willReturn($stmt);
 
-        $result = Utils::docCount($pdo, 'items');
+        $result = Utils::docCount($pdo, 'items', patterns: $this->fakePatterns('items'));
         $this->assertIsInt($result);
         $this->assertSame(999, $result);
     }
@@ -516,7 +539,7 @@ class DocTest extends TestCase
     {
         $pdo = $this->makeMockPDO();
         $this->expectException(\InvalidArgumentException::class);
-        Utils::docCount($pdo, 'bad;name', []);
+        Utils::docCount($pdo, 'bad;name', [], patterns: $this->fakePatterns('bad;name'));
     }
 
     // ========================================================================
@@ -533,7 +556,7 @@ class DocTest extends TestCase
                 return true;
             }));
 
-        Utils::docCreateIndex($pdo, 'users');
+        Utils::docCreateIndex($pdo, 'users', patterns: $this->fakePatterns('users'));
     }
 
     public function testDocCreateIndexGinForEmptyKeys(): void
@@ -545,7 +568,7 @@ class DocTest extends TestCase
                 return true;
             }));
 
-        Utils::docCreateIndex($pdo, 'users', []);
+        Utils::docCreateIndex($pdo, 'users', [], patterns: $this->fakePatterns('users'));
     }
 
     public function testDocCreateIndexBtreePerKey(): void
@@ -557,7 +580,7 @@ class DocTest extends TestCase
             return 0;
         });
 
-        Utils::docCreateIndex($pdo, 'users', ['name' => 1, 'age' => -1]);
+        Utils::docCreateIndex($pdo, 'users', ['name' => 1, 'age' => -1], patterns: $this->fakePatterns('users'));
 
         $this->assertCount(2, $execCalls);
         $this->assertStringContainsString('CREATE INDEX IF NOT EXISTS users_name_idx', $execCalls[0]);
@@ -575,7 +598,7 @@ class DocTest extends TestCase
             return 0;
         });
 
-        Utils::docCreateIndex($pdo, 'events', ['user.email' => 1]);
+        Utils::docCreateIndex($pdo, 'events', ['user.email' => 1], patterns: $this->fakePatterns('events'));
 
         $this->assertCount(1, $execCalls);
         $this->assertStringContainsString('events_user_email_idx', $execCalls[0]);
@@ -587,21 +610,21 @@ class DocTest extends TestCase
         $pdo = $this->makeMockPDO();
         $this->expectException(\InvalidArgumentException::class);
         $this->expectExceptionMessage('Invalid index key');
-        Utils::docCreateIndex($pdo, 'users', ['DROP;--' => 1]);
+        Utils::docCreateIndex($pdo, 'users', ['DROP;--' => 1], patterns: $this->fakePatterns('users'));
     }
 
     public function testDocCreateIndexInvalidCollection(): void
     {
         $pdo = $this->makeMockPDO();
         $this->expectException(\InvalidArgumentException::class);
-        Utils::docCreateIndex($pdo, 'bad table');
+        Utils::docCreateIndex($pdo, 'bad table', patterns: $this->fakePatterns('bad table'));
     }
 
     public function testDocCreateIndexReturnsVoid(): void
     {
         $pdo = $this->makeMockPDO();
         $pdo->method('exec');
-        $result = Utils::docCreateIndex($pdo, 'users');
+        $result = Utils::docCreateIndex($pdo, 'users', patterns: $this->fakePatterns('users'));
         $this->assertNull($result);
     }
 
@@ -643,7 +666,7 @@ class DocTest extends TestCase
             ['$sort' => ['total' => -1]],
             ['$limit' => 10],
             ['$skip' => 5],
-        ]);
+        ], patterns: $this->fakePatterns('orders'));
         $this->assertCount(2, $result);
         $this->assertSame('electronics', $result[0]['_id']);
     }
@@ -667,7 +690,7 @@ class DocTest extends TestCase
                 '_id' => '$department',
                 'avg_score' => ['$avg' => '$score'],
             ]],
-        ]);
+        ], patterns: $this->fakePatterns('employees'));
         $this->assertCount(1, $result);
         $this->assertSame('85.5', $result[0]['avg_score']);
     }
@@ -692,7 +715,7 @@ class DocTest extends TestCase
                 '_id' => null,
                 'total' => ['$sum' => '$amount'],
             ]],
-        ]);
+        ], patterns: $this->fakePatterns('orders'));
         $this->assertCount(1, $result);
     }
 
@@ -716,7 +739,7 @@ class DocTest extends TestCase
 
         $result = Utils::docAggregate($pdo, 'orders', [
             ['$match' => ['status' => 'active']],
-        ]);
+        ], patterns: $this->fakePatterns('orders'));
         $this->assertCount(1, $result);
     }
 
@@ -737,7 +760,7 @@ class DocTest extends TestCase
                 'cnt' => ['$count' => true],
             ]],
             ['$sort' => ['cnt' => -1]],
-        ]);
+        ], patterns: $this->fakePatterns('events'));
     }
 
     public function testDocAggregateSortContextWithoutGroup(): void
@@ -753,7 +776,7 @@ class DocTest extends TestCase
 
         Utils::docAggregate($pdo, 'users', [
             ['$sort' => ['name' => 1]],
-        ]);
+        ], patterns: $this->fakePatterns('users'));
     }
 
     public function testDocAggregateUnsupportedStage(): void
@@ -763,7 +786,7 @@ class DocTest extends TestCase
         $this->expectExceptionMessage('Unsupported pipeline stage: $bucket');
         Utils::docAggregate($pdo, 'users', [
             ['$bucket' => ['groupBy' => '$price']],
-        ]);
+        ], patterns: $this->fakePatterns('users'));
     }
 
     public function testDocAggregateUnsupportedAccumulator(): void
@@ -776,13 +799,13 @@ class DocTest extends TestCase
                 '_id' => '$status',
                 'top' => ['$first' => '$name'],
             ]],
-        ]);
+        ], patterns: $this->fakePatterns('users'));
     }
 
     public function testDocAggregateEmptyPipeline(): void
     {
         $pdo = $this->makeMockPDO();
-        $result = Utils::docAggregate($pdo, 'users', []);
+        $result = Utils::docAggregate($pdo, 'users', [], patterns: $this->fakePatterns('users'));
         $this->assertSame([], $result);
     }
 
@@ -790,7 +813,7 @@ class DocTest extends TestCase
     {
         $pdo = $this->makeMockPDO();
         $this->expectException(\InvalidArgumentException::class);
-        Utils::docAggregate($pdo, 'bad table', []);
+        Utils::docAggregate($pdo, 'bad table', [], patterns: $this->fakePatterns('bad table'));
     }
 
     public function testDocAggregateCountAccumulator(): void
@@ -811,7 +834,7 @@ class DocTest extends TestCase
                 '_id' => '$status',
                 'cnt' => ['$count' => true],
             ]],
-        ]);
+        ], patterns: $this->fakePatterns('users'));
         $this->assertCount(1, $result);
     }
 
@@ -833,7 +856,7 @@ class DocTest extends TestCase
                 'lo' => ['$min' => '$price'],
                 'hi' => ['$max' => '$price'],
             ]],
-        ]);
+        ], patterns: $this->fakePatterns('products'));
     }
 
     // ========================================================================
@@ -860,7 +883,7 @@ class DocTest extends TestCase
                 '_id' => ['region' => '$region', 'type' => '$type'],
                 'total' => ['$sum' => '$amount'],
             ]],
-        ]);
+        ], patterns: $this->fakePatterns('sales'));
         $this->assertCount(1, $result);
     }
 
@@ -881,7 +904,7 @@ class DocTest extends TestCase
                 '_id' => ['city' => '$address.city', 'zip' => '$address.zip'],
                 'cnt' => ['$count' => true],
             ]],
-        ]);
+        ], patterns: $this->fakePatterns('users'));
     }
 
     public function testDocAggregateCompositeIdInvalidAlias(): void
@@ -894,7 +917,7 @@ class DocTest extends TestCase
                 '_id' => ['bad alias!' => '$field'],
                 'cnt' => ['$count' => true],
             ]],
-        ]);
+        ], patterns: $this->fakePatterns('users'));
     }
 
     public function testDocAggregateCompositeIdInvalidRef(): void
@@ -907,7 +930,7 @@ class DocTest extends TestCase
                 '_id' => ['region' => 'not_a_ref'],
                 'cnt' => ['$count' => true],
             ]],
-        ]);
+        ], patterns: $this->fakePatterns('users'));
     }
 
     public function testDocAggregateCompositeIdEmptyArray(): void
@@ -920,7 +943,7 @@ class DocTest extends TestCase
                 '_id' => [],
                 'cnt' => ['$count' => true],
             ]],
-        ]);
+        ], patterns: $this->fakePatterns('users'));
     }
 
     public function testDocAggregatePushAccumulator(): void
@@ -940,7 +963,7 @@ class DocTest extends TestCase
                 '_id' => '$department',
                 'names' => ['$push' => '$name'],
             ]],
-        ]);
+        ], patterns: $this->fakePatterns('employees'));
         $this->assertCount(1, $result);
     }
 
@@ -961,7 +984,7 @@ class DocTest extends TestCase
                 '_id' => '$department',
                 'tags' => ['$addToSet' => '$tag'],
             ]],
-        ]);
+        ], patterns: $this->fakePatterns('employees'));
         $this->assertCount(1, $result);
     }
 
@@ -984,7 +1007,7 @@ class DocTest extends TestCase
                 '_id' => '$status',
                 'cnt' => ['$count' => true],
             ]],
-        ]);
+        ], patterns: $this->fakePatterns('users'));
         $this->assertCount(1, $result);
     }
 
@@ -1131,7 +1154,7 @@ class DocTest extends TestCase
 
         Utils::docAggregate($pdo, 'orders', [
             ['$project' => ['name' => 1, 'status' => 1]],
-        ]);
+        ], patterns: $this->fakePatterns('orders'));
     }
 
     public function testProjectExcludeId(): void
@@ -1150,7 +1173,7 @@ class DocTest extends TestCase
 
         Utils::docAggregate($pdo, 'orders', [
             ['$project' => ['_id' => 0, 'name' => 1, 'price' => 1]],
-        ]);
+        ], patterns: $this->fakePatterns('orders'));
     }
 
     public function testProjectRenameViaFieldRef(): void
@@ -1168,7 +1191,7 @@ class DocTest extends TestCase
 
         Utils::docAggregate($pdo, 'orders', [
             ['$project' => ['_id' => 0, 'customer_name' => '$name', 'total' => '$amount']],
-        ]);
+        ], patterns: $this->fakePatterns('orders'));
     }
 
     public function testProjectDotNotation(): void
@@ -1184,7 +1207,7 @@ class DocTest extends TestCase
 
         Utils::docAggregate($pdo, 'orders', [
             ['$project' => ['_id' => 0, 'city' => '$address.city']],
-        ]);
+        ], patterns: $this->fakePatterns('orders'));
     }
 
     public function testProjectRejectsInvalidField(): void
@@ -1193,7 +1216,7 @@ class DocTest extends TestCase
         $this->expectException(\InvalidArgumentException::class);
         Utils::docAggregate($pdo, 'orders', [
             ['$project' => ['bad field!' => 1]],
-        ]);
+        ], patterns: $this->fakePatterns('orders'));
     }
 
     // ========================================================================
@@ -1213,7 +1236,7 @@ class DocTest extends TestCase
 
         Utils::docAggregate($pdo, 'orders', [
             ['$unwind' => '$tags'],
-        ]);
+        ], patterns: $this->fakePatterns('orders'));
     }
 
     public function testUnwindArraySyntax(): void
@@ -1229,7 +1252,7 @@ class DocTest extends TestCase
 
         Utils::docAggregate($pdo, 'orders', [
             ['$unwind' => ['path' => '$items']],
-        ]);
+        ], patterns: $this->fakePatterns('orders'));
     }
 
     public function testUnwindWithGroup(): void
@@ -1251,7 +1274,7 @@ class DocTest extends TestCase
                 '_id' => '$tags',
                 'cnt' => ['$count' => true],
             ]],
-        ]);
+        ], patterns: $this->fakePatterns('orders'));
     }
 
     public function testUnwindRejectsInvalidField(): void
@@ -1260,7 +1283,7 @@ class DocTest extends TestCase
         $this->expectException(\InvalidArgumentException::class);
         Utils::docAggregate($pdo, 'orders', [
             ['$unwind' => '$bad field!'],
-        ]);
+        ], patterns: $this->fakePatterns('orders'));
     }
 
     // ========================================================================
@@ -1273,8 +1296,11 @@ class DocTest extends TestCase
         $stmt = $this->makeMockStmt([]);
         $pdo->expects($this->once())->method('prepare')
             ->with($this->callback(function (string $sql) {
+                // Phase 4: $lookup subqueries alias the foreign table as
+                // `_lk` so the SQL stays readable when `from` is rewritten
+                // to a fully-qualified name like `_goldlapel.doc_users`.
                 $this->assertStringContainsString(
-                    "COALESCE((SELECT json_agg(users.data) FROM users WHERE users.data->>'uid' = orders.data->>'user_id'), '[]'::json) AS user_docs",
+                    "COALESCE((SELECT json_agg(_lk.data) FROM users _lk WHERE _lk.data->>'uid' = orders.data->>'user_id'), '[]'::json) AS user_docs",
                     $sql
                 );
                 return true;
@@ -1288,7 +1314,7 @@ class DocTest extends TestCase
                 'foreignField' => 'uid',
                 'as' => 'user_docs',
             ]],
-        ]);
+        ], patterns: $this->fakePatterns('orders'));
     }
 
     public function testLookupRejectsInvalidIdentifiers(): void
@@ -1302,7 +1328,7 @@ class DocTest extends TestCase
                 'foreignField' => 'uid',
                 'as' => 'user_docs',
             ]],
-        ]);
+        ], patterns: $this->fakePatterns('orders'));
     }
 
     public function testLookupWithMatch(): void
@@ -1313,7 +1339,7 @@ class DocTest extends TestCase
             ->with($this->callback(function (string $sql) {
                 $this->assertStringContainsString('WHERE data @> ?::jsonb', $sql);
                 $this->assertStringContainsString(
-                    "COALESCE((SELECT json_agg(products.data) FROM products WHERE products.data->>'pid' = orders.data->>'product_id'), '[]'::json) AS product_info",
+                    "COALESCE((SELECT json_agg(_lk.data) FROM products _lk WHERE _lk.data->>'pid' = orders.data->>'product_id'), '[]'::json) AS product_info",
                     $sql
                 );
                 return true;
@@ -1331,7 +1357,7 @@ class DocTest extends TestCase
                 'foreignField' => 'pid',
                 'as' => 'product_info',
             ]],
-        ]);
+        ], patterns: $this->fakePatterns('orders'));
     }
 
     public function testUnwindGroupSortPipeline(): void
@@ -1363,7 +1389,7 @@ class DocTest extends TestCase
             ]],
             ['$sort' => ['total' => -1]],
             ['$limit' => 5],
-        ]);
+        ], patterns: $this->fakePatterns('orders'));
     }
 
     // ========================================================================
@@ -1419,7 +1445,7 @@ class DocTest extends TestCase
                 return true;
             }));
 
-        Utils::docFind($pdo, 'users', ['addr.city' => 'NY', 'age' => ['$gt' => 25]]);
+        Utils::docFind($pdo, 'users', ['addr.city' => 'NY', 'age' => ['$gt' => 25]], patterns: $this->fakePatterns('users'));
     }
 
     public function testDotNotationInDocFind(): void
@@ -1439,7 +1465,7 @@ class DocTest extends TestCase
                 return true;
             }));
 
-        Utils::docFind($pdo, 'users', ['addr.city' => 'NY']);
+        Utils::docFind($pdo, 'users', ['addr.city' => 'NY'], patterns: $this->fakePatterns('users'));
     }
 
     public function testDotNotationInDocCount(): void
@@ -1461,7 +1487,7 @@ class DocTest extends TestCase
                 return true;
             }));
 
-        $result = Utils::docCount($pdo, 'users', ['addr.city' => 'NY']);
+        $result = Utils::docCount($pdo, 'users', ['addr.city' => 'NY'], patterns: $this->fakePatterns('users'));
         $this->assertSame(3, $result);
     }
 
@@ -1478,7 +1504,7 @@ class DocTest extends TestCase
             return 0;
         });
 
-        Utils::docWatch($pdo, 'orders');
+        Utils::docWatch($pdo, 'orders', patterns: $this->fakePatterns('orders'));
 
         // CREATE FUNCTION (1) + CREATE OR REPLACE TRIGGER (2) + LISTEN (3).
         // Atomic CREATE OR REPLACE TRIGGER (PG14+) — matches the Go wrapper.
@@ -1504,7 +1530,7 @@ class DocTest extends TestCase
         $pdo = $this->makeMockPDO();
         $this->expectException(\InvalidArgumentException::class);
         $this->expectExceptionMessage('Invalid identifier');
-        Utils::docWatch($pdo, 'DROP;--');
+        Utils::docWatch($pdo, 'DROP;--', patterns: $this->fakePatterns('DROP;--'));
     }
 
     // ========================================================================
@@ -1520,7 +1546,7 @@ class DocTest extends TestCase
             return 0;
         });
 
-        Utils::docUnwatch($pdo, 'orders');
+        Utils::docUnwatch($pdo, 'orders', patterns: $this->fakePatterns('orders'));
 
         $this->assertCount(3, $execCalls);
         $this->assertStringContainsString('DROP TRIGGER IF EXISTS orders_notify_trg ON orders', $execCalls[0]);
@@ -1532,7 +1558,7 @@ class DocTest extends TestCase
     {
         $pdo = $this->makeMockPDO();
         $this->expectException(\InvalidArgumentException::class);
-        Utils::docUnwatch($pdo, '1bad');
+        Utils::docUnwatch($pdo, '1bad', patterns: $this->fakePatterns('1bad'));
     }
 
     // ========================================================================
@@ -1548,7 +1574,7 @@ class DocTest extends TestCase
             return 0;
         });
 
-        Utils::docCreateTtlIndex($pdo, 'sessions', 3600);
+        Utils::docCreateTtlIndex($pdo, 'sessions', 3600, patterns: $this->fakePatterns('sessions'));
 
         // CREATE INDEX (1) + CREATE FUNCTION (2) + CREATE OR REPLACE TRIGGER (3).
         // Atomic CREATE OR REPLACE TRIGGER (PG14+) — matches the Go wrapper.
@@ -1574,7 +1600,7 @@ class DocTest extends TestCase
             return 0;
         });
 
-        Utils::docCreateTtlIndex($pdo, 'tokens', 86400, 'expires_at');
+        Utils::docCreateTtlIndex($pdo, 'tokens', 86400, 'expires_at', patterns: $this->fakePatterns('tokens'));
 
         $this->assertStringContainsString('ON tokens (expires_at)', $execCalls[0]);
         $this->assertStringContainsString('WHERE expires_at', $execCalls[1]);
@@ -1585,7 +1611,7 @@ class DocTest extends TestCase
         $pdo = $this->makeMockPDO();
         $this->expectException(\InvalidArgumentException::class);
         $this->expectExceptionMessage('expireAfterSeconds must be a positive integer');
-        Utils::docCreateTtlIndex($pdo, 'items', 0);
+        Utils::docCreateTtlIndex($pdo, 'items', 0, patterns: $this->fakePatterns('items'));
     }
 
     // ========================================================================
@@ -1601,7 +1627,7 @@ class DocTest extends TestCase
             return 0;
         });
 
-        Utils::docRemoveTtlIndex($pdo, 'sessions');
+        Utils::docRemoveTtlIndex($pdo, 'sessions', patterns: $this->fakePatterns('sessions'));
 
         $this->assertCount(3, $execCalls);
         $this->assertStringContainsString('DROP TRIGGER IF EXISTS sessions_ttl_trg ON sessions', $execCalls[0]);
@@ -1613,53 +1639,42 @@ class DocTest extends TestCase
     // docCreateCollection
     // ========================================================================
 
-    public function testDocCreateCollectionCreatesRegularTable(): void
+    public function testDocCreateCollectionIsNoOpOnPdoSide(): void
     {
-        $execCalls = [];
+        // Phase 4 schema-to-core: the proxy issues `CREATE TABLE` against
+        // its own management connection; Documents::createCollection just
+        // calls `Ddl::fetchPatterns('doc_store', $name)` which returns the
+        // canonical table reference. By the time `Utils::docCreateCollection`
+        // is reached the table already exists upstream, so the helper must
+        // NOT issue any exec() on the user PDO.
         $pdo = $this->makeMockPDO();
-        $pdo->method('exec')->willReturnCallback(function ($sql) use (&$execCalls) {
-            $execCalls[] = $sql;
-            return 0;
-        });
+        $pdo->expects($this->never())->method('exec');
+        $pdo->expects($this->never())->method('prepare');
 
-        Utils::docCreateCollection($pdo, 'users');
-
-        $this->assertCount(1, $execCalls);
-        $this->assertStringContainsString('CREATE TABLE IF NOT EXISTS users', $execCalls[0]);
-        $this->assertStringNotContainsString('UNLOGGED', $execCalls[0]);
-        $this->assertStringContainsString('_id UUID PRIMARY KEY', $execCalls[0]);
-        $this->assertStringContainsString('data JSONB NOT NULL', $execCalls[0]);
-        $this->assertStringContainsString('created_at TIMESTAMPTZ', $execCalls[0]);
-    }
-
-    public function testDocCreateCollectionCreatesUnloggedTable(): void
-    {
-        $execCalls = [];
-        $pdo = $this->makeMockPDO();
-        $pdo->method('exec')->willReturnCallback(function ($sql) use (&$execCalls) {
-            $execCalls[] = $sql;
-            return 0;
-        });
-
-        Utils::docCreateCollection($pdo, 'ephemeral', true);
-
-        $this->assertCount(1, $execCalls);
-        $this->assertStringContainsString('CREATE UNLOGGED TABLE IF NOT EXISTS ephemeral', $execCalls[0]);
-        $this->assertStringNotContainsString('CREATE TABLE IF NOT EXISTS', $execCalls[0]);
+        Utils::docCreateCollection($pdo, 'users', patterns: $this->fakePatterns('users'));
+        Utils::docCreateCollection($pdo, 'ephemeral', true, patterns: $this->fakePatterns('ephemeral'));
     }
 
     public function testDocCreateCollectionInvalidCollection(): void
     {
         $pdo = $this->makeMockPDO();
         $this->expectException(\InvalidArgumentException::class);
-        Utils::docCreateCollection($pdo, 'bad table');
+        Utils::docCreateCollection($pdo, 'bad table', patterns: $this->fakePatterns('bad table'));
+    }
+
+    public function testDocCreateCollectionRequiresPatterns(): void
+    {
+        $pdo = $this->makeMockPDO();
+        $this->expectException(\RuntimeException::class);
+        $this->expectExceptionMessage('require DDL patterns from the proxy');
+        Utils::docCreateCollection($pdo, 'users');
     }
 
     // ========================================================================
     // docCreateCapped
     // ========================================================================
 
-    public function testDocCreateCappedEnsuresCollectionAndCreatesTrigger(): void
+    public function testDocCreateCappedCreatesTrigger(): void
     {
         $execCalls = [];
         $pdo = $this->makeMockPDO();
@@ -1668,19 +1683,20 @@ class DocTest extends TestCase
             return 0;
         });
 
-        Utils::docCreateCapped($pdo, 'logs', 1000);
+        Utils::docCreateCapped($pdo, 'logs', 1000, patterns: $this->fakePatterns('logs'));
 
-        // ensureCollection (1) + CREATE FUNCTION (2) + CREATE OR REPLACE TRIGGER (3).
-        // Atomic CREATE OR REPLACE TRIGGER (PG14+) — matches the Go wrapper.
-        $this->assertCount(3, $execCalls);
-        $this->assertStringContainsString('CREATE TABLE IF NOT EXISTS logs', $execCalls[0]);
-        $this->assertStringContainsString('CREATE OR REPLACE FUNCTION logs_cap_fn', $execCalls[1]);
-        $this->assertStringContainsString('DELETE FROM logs', $execCalls[1]);
-        $this->assertStringContainsString('ORDER BY created_at ASC', $execCalls[1]);
-        $this->assertStringContainsString('LIMIT GREATEST', $execCalls[1]);
-        $this->assertStringContainsString('1000', $execCalls[1]);
-        $this->assertStringContainsString('CREATE OR REPLACE TRIGGER logs_cap_trg', $execCalls[2]);
-        $this->assertStringContainsString('AFTER INSERT ON logs', $execCalls[2]);
+        // Phase 4 schema-to-core: the doc-store table itself is materialized
+        // by the proxy; this helper now only adds the cap trigger + function.
+        // CREATE FUNCTION (1) + CREATE OR REPLACE TRIGGER (2). Atomic
+        // CREATE OR REPLACE TRIGGER (PG14+) — matches the Go wrapper.
+        $this->assertCount(2, $execCalls);
+        $this->assertStringContainsString('CREATE OR REPLACE FUNCTION logs_cap_fn', $execCalls[0]);
+        $this->assertStringContainsString('DELETE FROM logs', $execCalls[0]);
+        $this->assertStringContainsString('ORDER BY created_at ASC', $execCalls[0]);
+        $this->assertStringContainsString('LIMIT GREATEST', $execCalls[0]);
+        $this->assertStringContainsString('1000', $execCalls[0]);
+        $this->assertStringContainsString('CREATE OR REPLACE TRIGGER logs_cap_trg', $execCalls[1]);
+        $this->assertStringContainsString('AFTER INSERT ON logs', $execCalls[1]);
         // Guard against the racy DROP + CREATE pair regressing.
         foreach ($execCalls as $sql) {
             $this->assertStringNotContainsString('DROP TRIGGER IF EXISTS logs_cap_trg', $sql);
@@ -1692,7 +1708,7 @@ class DocTest extends TestCase
         $pdo = $this->makeMockPDO();
         $this->expectException(\InvalidArgumentException::class);
         $this->expectExceptionMessage('maxDocuments must be a positive integer');
-        Utils::docCreateCapped($pdo, 'logs', 0);
+        Utils::docCreateCapped($pdo, 'logs', 0, patterns: $this->fakePatterns('logs'));
     }
 
     // ========================================================================
@@ -1708,7 +1724,7 @@ class DocTest extends TestCase
             return 0;
         });
 
-        Utils::docRemoveCap($pdo, 'logs');
+        Utils::docRemoveCap($pdo, 'logs', patterns: $this->fakePatterns('logs'));
 
         $this->assertCount(2, $execCalls);
         $this->assertStringContainsString('DROP TRIGGER IF EXISTS logs_cap_trg ON logs', $execCalls[0]);
@@ -1719,7 +1735,7 @@ class DocTest extends TestCase
     {
         $pdo = $this->makeMockPDO();
         $this->expectException(\InvalidArgumentException::class);
-        Utils::docRemoveCap($pdo, 'bad table');
+        Utils::docRemoveCap($pdo, 'bad table', patterns: $this->fakePatterns('bad table'));
     }
 
     // ========================================================================
@@ -1825,7 +1841,7 @@ class DocTest extends TestCase
 
         Utils::docFind($pdo, 'users', [
             '$or' => [['status' => 'active'], ['status' => 'inactive']],
-        ]);
+        ], patterns: $this->fakePatterns('users'));
     }
 
     public function testFilterNotInDocCount(): void
@@ -1841,7 +1857,7 @@ class DocTest extends TestCase
             }))
             ->willReturn($stmt);
 
-        Utils::docCount($pdo, 'users', ['$not' => ['status' => 'suspended']]);
+        Utils::docCount($pdo, 'users', ['$not' => ['status' => 'suspended']], patterns: $this->fakePatterns('users'));
     }
 
     // ========================================================================
@@ -1941,7 +1957,7 @@ class DocTest extends TestCase
             }))
             ->willReturn($stmt);
 
-        Utils::docUpdate($pdo, 'users', ['status' => 'old'], ['$set' => ['status' => 'new']]);
+        Utils::docUpdate($pdo, 'users', ['status' => 'old'], ['$set' => ['status' => 'new']], patterns: $this->fakePatterns('users'));
     }
 
     public function testBuildUpdateIncInDocUpdateOne(): void
@@ -1956,7 +1972,7 @@ class DocTest extends TestCase
             }))
             ->willReturn($stmt);
 
-        Utils::docUpdateOne($pdo, 'users', ['name' => 'alice'], ['$inc' => ['score' => 10]]);
+        Utils::docUpdateOne($pdo, 'users', ['name' => 'alice'], ['$inc' => ['score' => 10]], patterns: $this->fakePatterns('users'));
     }
 
     public function testBuildUpdateInvalidFieldKey(): void
@@ -2014,7 +2030,7 @@ class DocTest extends TestCase
             }))
             ->willReturn($stmt);
 
-        Utils::docUpdate($pdo, 'users', ['name' => 'alice'], ['$push' => ['tags' => 'python']]);
+        Utils::docUpdate($pdo, 'users', ['name' => 'alice'], ['$push' => ['tags' => 'python']], patterns: $this->fakePatterns('users'));
     }
 
     public function testBuildUpdateCombinedSetPush(): void
@@ -2045,7 +2061,7 @@ class DocTest extends TestCase
             }))
             ->willReturn($stmt);
 
-        $result = Utils::docFindOneAndUpdate($pdo, 'users', ['name' => 'alice'], ['$inc' => ['score' => 5]]);
+        $result = Utils::docFindOneAndUpdate($pdo, 'users', ['name' => 'alice'], ['$inc' => ['score' => 5]], patterns: $this->fakePatterns('users'));
         $this->assertSame($row, $result);
     }
 
@@ -2057,7 +2073,7 @@ class DocTest extends TestCase
         $stmt->method('fetch')->willReturn(false);
         $pdo->method('prepare')->willReturn($stmt);
 
-        $result = Utils::docFindOneAndUpdate($pdo, 'users', ['name' => 'nobody'], ['status' => 'new']);
+        $result = Utils::docFindOneAndUpdate($pdo, 'users', ['name' => 'nobody'], ['status' => 'new'], patterns: $this->fakePatterns('users'));
         $this->assertNull($result);
     }
 
@@ -2075,7 +2091,7 @@ class DocTest extends TestCase
             }))
             ->willReturn($stmt);
 
-        Utils::docFindOneAndUpdate($pdo, 'users', ['name' => 'alice'], ['status' => 'updated']);
+        Utils::docFindOneAndUpdate($pdo, 'users', ['name' => 'alice'], ['status' => 'updated'], patterns: $this->fakePatterns('users'));
     }
 
     public function testDocFindOneAndUpdateWithOperatorUpdate(): void
@@ -2093,7 +2109,7 @@ class DocTest extends TestCase
             }))
             ->willReturn($stmt);
 
-        Utils::docFindOneAndUpdate($pdo, 'users', ['name' => 'alice'], ['$inc' => ['score' => 5]]);
+        Utils::docFindOneAndUpdate($pdo, 'users', ['name' => 'alice'], ['$inc' => ['score' => 5]], patterns: $this->fakePatterns('users'));
     }
 
     public function testDocFindOneAndUpdateInvalidCollection(): void
@@ -2101,7 +2117,7 @@ class DocTest extends TestCase
         $pdo = $this->makeMockPDO();
         $this->expectException(\InvalidArgumentException::class);
         $this->expectExceptionMessage('Invalid identifier');
-        Utils::docFindOneAndUpdate($pdo, 'bad; name', [], ['a' => 1]);
+        Utils::docFindOneAndUpdate($pdo, 'bad; name', [], ['a' => 1], patterns: $this->fakePatterns('bad; name'));
     }
 
     // ========================================================================
@@ -2123,7 +2139,7 @@ class DocTest extends TestCase
             }))
             ->willReturn($stmt);
 
-        $result = Utils::docFindOneAndDelete($pdo, 'users', ['name' => 'alice']);
+        $result = Utils::docFindOneAndDelete($pdo, 'users', ['name' => 'alice'], patterns: $this->fakePatterns('users'));
         $this->assertSame($row, $result);
     }
 
@@ -2135,7 +2151,7 @@ class DocTest extends TestCase
         $stmt->method('fetch')->willReturn(false);
         $pdo->method('prepare')->willReturn($stmt);
 
-        $result = Utils::docFindOneAndDelete($pdo, 'users', ['name' => 'nobody']);
+        $result = Utils::docFindOneAndDelete($pdo, 'users', ['name' => 'nobody'], patterns: $this->fakePatterns('users'));
         $this->assertNull($result);
     }
 
@@ -2144,7 +2160,7 @@ class DocTest extends TestCase
         $pdo = $this->makeMockPDO();
         $this->expectException(\InvalidArgumentException::class);
         $this->expectExceptionMessage('Invalid identifier');
-        Utils::docFindOneAndDelete($pdo, 'bad; name', []);
+        Utils::docFindOneAndDelete($pdo, 'bad; name', [], patterns: $this->fakePatterns('bad; name'));
     }
 
     // ========================================================================
@@ -2168,7 +2184,7 @@ class DocTest extends TestCase
             }))
             ->willReturn($stmt);
 
-        $result = Utils::docDistinct($pdo, 'users', 'status');
+        $result = Utils::docDistinct($pdo, 'users', 'status', patterns: $this->fakePatterns('users'));
         $this->assertSame(['active', 'inactive'], $result);
     }
 
@@ -2187,7 +2203,7 @@ class DocTest extends TestCase
             }))
             ->willReturn($stmt);
 
-        $result = Utils::docDistinct($pdo, 'users', 'address.city');
+        $result = Utils::docDistinct($pdo, 'users', 'address.city', patterns: $this->fakePatterns('users'));
         $this->assertSame(['NYC', 'LA'], $result);
     }
 
@@ -2208,7 +2224,7 @@ class DocTest extends TestCase
             }))
             ->willReturn($stmt);
 
-        $result = Utils::docDistinct($pdo, 'users', 'status', ['age' => ['$gt' => 25]]);
+        $result = Utils::docDistinct($pdo, 'users', 'status', ['age' => ['$gt' => 25]], patterns: $this->fakePatterns('users'));
         $this->assertSame(['active'], $result);
     }
 
@@ -2226,7 +2242,7 @@ class DocTest extends TestCase
             }))
             ->willReturn($stmt);
 
-        Utils::docDistinct($pdo, 'users', 'status');
+        Utils::docDistinct($pdo, 'users', 'status', patterns: $this->fakePatterns('users'));
     }
 
     public function testDocDistinctInvalidField(): void
@@ -2234,14 +2250,14 @@ class DocTest extends TestCase
         $pdo = $this->makeMockPDO();
         $this->expectException(\InvalidArgumentException::class);
         $this->expectExceptionMessage('Invalid filter key');
-        Utils::docDistinct($pdo, 'users', 'bad;field');
+        Utils::docDistinct($pdo, 'users', 'bad;field', patterns: $this->fakePatterns('users'));
     }
 
     public function testDocDistinctInvalidCollection(): void
     {
         $pdo = $this->makeMockPDO();
         $this->expectException(\InvalidArgumentException::class);
-        Utils::docDistinct($pdo, 'bad table', 'status');
+        Utils::docDistinct($pdo, 'bad table', 'status', patterns: $this->fakePatterns('bad table'));
     }
 
     // ========================================================================
@@ -2315,7 +2331,7 @@ class DocTest extends TestCase
 
         Utils::docFind($pdo, 'users', [
             'scores' => ['$elemMatch' => ['$gt' => 80, '$lt' => 90]],
-        ]);
+        ], patterns: $this->fakePatterns('users'));
     }
 
     // ========================================================================
@@ -2398,7 +2414,7 @@ class DocTest extends TestCase
         $stmt->expects($this->once())->method('execute')
             ->with(['english', 'english', 'hello']);
 
-        Utils::docFind($pdo, 'users', ['$text' => ['$search' => 'hello']]);
+        Utils::docFind($pdo, 'users', ['$text' => ['$search' => 'hello']], patterns: $this->fakePatterns('users'));
     }
 
     public function testFilterTextFieldLevelInDocFind(): void
@@ -2414,7 +2430,7 @@ class DocTest extends TestCase
 
         Utils::docFind($pdo, 'posts', [
             'title' => ['$text' => ['$search' => 'postgres']],
-        ]);
+        ], patterns: $this->fakePatterns('posts'));
     }
 
     public function testFilterTextMixedWithOtherFilters(): void
@@ -2472,7 +2488,7 @@ class DocTest extends TestCase
         });
 
         $results = [];
-        foreach (Utils::docFindCursor($pdo, 'users') as $row) {
+        foreach (Utils::docFindCursor($pdo, 'users', patterns: $this->fakePatterns('users')) as $row) {
             $results[] = $row;
         }
 
@@ -2511,7 +2527,7 @@ class DocTest extends TestCase
         $pdo->method('query')->willReturn($fetchStmt);
 
         $results = [];
-        foreach (Utils::docFindCursor($pdo, 'users', ['active' => true], ['name' => 1], 10, 5) as $row) {
+        foreach (Utils::docFindCursor($pdo, 'users', ['active' => true], ['name' => 1], 10, 5, patterns: $this->fakePatterns('users')) as $row) {
             $results[] = $row;
         }
 
@@ -2541,7 +2557,7 @@ class DocTest extends TestCase
         });
 
         $results = [];
-        foreach (Utils::docFindCursor($pdo, 'items', null, null, null, null, 50) as $row) {
+        foreach (Utils::docFindCursor($pdo, 'items', null, null, null, null, 50, patterns: $this->fakePatterns('items')) as $row) {
             $results[] = $row;
         }
 
@@ -2555,7 +2571,7 @@ class DocTest extends TestCase
         $this->expectException(\InvalidArgumentException::class);
         $this->expectExceptionMessage('Invalid identifier');
         // Must consume the generator to trigger execution
-        iterator_to_array(Utils::docFindCursor($pdo, 'bad table'));
+        iterator_to_array(Utils::docFindCursor($pdo, 'bad table', patterns: $this->fakePatterns('bad table')));
     }
 
     public function testDocFindCursorRollsBackOnError(): void
@@ -2577,7 +2593,7 @@ class DocTest extends TestCase
         $pdo->method('query')->willReturn($fetchStmt);
 
         try {
-            iterator_to_array(Utils::docFindCursor($pdo, 'users'));
+            iterator_to_array(Utils::docFindCursor($pdo, 'users', patterns: $this->fakePatterns('users')));
             $this->fail('Expected RuntimeException');
         } catch (\RuntimeException $e) {
             $this->assertSame('DB error', $e->getMessage());

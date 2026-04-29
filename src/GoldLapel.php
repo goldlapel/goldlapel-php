@@ -15,9 +15,10 @@ use RuntimeException;
  *     // PDO needs the pgsql: DSN form plus user/password — not the raw URL.
  *     $pdo = new PDO($gl->pdoDsn(), ...$gl->pdoCredentials());
  *     $hits = $gl->search('articles', 'body', 'postgres tuning');
- *     $gl->docInsert('events', ['type' => 'signup']);
+ *     $gl->documents->insert('events', ['type' => 'signup']);
+ *     $gl->streams->add('clicks', ['url' => '/']);
  *     $gl->using($pdo, function ($gl) {
- *         $gl->docInsert('events', ['type' => 'order.created']);
+ *         $gl->documents->insert('events', ['type' => 'order.created']);
  *     });
  *     $gl->stop();
  */
@@ -105,6 +106,27 @@ class GoldLapel
     private static bool $cleanupRegistered = false;
 
     /**
+     * Documents sub-API — `$gl->documents-><verb>(...)`. Holds a back-reference
+     * to this client; reads dashboard token / port / cache through it. Created
+     * once in __construct() and lives for the life of this instance.
+     *
+     * Schema-to-core Phase 4: doc-store DDL is owned by the proxy. The
+     * sub-API issues `/api/ddl/doc_store/create` (idempotent) on first use of
+     * each collection and caches the resulting (tables, query_patterns) on
+     * this client.
+     */
+    public readonly Documents $documents;
+
+    /**
+     * Streams sub-API — `$gl->streams-><verb>(...)`. Holds a back-reference
+     * to this client; reads dashboard token / port / cache through it.
+     *
+     * Schema-to-core Phase 1+2 shipped streams DDL ownership; Phase 4 moves
+     * the surface from flat `streamAdd` etc. into the nested namespace.
+     */
+    public readonly Streams $streams;
+
+    /**
      * Constructor — use GoldLapel::start() to create and start an instance.
      * Accepts a canonical-surface options array (same shape as start()).
      *
@@ -164,6 +186,16 @@ class GoldLapel
         $this->mesh = !empty($options['mesh']);
         $tag = isset($options['mesh_tag']) ? (string) $options['mesh_tag'] : '';
         $this->meshTag = $tag === '' ? null : $tag;
+
+        // Nested namespaces — see src/Documents.php and src/Streams.php.
+        // These are the canonical schema-to-core sub-API instances. Each
+        // holds a back-reference to this client for shared state (license,
+        // dashboard token, PDO, DDL pattern cache). Other namespaces (cache,
+        // search, queues, counters, hashes, zsets, geo, auth, ...) stay flat
+        // for now; they migrate to nested form one-at-a-time as their own
+        // schema-to-core phase fires.
+        $this->documents = new Documents($this);
+        $this->streams = new Streams($this);
     }
 
     /**
@@ -361,6 +393,20 @@ class GoldLapel
         throw new RuntimeException(
             'Not connected. Pass conn: or call GoldLapel::start() before using instance methods.'
         );
+    }
+
+    /**
+     * Public alias of resolveConn() for the sub-API namespace classes
+     * (Documents, Streams). PHP doesn't have package-private visibility, so
+     * we expose this with a `Public` suffix to discourage user code from
+     * calling it — pass an explicit `?\PDO $conn` to verb methods instead,
+     * or use `using()` for scoped overrides.
+     *
+     * @internal Used only by GoldLapel\Documents and GoldLapel\Streams.
+     */
+    public function resolveConnPublic(?\PDO $conn): \PDO
+    {
+        return $this->resolveConn($conn);
     }
 
     /**
@@ -816,150 +862,7 @@ class GoldLapel
     // Instance wrapper methods — all accept an optional `conn:` override.
     // ------------------------------------------------------------------
 
-    // Document Store
-
-    public function docInsert(string $collection, array $document, ?\PDO $conn = null): array
-    {
-        return Utils::docInsert($this->resolveConn($conn), $collection, $document);
-    }
-
-    public function docInsertMany(string $collection, array $documents, ?\PDO $conn = null): array
-    {
-        return Utils::docInsertMany($this->resolveConn($conn), $collection, $documents);
-    }
-
-    public function docFind(
-        string $collection,
-        ?array $filter = null,
-        ?array $sort = null,
-        ?int $limit = null,
-        ?int $skip = null,
-        ?\PDO $conn = null,
-    ): array {
-        return Utils::docFind($this->resolveConn($conn), $collection, $filter, $sort, $limit, $skip);
-    }
-
-    public function docFindOne(string $collection, ?array $filter = null, ?\PDO $conn = null): ?array
-    {
-        return Utils::docFindOne($this->resolveConn($conn), $collection, $filter);
-    }
-
-    public function docUpdate(string $collection, array $filter, array $update, ?\PDO $conn = null): int
-    {
-        return Utils::docUpdate($this->resolveConn($conn), $collection, $filter, $update);
-    }
-
-    public function docUpdateOne(string $collection, array $filter, array $update, ?\PDO $conn = null): int
-    {
-        return Utils::docUpdateOne($this->resolveConn($conn), $collection, $filter, $update);
-    }
-
-    public function docDelete(string $collection, array $filter, ?\PDO $conn = null): int
-    {
-        return Utils::docDelete($this->resolveConn($conn), $collection, $filter);
-    }
-
-    public function docDeleteOne(string $collection, array $filter, ?\PDO $conn = null): int
-    {
-        return Utils::docDeleteOne($this->resolveConn($conn), $collection, $filter);
-    }
-
-    public function docCount(string $collection, ?array $filter = null, ?\PDO $conn = null): int
-    {
-        return Utils::docCount($this->resolveConn($conn), $collection, $filter);
-    }
-
-    public function docCreateIndex(string $collection, ?array $keys = null, ?\PDO $conn = null): void
-    {
-        Utils::docCreateIndex($this->resolveConn($conn), $collection, $keys);
-    }
-
-    public function docAggregate(string $collection, array $pipeline, ?\PDO $conn = null): array
-    {
-        return Utils::docAggregate($this->resolveConn($conn), $collection, $pipeline);
-    }
-
-    public function docWatch(string $collection, ?callable $callback = null, ?\PDO $conn = null): void
-    {
-        Utils::docWatch($this->resolveConn($conn), $collection, $callback);
-    }
-
-    public function docUnwatch(string $collection, ?\PDO $conn = null): void
-    {
-        Utils::docUnwatch($this->resolveConn($conn), $collection);
-    }
-
-    public function docCreateTtlIndex(
-        string $collection,
-        int $expireAfterSeconds,
-        string $field = 'created_at',
-        ?\PDO $conn = null,
-    ): void {
-        Utils::docCreateTtlIndex($this->resolveConn($conn), $collection, $expireAfterSeconds, $field);
-    }
-
-    public function docRemoveTtlIndex(string $collection, ?\PDO $conn = null): void
-    {
-        Utils::docRemoveTtlIndex($this->resolveConn($conn), $collection);
-    }
-
-    public function docCreateCollection(string $collection, bool $unlogged = false, ?\PDO $conn = null): void
-    {
-        Utils::docCreateCollection($this->resolveConn($conn), $collection, $unlogged);
-    }
-
-    public function docCreateCapped(string $collection, int $maxDocuments, ?\PDO $conn = null): void
-    {
-        Utils::docCreateCapped($this->resolveConn($conn), $collection, $maxDocuments);
-    }
-
-    public function docRemoveCap(string $collection, ?\PDO $conn = null): void
-    {
-        Utils::docRemoveCap($this->resolveConn($conn), $collection);
-    }
-
-    public function docFindCursor(
-        string $collection,
-        ?array $filter = null,
-        ?array $sort = null,
-        ?int $limit = null,
-        ?int $skip = null,
-        int $batchSize = 100,
-        ?\PDO $conn = null,
-    ): \Generator {
-        return Utils::docFindCursor(
-            $this->resolveConn($conn),
-            $collection,
-            $filter,
-            $sort,
-            $limit,
-            $skip,
-            $batchSize,
-        );
-    }
-
-    public function docFindOneAndUpdate(
-        string $collection,
-        array $filter,
-        array $update,
-        ?\PDO $conn = null,
-    ): ?array {
-        return Utils::docFindOneAndUpdate($this->resolveConn($conn), $collection, $filter, $update);
-    }
-
-    public function docFindOneAndDelete(string $collection, array $filter, ?\PDO $conn = null): ?array
-    {
-        return Utils::docFindOneAndDelete($this->resolveConn($conn), $collection, $filter);
-    }
-
-    public function docDistinct(
-        string $collection,
-        string $field,
-        ?array $filter = null,
-        ?\PDO $conn = null,
-    ): array {
-        return Utils::docDistinct($this->resolveConn($conn), $collection, $field, $filter);
-    }
+    // Document Store: $gl->documents-><verb>(...). See src/Documents.php.
 
     // Search
 
@@ -1205,55 +1108,7 @@ class GoldLapel
         return Utils::script($this->resolveConn(null), $luaCode, ...$args);
     }
 
-    // Streams — proxy-owned DDL. First call for a given stream fetches the
-    // canonical query patterns from /api/ddl/stream/create; subsequent calls
-    // hit the per-instance cache.
-
-    private function streamPatterns(string $stream): array
-    {
-        $token = $this->dashboardToken ?? Ddl::tokenFromEnvOrFile();
-        return Ddl::fetchPatterns($this->ddlCache, 'stream', $stream, $this->dashboardPort, $token);
-    }
-
-    public function streamAdd(string $stream, array $payload, ?\PDO $conn = null): int
-    {
-        $patterns = $this->streamPatterns($stream);
-        return Utils::streamAdd($this->resolveConn($conn), $stream, $payload, $patterns);
-    }
-
-    public function streamCreateGroup(string $stream, string $group, ?\PDO $conn = null): void
-    {
-        $patterns = $this->streamPatterns($stream);
-        Utils::streamCreateGroup($this->resolveConn($conn), $stream, $group, $patterns);
-    }
-
-    public function streamRead(
-        string $stream,
-        string $group,
-        string $consumer,
-        int $count = 1,
-        ?\PDO $conn = null,
-    ): array {
-        $patterns = $this->streamPatterns($stream);
-        return Utils::streamRead($this->resolveConn($conn), $stream, $group, $consumer, $count, $patterns);
-    }
-
-    public function streamAck(string $stream, string $group, int $messageId, ?\PDO $conn = null): bool
-    {
-        $patterns = $this->streamPatterns($stream);
-        return Utils::streamAck($this->resolveConn($conn), $stream, $group, $messageId, $patterns);
-    }
-
-    public function streamClaim(
-        string $stream,
-        string $group,
-        string $consumer,
-        int $minIdleMs = 60000,
-        ?\PDO $conn = null,
-    ): array {
-        $patterns = $this->streamPatterns($stream);
-        return Utils::streamClaim($this->resolveConn($conn), $stream, $group, $consumer, $minIdleMs, $patterns);
-    }
+    // Streams: $gl->streams-><verb>(...). See src/Streams.php.
 
     // Percolate
 

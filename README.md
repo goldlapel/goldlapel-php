@@ -29,6 +29,14 @@ $gl->stop();  // (also cleaned up in __destruct)
 
 Point PDO at `$gl->pdoDsn()` (with `$gl->pdoCredentials()`, since PDO doesn't accept `postgresql://` URLs directly). Gold Lapel sits between your app and your DB, watching query patterns and creating materialized views + indexes automatically. Zero code changes beyond the connection string.
 
+Document store and streams live under nested namespaces:
+
+```php
+$gl->documents->insert('orders', ['status' => 'pending']);
+$pending = $gl->documents->find('orders', ['status' => 'pending']);
+$gl->streams->add('clicks', ['url' => '/']);
+```
+
 Scoped transactional coordination via `$gl->using($pdo, $cb)`, Laravel auto-wiring, and native async via `GoldLapel\Amp\` are in the docs.
 
 ## Dashboard

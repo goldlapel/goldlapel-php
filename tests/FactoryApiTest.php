@@ -217,7 +217,29 @@ class FactoryApiTest extends TestCase
         $ref = new \ReflectionProperty(GoldLapel::class, 'pdo');
         $ref->setAccessible(true);
         $ref->setValue($gl, $pdo);
+        // Pre-populate the DDL cache so $gl->documents-><verb> doesn't issue
+        // an HTTP call against a non-running dashboard. Tests use the user
+        // collection name as the canonical table — see DocTest::fakePatterns.
+        $this->seedDdlCache($gl, 'doc_store', 'users', 'users');
+        $this->seedDdlCache($gl, 'doc_store', 'events', 'events');
         return [$gl, $pdo];
+    }
+
+    /**
+     * Seed the per-instance DDL pattern cache with a fake (tables, query_patterns)
+     * entry for `(family, name)` so namespace verbs can dispatch without
+     * round-tripping to the dashboard during unit tests.
+     */
+    private function seedDdlCache(GoldLapel $gl, string $family, string $name, string $table): void
+    {
+        $ref = new \ReflectionProperty(GoldLapel::class, 'ddlCache');
+        $ref->setAccessible(true);
+        $cache = $ref->getValue($gl);
+        $cache["{$family}:{$name}"] = [
+            'tables' => ['main' => $table],
+            'query_patterns' => [],
+        ];
+        $ref->setValue($gl, $cache);
     }
 
     public function testUsingScopeHoldsConnection(): void
@@ -313,7 +335,7 @@ class FactoryApiTest extends TestCase
             ->method('prepare')
             ->willReturn($stmt);
 
-        $count = $gl->docCount('users', ['active' => true], conn: $overridePdo);
+        $count = $gl->documents->count('users', ['active' => true], conn: $overridePdo);
 
         $this->assertSame(42, $count);
     }
@@ -335,7 +357,7 @@ class FactoryApiTest extends TestCase
             ->willReturn($stmt);
 
         $gl->using($scopedPdo, function ($gl) use ($overridePdo) {
-            $gl->docCount('users', null, conn: $overridePdo);
+            $gl->documents->count('users', null, conn: $overridePdo);
         });
 
         // Exit the scope cleanly
@@ -357,7 +379,7 @@ class FactoryApiTest extends TestCase
             ->willReturn($stmt);
 
         $gl->using($scopedPdo, function ($gl) {
-            $gl->docCount('users');
+            $gl->documents->count('users');
         });
     }
 
@@ -373,7 +395,7 @@ class FactoryApiTest extends TestCase
             ->method('prepare')
             ->willReturn($stmt);
 
-        $gl->docCount('users');
+        $gl->documents->count('users');
     }
 
     public function testConnArgumentForSearch(): void
@@ -414,7 +436,7 @@ class FactoryApiTest extends TestCase
             ->method('prepare')
             ->willReturn($stmt);
 
-        $result = $gl->docInsert('events', ['x' => 1], conn: $overridePdo);
+        $result = $gl->documents->insert('events', ['x' => 1], conn: $overridePdo);
         $this->assertSame('abc', $result['_id']);
     }
 
@@ -425,16 +447,18 @@ class FactoryApiTest extends TestCase
     public function testResolveConnThrowsWhenNeitherScopedNorInternalSet(): void
     {
         $gl = new GoldLapel('postgresql://user:pass@host:5432/db');
+        $this->seedDdlCache($gl, 'doc_store', 'users', 'users');
 
         $this->expectException(RuntimeException::class);
         $this->expectExceptionMessage('Not connected');
-        $gl->docCount('users');
+        $gl->documents->count('users');
     }
 
     public function testConnNamedArgWorksEvenWithoutInternalPdo(): void
     {
         // No internal PDO — an explicit conn: still works.
         $gl = new GoldLapel('postgresql://user:pass@host:5432/db');
+        $this->seedDdlCache($gl, 'doc_store', 'users', 'users');
         $pdo = $this->createMock(\PDO::class);
 
         $stmt = $this->createMock(\PDOStatement::class);
@@ -445,7 +469,7 @@ class FactoryApiTest extends TestCase
             ->method('prepare')
             ->willReturn($stmt);
 
-        $count = $gl->docCount('users', null, conn: $pdo);
+        $count = $gl->documents->count('users', null, conn: $pdo);
         $this->assertSame(0, $count);
     }
 
@@ -454,6 +478,7 @@ class FactoryApiTest extends TestCase
         // No internal PDO, but using() sets the scope and wrapper calls
         // should still work.
         $gl = new GoldLapel('postgresql://user:pass@host:5432/db');
+        $this->seedDdlCache($gl, 'doc_store', 'users', 'users');
         $scopedPdo = $this->createMock(\PDO::class);
 
         $stmt = $this->createMock(\PDOStatement::class);
@@ -466,7 +491,7 @@ class FactoryApiTest extends TestCase
 
         $observed = null;
         $gl->using($scopedPdo, function ($gl) use (&$observed) {
-            $observed = $gl->docCount('users');
+            $observed = $gl->documents->count('users');
         });
 
         $this->assertSame(99, $observed);

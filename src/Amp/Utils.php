@@ -1121,39 +1121,61 @@ class Utils
     // Document Store
     // ========================================================================
 
-    private static function ensureCollection(
-        PostgresExecutor $conn,
-        string $collection,
-        bool $unlogged = false,
-    ): void {
-        $prefix = $unlogged ? 'CREATE UNLOGGED TABLE' : 'CREATE TABLE';
-        $conn->query(
-            "{$prefix} IF NOT EXISTS {$collection} ("
-            . "_id UUID PRIMARY KEY DEFAULT gen_random_uuid(), "
-            . "data JSONB NOT NULL, "
-            . "created_at TIMESTAMPTZ DEFAULT NOW())"
-        );
+    /**
+     * Resolve the canonical doc-store table name from proxy-fetched patterns.
+     *
+     * Phase 4 schema-to-core: the proxy owns doc-store DDL. The async
+     * Documents sub-API issues `/api/ddl/doc_store/create` (idempotent)
+     * before dispatching here; by the time these helpers run, the canonical
+     * `_goldlapel.doc_<name>` table already exists upstream. Throws if
+     * `$patterns` is null — direct util callers must come through
+     * `$gl->documents-><verb>` so the sub-API can fetch & cache the DDL.
+     */
+    private static function docTable(?array $patterns): string
+    {
+        if ($patterns === null || !isset($patterns['tables']['main'])) {
+            throw new \RuntimeException(
+                'doc* utils now require DDL patterns from the proxy — call via '
+                . '`$gl->documents-><verb>(...)` rather than the Utils function directly.'
+            );
+        }
+        return $patterns['tables']['main'];
+    }
+
+    /**
+     * Build a deterministic auxiliary index/trigger/function name keyed off
+     * a (possibly schema-qualified) table reference. Strips any `schema.`
+     * prefix so the name doesn't contain a dot — Postgres rejects those
+     * without quoting.
+     */
+    private static function docAuxName(string $table, string $suffix): string
+    {
+        $parts = explode('.', $table);
+        $bare = end($parts);
+        return "{$bare}_{$suffix}";
     }
 
     public static function docCreateCollection(
         PostgresExecutor $conn,
         string $collection,
         bool $unlogged = false,
+        ?array $patterns = null,
     ): void {
         SyncUtils::validateIdentifier($collection);
-        self::ensureCollection($conn, $collection, $unlogged);
+        self::docTable($patterns); // validates patterns; proxy already created the table
     }
 
     public static function docInsert(
         PostgresExecutor $conn,
         string $collection,
         array $document,
+        ?array $patterns = null,
     ): array {
         SyncUtils::validateIdentifier($collection);
-        self::ensureCollection($conn, $collection);
+        $table = self::docTable($patterns);
         return self::fetchOne(
             $conn,
-            "INSERT INTO {$collection} (data) VALUES (?::jsonb) RETURNING _id, data, created_at",
+            "INSERT INTO {$table} (data) VALUES (?::jsonb) RETURNING _id, data, created_at",
             [json_encode($document)]
         );
     }
@@ -1162,17 +1184,18 @@ class Utils
         PostgresExecutor $conn,
         string $collection,
         array $documents,
+        ?array $patterns = null,
     ): array {
         SyncUtils::validateIdentifier($collection);
         if (empty($documents)) {
             return [];
         }
-        self::ensureCollection($conn, $collection);
+        $table = self::docTable($patterns);
         $placeholders = implode(', ', array_map(fn() => '(?::jsonb)', $documents));
         $params = array_map(fn($d) => json_encode($d), $documents);
         return self::fetchAll(
             $conn,
-            "INSERT INTO {$collection} (data) VALUES {$placeholders} RETURNING _id, data, created_at",
+            "INSERT INTO {$table} (data) VALUES {$placeholders} RETURNING _id, data, created_at",
             $params
         );
     }
@@ -1184,10 +1207,12 @@ class Utils
         ?array $sort = null,
         ?int $limit = null,
         ?int $skip = null,
+        ?array $patterns = null,
     ): array {
         SyncUtils::validateIdentifier($collection);
+        $table = self::docTable($patterns);
         [$clause, $params] = SyncUtils::buildFilter($filter);
-        $sql = "SELECT _id, data, created_at FROM {$collection}";
+        $sql = "SELECT _id, data, created_at FROM {$table}";
         if ($clause !== '') {
             $sql .= " WHERE {$clause}";
         }
@@ -1228,10 +1253,12 @@ class Utils
         ?int $limit = null,
         ?int $skip = null,
         int $batchSize = 100,
+        ?array $patterns = null,
     ): \Amp\Pipeline\ConcurrentIterator {
         SyncUtils::validateIdentifier($collection);
+        $table = self::docTable($patterns);
         [$clause, $params] = SyncUtils::buildFilter($filter);
-        $sql = "SELECT _id, data, created_at FROM {$collection}";
+        $sql = "SELECT _id, data, created_at FROM {$table}";
         if ($clause !== '') {
             $sql .= " WHERE {$clause}";
         }
@@ -1307,10 +1334,12 @@ class Utils
         PostgresExecutor $conn,
         string $collection,
         ?array $filter = null,
+        ?array $patterns = null,
     ): ?array {
         SyncUtils::validateIdentifier($collection);
+        $table = self::docTable($patterns);
         [$clause, $params] = SyncUtils::buildFilter($filter);
-        $sql = "SELECT _id, data, created_at FROM {$collection}";
+        $sql = "SELECT _id, data, created_at FROM {$table}";
         if ($clause !== '') {
             $sql .= " WHERE {$clause}";
         }
@@ -1323,15 +1352,17 @@ class Utils
         string $collection,
         array $filter,
         array $update,
+        ?array $patterns = null,
     ): int {
         SyncUtils::validateIdentifier($collection);
+        $table = self::docTable($patterns);
         [$clause, $filterParams] = SyncUtils::buildFilter($filter);
         [$updateExpr, $updateParams] = SyncUtils::buildUpdate($update);
         $where = $clause !== '' ? $clause : 'TRUE';
         $allParams = [...$updateParams, ...$filterParams];
         $result = self::exec(
             $conn,
-            "UPDATE {$collection} SET data = {$updateExpr} WHERE {$where}",
+            "UPDATE {$table} SET data = {$updateExpr} WHERE {$where}",
             $allParams
         );
         return $result->getRowCount() ?? 0;
@@ -1342,17 +1373,19 @@ class Utils
         string $collection,
         array $filter,
         array $update,
+        ?array $patterns = null,
     ): int {
         SyncUtils::validateIdentifier($collection);
+        $table = self::docTable($patterns);
         [$clause, $filterParams] = SyncUtils::buildFilter($filter);
         [$updateExpr, $updateParams] = SyncUtils::buildUpdate($update);
         $where = $clause !== '' ? $clause : 'TRUE';
         $allParams = [...$filterParams, ...$updateParams];
         $result = self::exec($conn,
             "WITH target AS ("
-            . "SELECT _id FROM {$collection} WHERE {$where} LIMIT 1"
-            . ") UPDATE {$collection} SET data = {$updateExpr} "
-            . "FROM target WHERE {$collection}._id = target._id",
+            . "SELECT _id FROM {$table} WHERE {$where} LIMIT 1"
+            . ") UPDATE {$table} SET data = {$updateExpr} "
+            . "FROM target WHERE {$table}._id = target._id",
             $allParams
         );
         return $result->getRowCount() ?? 0;
@@ -1362,11 +1395,13 @@ class Utils
         PostgresExecutor $conn,
         string $collection,
         array $filter,
+        ?array $patterns = null,
     ): int {
         SyncUtils::validateIdentifier($collection);
+        $table = self::docTable($patterns);
         [$clause, $params] = SyncUtils::buildFilter($filter);
         $where = $clause !== '' ? $clause : 'TRUE';
-        $result = self::exec($conn, "DELETE FROM {$collection} WHERE {$where}", $params);
+        $result = self::exec($conn, "DELETE FROM {$table} WHERE {$where}", $params);
         return $result->getRowCount() ?? 0;
     }
 
@@ -1374,14 +1409,16 @@ class Utils
         PostgresExecutor $conn,
         string $collection,
         array $filter,
+        ?array $patterns = null,
     ): int {
         SyncUtils::validateIdentifier($collection);
+        $table = self::docTable($patterns);
         [$clause, $params] = SyncUtils::buildFilter($filter);
         $where = $clause !== '' ? $clause : 'TRUE';
         $result = self::exec($conn,
             "WITH target AS ("
-            . "SELECT _id FROM {$collection} WHERE {$where} LIMIT 1"
-            . ") DELETE FROM {$collection} USING target WHERE {$collection}._id = target._id",
+            . "SELECT _id FROM {$table} WHERE {$where} LIMIT 1"
+            . ") DELETE FROM {$table} USING target WHERE {$table}._id = target._id",
             $params
         );
         return $result->getRowCount() ?? 0;
@@ -1391,10 +1428,12 @@ class Utils
         PostgresExecutor $conn,
         string $collection,
         ?array $filter = null,
+        ?array $patterns = null,
     ): int {
         SyncUtils::validateIdentifier($collection);
+        $table = self::docTable($patterns);
         [$clause, $params] = SyncUtils::buildFilter($filter);
-        $sql = "SELECT COUNT(*) FROM {$collection}";
+        $sql = "SELECT COUNT(*) FROM {$table}";
         if ($clause !== '') {
             $sql .= " WHERE {$clause}";
         }
@@ -1406,16 +1445,18 @@ class Utils
         string $collection,
         array $filter,
         array $update,
+        ?array $patterns = null,
     ): ?array {
         SyncUtils::validateIdentifier($collection);
+        $table = self::docTable($patterns);
         [$clause, $filterParams] = SyncUtils::buildFilter($filter);
         [$updateExpr, $updateParams] = SyncUtils::buildUpdate($update);
         $cteWhere = $clause !== '' ? " WHERE {$clause}" : '';
         $sql = "WITH target AS ("
-            . "SELECT _id FROM {$collection}{$cteWhere} LIMIT 1"
-            . ") UPDATE {$collection} SET data = {$updateExpr} FROM target "
-            . "WHERE {$collection}._id = target._id "
-            . "RETURNING {$collection}._id, {$collection}.data, {$collection}.created_at";
+            . "SELECT _id FROM {$table}{$cteWhere} LIMIT 1"
+            . ") UPDATE {$table} SET data = {$updateExpr} FROM target "
+            . "WHERE {$table}._id = target._id "
+            . "RETURNING {$table}._id, {$table}.data, {$table}.created_at";
         $allParams = [...$filterParams, ...$updateParams];
         return self::fetchOne($conn, $sql, $allParams);
     }
@@ -1424,15 +1465,17 @@ class Utils
         PostgresExecutor $conn,
         string $collection,
         array $filter,
+        ?array $patterns = null,
     ): ?array {
         SyncUtils::validateIdentifier($collection);
+        $table = self::docTable($patterns);
         [$clause, $filterParams] = SyncUtils::buildFilter($filter);
         $cteWhere = $clause !== '' ? " WHERE {$clause}" : '';
         $sql = "WITH target AS ("
-            . "SELECT _id FROM {$collection}{$cteWhere} LIMIT 1"
-            . ") DELETE FROM {$collection} USING target "
-            . "WHERE {$collection}._id = target._id "
-            . "RETURNING {$collection}._id, {$collection}.data, {$collection}.created_at";
+            . "SELECT _id FROM {$table}{$cteWhere} LIMIT 1"
+            . ") DELETE FROM {$table} USING target "
+            . "WHERE {$table}._id = target._id "
+            . "RETURNING {$table}._id, {$table}.data, {$table}.created_at";
         return self::fetchOne($conn, $sql, $filterParams);
     }
 
@@ -1441,10 +1484,12 @@ class Utils
         string $collection,
         string $field,
         ?array $filter = null,
+        ?array $patterns = null,
     ): array {
         SyncUtils::validateIdentifier($collection);
+        $table = self::docTable($patterns);
         $fieldExpr = SyncUtils::fieldPath($field);
-        $sql = "SELECT DISTINCT {$fieldExpr} FROM {$collection}";
+        $sql = "SELECT DISTINCT {$fieldExpr} FROM {$table}";
         $params = [];
         $whereParts = ["{$fieldExpr} IS NOT NULL"];
         [$filterClause, $filterParams] = SyncUtils::buildFilter($filter);
@@ -1470,8 +1515,11 @@ class Utils
         PostgresExecutor $conn,
         string $collection,
         array $pipeline,
+        ?array $patterns = null,
+        ?array $lookupTables = null,
     ): array {
         SyncUtils::validateIdentifier($collection);
+        $table = self::docTable($patterns);
 
         if (empty($pipeline)) {
             return [];
@@ -1560,7 +1608,13 @@ class Utils
             if (!preg_match('/^[a-zA-Z_][a-zA-Z0-9_]*$/', $asField)) {
                 throw new \InvalidArgumentException("Invalid field name: {$asField}");
             }
-            $lookupSqls[] = "COALESCE((SELECT json_agg({$from}.data) FROM {$from} WHERE {$from}.data->>'{$foreignField}' = {$collection}.data->>'{$localField}'), '[]'::json) AS {$asField}";
+            // Resolve `from` to its canonical proxy table when the documents
+            // sub-API supplied a lookup map (Phase 4 schema-to-core). Direct
+            // util callers without a map keep the legacy public-schema name.
+            $fromTable = ($lookupTables !== null && isset($lookupTables[$from]))
+                ? $lookupTables[$from]
+                : $from;
+            $lookupSqls[] = "COALESCE((SELECT json_agg(_lk.data) FROM {$fromTable} _lk WHERE _lk.data->>'{$foreignField}' = {$table}.data->>'{$localField}'), '[]'::json) AS {$asField}";
         }
 
         $whereParams = [];
@@ -1614,7 +1668,7 @@ class Utils
             }
             $allParts = array_merge($projectParts, $lookupSqls);
             $selectFields = $allParts;
-            $sql = "SELECT " . implode(', ', $selectFields) . " FROM {$collection}";
+            $sql = "SELECT " . implode(', ', $selectFields) . " FROM {$table}";
             if ($unwindField !== null) {
                 $sql .= " CROSS JOIN jsonb_array_elements_text(data->'{$unwindField}') AS {$unwindAlias}";
             }
@@ -1740,7 +1794,7 @@ class Utils
             }
 
             $allParts = array_merge($selectFields, $lookupSqls);
-            $sql = "SELECT " . implode(', ', $allParts) . " FROM {$collection}";
+            $sql = "SELECT " . implode(', ', $allParts) . " FROM {$table}";
             if ($unwindField !== null) {
                 $sql .= " CROSS JOIN jsonb_array_elements_text(data->'{$unwindField}') AS {$unwindAlias}";
             }
@@ -1771,7 +1825,7 @@ class Utils
             }
         } else {
             $baseParts = array_merge(['_id', 'data', 'created_at'], $lookupSqls);
-            $sql = "SELECT " . implode(', ', $baseParts) . " FROM {$collection}";
+            $sql = "SELECT " . implode(', ', $baseParts) . " FROM {$table}";
             if ($unwindField !== null) {
                 $sql .= " CROSS JOIN jsonb_array_elements_text(data->'{$unwindField}') AS {$unwindAlias}";
             }
@@ -1811,11 +1865,14 @@ class Utils
         PostgresExecutor $conn,
         string $collection,
         ?array $keys = null,
+        ?array $patterns = null,
     ): void {
         SyncUtils::validateIdentifier($collection);
+        $table = self::docTable($patterns);
         if ($keys === null || count($keys) === 0) {
+            $idx = self::docAuxName($table, 'data_gin');
             $conn->query(
-                "CREATE INDEX IF NOT EXISTS {$collection}_data_gin ON {$collection} USING GIN (data)"
+                "CREATE INDEX IF NOT EXISTS {$idx} ON {$table} USING GIN (data)"
             );
             return;
         }
@@ -1825,9 +1882,10 @@ class Utils
             }
             $order = $dir === -1 ? 'DESC' : 'ASC';
             $safeName = str_replace('.', '_', $key);
+            $idx = self::docAuxName($table, "{$safeName}_idx");
             $conn->query(
-                "CREATE INDEX IF NOT EXISTS {$collection}_{$safeName}_idx "
-                . "ON {$collection} ((data->>'{$key}') {$order})"
+                "CREATE INDEX IF NOT EXISTS {$idx} "
+                . "ON {$table} ((data->>'{$key}') {$order})"
             );
         }
     }
@@ -1850,8 +1908,13 @@ class Utils
         PostgresConnection $conn,
         string $collection,
         ?callable $callback = null,
+        ?array $patterns = null,
     ): void {
         SyncUtils::validateIdentifier($collection);
+        $table = self::docTable($patterns);
+        // Channel/function/trigger names key off the user's collection name
+        // (validated identifier — safe to interpolate). Triggers fire on the
+        // canonical proxy table.
         $channel = "{$collection}_changes";
         $funcName = "{$collection}_notify_fn";
         $triggerName = "{$collection}_notify_trg";
@@ -1876,7 +1939,7 @@ class Utils
         // across the product, so this is safe and matches the Go wrapper.
         $conn->query(
             "CREATE OR REPLACE TRIGGER {$triggerName} "
-            . "AFTER INSERT OR UPDATE OR DELETE ON {$collection} "
+            . "AFTER INSERT OR UPDATE OR DELETE ON {$table} "
             . "FOR EACH ROW EXECUTE FUNCTION {$funcName}()"
         );
 
@@ -1888,13 +1951,17 @@ class Utils
         }
     }
 
-    public static function docUnwatch(PostgresExecutor $conn, string $collection): void
-    {
+    public static function docUnwatch(
+        PostgresExecutor $conn,
+        string $collection,
+        ?array $patterns = null,
+    ): void {
         SyncUtils::validateIdentifier($collection);
+        $table = self::docTable($patterns);
         $channel = "{$collection}_changes";
         $funcName = "{$collection}_notify_fn";
         $triggerName = "{$collection}_notify_trg";
-        $conn->query("DROP TRIGGER IF EXISTS {$triggerName} ON {$collection}");
+        $conn->query("DROP TRIGGER IF EXISTS {$triggerName} ON {$table}");
         $conn->query("DROP FUNCTION IF EXISTS {$funcName}()");
         // UNLISTEN is transaction-scoped; if this is a bare connection,
         // executing here is harmless. amphp's listen() is cleaned up by
@@ -1911,21 +1978,23 @@ class Utils
         string $collection,
         int $expireAfterSeconds,
         string $field = 'created_at',
+        ?array $patterns = null,
     ): void {
         SyncUtils::validateIdentifier($collection);
         SyncUtils::validateIdentifier($field);
         if ($expireAfterSeconds <= 0) {
             throw new \InvalidArgumentException('expireAfterSeconds must be a positive integer');
         }
-        $idxName = "{$collection}_ttl_idx";
+        $table = self::docTable($patterns);
+        $idxName = self::docAuxName($table, 'ttl_idx');
         $funcName = "{$collection}_ttl_fn";
         $triggerName = "{$collection}_ttl_trg";
-        $conn->query("CREATE INDEX IF NOT EXISTS {$idxName} ON {$collection} ({$field})");
+        $conn->query("CREATE INDEX IF NOT EXISTS {$idxName} ON {$table} ({$field})");
         $conn->query("
             CREATE OR REPLACE FUNCTION {$funcName}()
             RETURNS TRIGGER LANGUAGE plpgsql AS \$\$
             BEGIN
-                DELETE FROM {$collection} WHERE {$field} < NOW() - INTERVAL '{$expireAfterSeconds} seconds';
+                DELETE FROM {$table} WHERE {$field} < NOW() - INTERVAL '{$expireAfterSeconds} seconds';
                 RETURN NEW;
             END;
             \$\$
@@ -1934,18 +2003,22 @@ class Utils
         // See docWatch for rationale.
         $conn->query(
             "CREATE OR REPLACE TRIGGER {$triggerName} "
-            . "BEFORE INSERT ON {$collection} "
+            . "BEFORE INSERT ON {$table} "
             . "FOR EACH ROW EXECUTE FUNCTION {$funcName}()"
         );
     }
 
-    public static function docRemoveTtlIndex(PostgresExecutor $conn, string $collection): void
-    {
+    public static function docRemoveTtlIndex(
+        PostgresExecutor $conn,
+        string $collection,
+        ?array $patterns = null,
+    ): void {
         SyncUtils::validateIdentifier($collection);
-        $idxName = "{$collection}_ttl_idx";
+        $table = self::docTable($patterns);
+        $idxName = self::docAuxName($table, 'ttl_idx');
         $funcName = "{$collection}_ttl_fn";
         $triggerName = "{$collection}_ttl_trg";
-        $conn->query("DROP TRIGGER IF EXISTS {$triggerName} ON {$collection}");
+        $conn->query("DROP TRIGGER IF EXISTS {$triggerName} ON {$table}");
         $conn->query("DROP FUNCTION IF EXISTS {$funcName}()");
         $conn->query("DROP INDEX IF EXISTS {$idxName}");
     }
@@ -1958,22 +2031,26 @@ class Utils
         PostgresExecutor $conn,
         string $collection,
         int $maxDocuments,
+        ?array $patterns = null,
     ): void {
         SyncUtils::validateIdentifier($collection);
         if ($maxDocuments <= 0) {
             throw new \InvalidArgumentException('maxDocuments must be a positive integer');
         }
-        self::ensureCollection($conn, $collection);
+        // The underlying doc-store table is already materialized by the
+        // proxy (Documents::patterns issues create on first call). This
+        // call only adds the cap trigger + function.
+        $table = self::docTable($patterns);
         $funcName = "{$collection}_cap_fn";
         $triggerName = "{$collection}_cap_trg";
         $conn->query("
             CREATE OR REPLACE FUNCTION {$funcName}()
             RETURNS TRIGGER LANGUAGE plpgsql AS \$\$
             BEGIN
-                DELETE FROM {$collection} WHERE _id IN (
-                    SELECT _id FROM {$collection}
+                DELETE FROM {$table} WHERE _id IN (
+                    SELECT _id FROM {$table}
                     ORDER BY created_at ASC, _id ASC
-                    LIMIT GREATEST((SELECT COUNT(*) FROM {$collection}) - {$maxDocuments}, 0)
+                    LIMIT GREATEST((SELECT COUNT(*) FROM {$table}) - {$maxDocuments}, 0)
                 );
                 RETURN NEW;
             END;
@@ -1983,17 +2060,21 @@ class Utils
         // See docWatch for rationale.
         $conn->query(
             "CREATE OR REPLACE TRIGGER {$triggerName} "
-            . "AFTER INSERT ON {$collection} "
+            . "AFTER INSERT ON {$table} "
             . "FOR EACH ROW EXECUTE FUNCTION {$funcName}()"
         );
     }
 
-    public static function docRemoveCap(PostgresExecutor $conn, string $collection): void
-    {
+    public static function docRemoveCap(
+        PostgresExecutor $conn,
+        string $collection,
+        ?array $patterns = null,
+    ): void {
         SyncUtils::validateIdentifier($collection);
+        $table = self::docTable($patterns);
         $funcName = "{$collection}_cap_fn";
         $triggerName = "{$collection}_cap_trg";
-        $conn->query("DROP TRIGGER IF EXISTS {$triggerName} ON {$collection}");
+        $conn->query("DROP TRIGGER IF EXISTS {$triggerName} ON {$table}");
         $conn->query("DROP FUNCTION IF EXISTS {$funcName}()");
     }
 }
