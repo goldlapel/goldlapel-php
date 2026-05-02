@@ -11,10 +11,25 @@ class GoldLapelTest extends TestCase
     // -- FindBinary (3 tests) --
 
     private string|false $originalGoldlapelBinary;
+    private string|false $originalPgAppName;
+
+    /**
+     * The wrapper appends `application_name=goldlapel:php:<version>` to every
+     * rewritten URL so the proxy can classify wrapper-vs-raw traffic and skip
+     * L2 result cache for wrappers (they have their own L1).
+     */
+    private function appNameSuffix(): string
+    {
+        return 'application_name=' . GoldLapel::applicationNameMarker();
+    }
 
     protected function setUp(): void
     {
         $this->originalGoldlapelBinary = getenv('GOLDLAPEL_BINARY');
+        $this->originalPgAppName = getenv('PGAPPNAME');
+        // Clear PGAPPNAME so makeProxyUrl tests are deterministic (a developer
+        // with PGAPPNAME set in their shell would otherwise see different URLs).
+        putenv('PGAPPNAME');
     }
 
     protected function tearDown(): void
@@ -23,6 +38,11 @@ class GoldLapelTest extends TestCase
             putenv('GOLDLAPEL_BINARY');
         } else {
             putenv("GOLDLAPEL_BINARY={$this->originalGoldlapelBinary}");
+        }
+        if ($this->originalPgAppName === false) {
+            putenv('PGAPPNAME');
+        } else {
+            putenv("PGAPPNAME={$this->originalPgAppName}");
         }
     }
 
@@ -64,7 +84,7 @@ class GoldLapelTest extends TestCase
     public function testMakeProxyUrlPostgresqlFull(): void
     {
         $this->assertSame(
-            'postgresql://user:pass@localhost:7932/mydb',
+            'postgresql://user:pass@localhost:7932/mydb?' . $this->appNameSuffix(),
             GoldLapel::makeProxyUrl('postgresql://user:pass@dbhost:5432/mydb', 7932)
         );
     }
@@ -72,7 +92,7 @@ class GoldLapelTest extends TestCase
     public function testMakeProxyUrlPostgresScheme(): void
     {
         $this->assertSame(
-            'postgres://user:pass@localhost:7932/mydb',
+            'postgres://user:pass@localhost:7932/mydb?' . $this->appNameSuffix(),
             GoldLapel::makeProxyUrl('postgres://user:pass@remote.aws.com:5432/mydb', 7932)
         );
     }
@@ -80,7 +100,7 @@ class GoldLapelTest extends TestCase
     public function testMakeProxyUrlNoPort(): void
     {
         $this->assertSame(
-            'postgresql://user:pass@localhost:7932/mydb',
+            'postgresql://user:pass@localhost:7932/mydb?' . $this->appNameSuffix(),
             GoldLapel::makeProxyUrl('postgresql://user:pass@host.aws.com/mydb', 7932)
         );
     }
@@ -88,13 +108,14 @@ class GoldLapelTest extends TestCase
     public function testMakeProxyUrlNoPortNoPath(): void
     {
         $this->assertSame(
-            'postgresql://user:pass@localhost:7932',
+            'postgresql://user:pass@localhost:7932?' . $this->appNameSuffix(),
             GoldLapel::makeProxyUrl('postgresql://user:pass@host.aws.com', 7932)
         );
     }
 
     public function testMakeProxyUrlBareHostPort(): void
     {
+        // Bare-host form skips the marker — atypical caller path.
         $this->assertSame(
             'localhost:7932',
             GoldLapel::makeProxyUrl('dbhost:5432', 7932)
@@ -112,7 +133,7 @@ class GoldLapelTest extends TestCase
     public function testMakeProxyUrlQueryParams(): void
     {
         $this->assertSame(
-            'postgresql://user:pass@localhost:7932/mydb?sslmode=require',
+            'postgresql://user:pass@localhost:7932/mydb?sslmode=require&' . $this->appNameSuffix(),
             GoldLapel::makeProxyUrl('postgresql://user:pass@remote:5432/mydb?sslmode=require', 7932)
         );
     }
@@ -120,7 +141,7 @@ class GoldLapelTest extends TestCase
     public function testMakeProxyUrlPercentEncoded(): void
     {
         $this->assertSame(
-            'postgresql://user:p%40ss@localhost:7932/mydb',
+            'postgresql://user:p%40ss@localhost:7932/mydb?' . $this->appNameSuffix(),
             GoldLapel::makeProxyUrl('postgresql://user:p%40ss@remote:5432/mydb', 7932)
         );
     }
@@ -128,7 +149,7 @@ class GoldLapelTest extends TestCase
     public function testMakeProxyUrlNoUserWithPort(): void
     {
         $this->assertSame(
-            'postgresql://localhost:7932/mydb',
+            'postgresql://localhost:7932/mydb?' . $this->appNameSuffix(),
             GoldLapel::makeProxyUrl('postgresql://dbhost:5432/mydb', 7932)
         );
     }
@@ -136,7 +157,7 @@ class GoldLapelTest extends TestCase
     public function testMakeProxyUrlNoUserNoPort(): void
     {
         $this->assertSame(
-            'postgresql://localhost:7932/mydb',
+            'postgresql://localhost:7932/mydb?' . $this->appNameSuffix(),
             GoldLapel::makeProxyUrl('postgresql://dbhost/mydb', 7932)
         );
     }
@@ -144,7 +165,7 @@ class GoldLapelTest extends TestCase
     public function testMakeProxyUrlLocalhostUpstream(): void
     {
         $this->assertSame(
-            'postgresql://user:pass@localhost:7932/mydb',
+            'postgresql://user:pass@localhost:7932/mydb?' . $this->appNameSuffix(),
             GoldLapel::makeProxyUrl('postgresql://user:pass@localhost:5432/mydb', 7932)
         );
     }
@@ -152,7 +173,7 @@ class GoldLapelTest extends TestCase
     public function testMakeProxyUrlLiteralAtInPassword(): void
     {
         $this->assertSame(
-            'postgresql://user:p@ss@localhost:7932/mydb',
+            'postgresql://user:p@ss@localhost:7932/mydb?' . $this->appNameSuffix(),
             GoldLapel::makeProxyUrl('postgresql://user:p@ss@host:5432/mydb', 7932)
         );
     }
@@ -160,7 +181,7 @@ class GoldLapelTest extends TestCase
     public function testMakeProxyUrlLiteralAtInPasswordNoPort(): void
     {
         $this->assertSame(
-            'postgresql://user:p@ss@localhost:7932/mydb',
+            'postgresql://user:p@ss@localhost:7932/mydb?' . $this->appNameSuffix(),
             GoldLapel::makeProxyUrl('postgresql://user:p@ss@host/mydb', 7932)
         );
     }
@@ -168,9 +189,58 @@ class GoldLapelTest extends TestCase
     public function testMakeProxyUrlLiteralAtInPasswordWithQueryParams(): void
     {
         $this->assertSame(
-            'postgresql://user:p@ss@localhost:7932/mydb?sslmode=require&param=val@ue',
+            'postgresql://user:p@ss@localhost:7932/mydb?sslmode=require&param=val@ue&' . $this->appNameSuffix(),
             GoldLapel::makeProxyUrl('postgresql://user:p@ss@host:5432/mydb?sslmode=require&param=val@ue', 7932)
         );
+    }
+
+    // -- ApplicationName marker (L2-router architecture) --
+    //
+    // Wrappers identify themselves to the proxy via PG `application_name` so
+    // the proxy can gate L2 result cache (wrappers have their own L1; raw
+    // clients don't).
+
+    public function testApplicationNameMarkerHasGoldlapelPhpShape(): void
+    {
+        $this->assertMatchesRegularExpression(
+            '/^goldlapel:php:.+$/',
+            GoldLapel::applicationNameMarker()
+        );
+    }
+
+    public function testApplicationNameMarkerAppendedWhenNoExistingQuery(): void
+    {
+        $out = GoldLapel::makeProxyUrl('postgresql://localhost:5432/mydb', 7932);
+        $this->assertStringContainsString('?application_name=goldlapel:php:', $out);
+    }
+
+    public function testApplicationNameMarkerAppendedWithExistingQuery(): void
+    {
+        $out = GoldLapel::makeProxyUrl('postgresql://localhost:5432/mydb?sslmode=require', 7932);
+        $this->assertStringContainsString('sslmode=require', $out);
+        $this->assertStringContainsString('&application_name=goldlapel:php:', $out);
+    }
+
+    public function testApplicationNameMarkerRespectsUserUrlOverride(): void
+    {
+        $out = GoldLapel::makeProxyUrl(
+            'postgresql://localhost:5432/mydb?application_name=my-app',
+            7932
+        );
+        $this->assertStringContainsString('application_name=my-app', $out);
+        $this->assertStringNotContainsString('goldlapel:php', $out);
+    }
+
+    public function testApplicationNameMarkerRespectsPgAppNameEnv(): void
+    {
+        putenv('PGAPPNAME=my-app');
+        try {
+            $out = GoldLapel::makeProxyUrl('postgresql://localhost:5432/mydb', 7932);
+            $this->assertStringNotContainsString('application_name=', $out);
+            $this->assertStringNotContainsString('goldlapel:php', $out);
+        } finally {
+            putenv('PGAPPNAME');
+        }
     }
 
     // -- WaitForPort (2 tests) --
