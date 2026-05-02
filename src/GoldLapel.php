@@ -1120,19 +1120,73 @@ class GoldLapel
         );
     }
 
+    /**
+     * Wrapper version, used to build the application_name marker on PG
+     * connections. Reads from Composer's InstalledVersions metadata when
+     * available (production); falls back to the parent composer.json for
+     * dev installs, or "0.0.0" if neither is reachable.
+     */
+    public static function wrapperVersion(): string
+    {
+        if (class_exists('\\Composer\\InstalledVersions')) {
+            try {
+                $v = \Composer\InstalledVersions::getPrettyVersion('goldlapel/goldlapel');
+                if (is_string($v) && $v !== '') {
+                    return ltrim($v, 'v');
+                }
+            } catch (\Throwable $e) {
+                // fall through
+            }
+        }
+        // Dev fallback: read sibling composer.json. CI rewrites this at publish time.
+        $composerJson = __DIR__ . '/../composer.json';
+        if (is_file($composerJson)) {
+            $data = json_decode((string) @file_get_contents($composerJson), true);
+            if (is_array($data) && isset($data['version']) && is_string($data['version'])) {
+                return ltrim($data['version'], 'v');
+            }
+        }
+        return '0.0.0';
+    }
+
+    public static function applicationNameMarker(): string
+    {
+        return 'goldlapel:php:' . self::wrapperVersion();
+    }
+
+    /**
+     * Append `application_name=goldlapel:php:<version>` to the URL unless one
+     * is already present (or PGAPPNAME is set). Tells the proxy this is
+     * wrapper traffic so it can skip L2 result cache (the wrapper has its
+     * own L1). Idempotent and override-respecting.
+     */
+    public static function injectApplicationName(string $url): string
+    {
+        if (preg_match('/[?&]application_name=/', $url)) {
+            return $url;
+        }
+        $pgAppName = getenv('PGAPPNAME');
+        if (is_string($pgAppName) && $pgAppName !== '') {
+            return $url;
+        }
+        $sep = (strpos($url, '?') !== false) ? '&' : '?';
+        return $url . $sep . 'application_name=' . self::applicationNameMarker();
+    }
+
     public static function makeProxyUrl(string $upstream, int $port): string
     {
         $withPort = '/^(postgres(?:ql)?:\/\/(?:.*@)?)([^\/:?#]+):(\d+)(.*)$/';
         $noPort = '/^(postgres(?:ql)?:\/\/(?:.*@)?)([^\/:?#]+)(.*)$/';
 
         if (preg_match($withPort, $upstream, $m)) {
-            return $m[1] . 'localhost:' . $port . $m[4];
+            return self::injectApplicationName($m[1] . 'localhost:' . $port . $m[4]);
         }
 
         if (preg_match($noPort, $upstream, $m)) {
-            return $m[1] . 'localhost:' . $port . $m[3];
+            return self::injectApplicationName($m[1] . 'localhost:' . $port . $m[3]);
         }
 
+        // Bare-host form skips the marker — atypical caller path.
         return 'localhost:' . $port;
     }
 
