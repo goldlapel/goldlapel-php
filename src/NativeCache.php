@@ -18,6 +18,20 @@ class NativeCache
         'except', 'all', 'distinct', 'lateral', 'values',
     ];
 
+    // --- L1 telemetry tuning ---
+    //
+    // Demand-driven model (mirrors goldlapel-python). Counters bump on
+    // cache ops; state-change events emit synchronously when a relevant
+    // counter crosses a threshold; snapshot replies are sent only when
+    // the proxy asks via ?:<request>.
+    //
+    // Eviction-rate sliding window: cache_full fires when ≥ 50% of the
+    // last 200 puts caused an eviction; cache_recovered when the rate
+    // falls back below 10%. Hysteresis prevents flapping at the boundary.
+    private const EVICT_RATE_WINDOW = 200;
+    private const EVICT_RATE_HIGH = 0.5;
+    private const EVICT_RATE_LOW = 0.1;
+
     private array $cache = [];
     private array $tableIndex = [];
     private array $accessOrder = [];
@@ -33,6 +47,34 @@ class NativeCache
     public int $statsHits = 0;
     public int $statsMisses = 0;
     public int $statsInvalidations = 0;
+    // L1 telemetry — was missing before; bumped in evictOne(). Public so
+    // tests + external integrations can read it the same way they read
+    // the other counters.
+    public int $statsEvictions = 0;
+
+    // L1 telemetry state. wrapperId is generated once per process and
+    // stable across reconnects; lets the proxy aggregate per-wrapper.
+    private string $wrapperId;
+    private string $wrapperLang = 'php';
+    private string $wrapperVersion;
+    // Whether snapshot replies + S: emissions should actually go on the
+    // wire. Defaults to true under CLI (long-running workers, Amp,
+    // tests, scripts) and false under short-lived SAPIs (FPM, Apache,
+    // CGI) where each request would emit wrapper_connected /
+    // wrapper_disconnected and flood the proxy. Override with
+    // GOLDLAPEL_REPORT_STATS=true|false.
+    private bool $reportStats;
+    // Sliding window for eviction-rate state-change detection. A bounded
+    // ring buffer (1 = evicted, 0 = inserted); updates are O(1).
+    private array $recentEvictions = [];
+    private int $recentEvictionsIdx = 0;
+    // Latched state — only emit a transition when the rate flips. Without
+    // latching we'd re-emit cache_full on every put while the rate is bad.
+    private bool $stateCacheFull = false;
+    // Whether we've already registered a shutdown hook for this instance.
+    // PHP can call register_shutdown_function multiple times safely, but
+    // we still gate on this so reset() + new instance don't double-register.
+    private bool $shutdownRegistered = false;
 
     private static ?self $instance = null;
 
@@ -41,6 +83,9 @@ class NativeCache
         $this->maxEntries = $maxEntries ?? (int) (getenv('GOLDLAPEL_NATIVE_CACHE_SIZE') ?: '32768');
         $envEnabled = getenv('GOLDLAPEL_NATIVE_CACHE');
         $this->enabled = $enabled ?? ($envEnabled === false || strtolower($envEnabled) !== 'false');
+        $this->wrapperId = self::generateUuidV4();
+        $this->wrapperVersion = self::resolveWrapperVersion();
+        $this->reportStats = self::resolveReportStats();
     }
 
     public static function getInstance(): self
@@ -105,8 +150,10 @@ class NativeCache
             return;
         }
         $tables = self::extractTables($sql);
+        $evicted = 0;
         if (!isset($this->cache[$key]) && count($this->cache) >= $this->maxEntries) {
             $this->evictOne();
+            $evicted = 1;
         }
         $this->cache[$key] = ['rows' => $rows, 'columns' => $columns, 'tables' => $tables];
         $this->counter++;
@@ -117,6 +164,11 @@ class NativeCache
             }
             $this->tableIndex[$table][$key] = true;
         }
+        $this->recordEviction($evicted);
+        // Threshold check happens after the put completes — emitLine may
+        // write to the socket and we don't want to interleave write
+        // bookkeeping with cache state.
+        $this->maybeEmitEvictionRateStateChange();
     }
 
     public function invalidateTable(string $table): void
@@ -177,6 +229,8 @@ class NativeCache
             stream_set_blocking($sock, false);
             $this->socket = $sock;
             $this->invalidationConnected = true;
+            $this->registerShutdownEmit();
+            $this->emitStateChange('wrapper_connected');
 
             // Non-blocking read of any pending signals
             $this->drainSignals($sock);
@@ -211,6 +265,8 @@ class NativeCache
             stream_set_blocking($sock, false);
             $this->socket = $sock;
             $this->invalidationConnected = true;
+            $this->registerShutdownEmit();
+            $this->emitStateChange('wrapper_connected');
 
             // For long-running processes: read signals using stream_select
             $this->readSignalsLoop($sock);
@@ -236,6 +292,17 @@ class NativeCache
     public function disconnect(): void
     {
         $this->stopped = true;
+        // Emit wrapper_disconnected before tearing the socket down — the
+        // emit path checks invalidationConnected indirectly (via
+        // emitLine reading $this->socket), so we sequence:
+        //   1. emit while the socket is still up
+        //   2. flip the connected flag
+        //   3. close the socket
+        // emitLine itself short-circuits if reportStats is off, so this
+        // is a no-op under FPM.
+        if ($this->socket !== null && is_resource($this->socket)) {
+            $this->emitWrapperDisconnected();
+        }
         $this->invalidationConnected = false;
         if ($this->socket !== null && is_resource($this->socket)) {
             fclose($this->socket);
@@ -250,6 +317,9 @@ class NativeCache
 
     public function processSignal(string $line): void
     {
+        // Backwards-compat: unknown prefixes are silently ignored. Older
+        // proxies sent only I:/C:/P:; newer proxies may add request types.
+        // Forward-compat: accept any well-formed prefix and route by type.
         if (str_starts_with($line, 'I:')) {
             $table = trim(substr($line, 2));
             if ($table === '*') {
@@ -257,7 +327,10 @@ class NativeCache
             } else {
                 $this->invalidateTable($table);
             }
+        } elseif (str_starts_with($line, '?:')) {
+            $this->processRequest(substr($line, 2));
         }
+        // C: (config), P: (ping), and anything else — ignored.
     }
 
     // --- SQL parsing (static) ---
@@ -429,6 +502,7 @@ class NativeCache
                 }
             }
         }
+        $this->statsEvictions++;
     }
 
     private function drainSignals($sock): void
@@ -537,6 +611,7 @@ class NativeCache
                 stream_set_blocking($sock, false);
                 $this->socket = $sock;
                 $this->invalidationConnected = true;
+                $this->emitStateChange('wrapper_connected');
                 return true;
             } catch (\Throwable $e) {
                 if ($sock && is_resource($sock)) {
@@ -547,5 +622,275 @@ class NativeCache
         }
 
         return false;
+    }
+
+    // ------------------------------------------------------------------
+    // L1 telemetry
+    // ------------------------------------------------------------------
+
+    /**
+     * Read-only accessor for the stable wrapper id. UUID v4 generated
+     * once per process; lets the proxy aggregate per-wrapper across
+     * reconnects.
+     */
+    public function getWrapperId(): string
+    {
+        return $this->wrapperId;
+    }
+
+    public function isReportingStats(): bool
+    {
+        return $this->reportStats;
+    }
+
+    /**
+     * Build the L1 snapshot dict the proxy aggregates per-tick. All
+     * counters + cache size read in a single pass for internal
+     * consistency. Public so external dashboards can call it directly.
+     */
+    public function buildSnapshot(): array
+    {
+        return [
+            'wrapper_id' => $this->wrapperId,
+            'lang' => $this->wrapperLang,
+            'version' => $this->wrapperVersion,
+            'hits' => $this->statsHits,
+            'misses' => $this->statsMisses,
+            'evictions' => $this->statsEvictions,
+            'invalidations' => $this->statsInvalidations,
+            'current_size_entries' => count($this->cache),
+            'capacity_entries' => $this->maxEntries,
+        ];
+    }
+
+    /**
+     * Emit a final wrapper_disconnected snapshot before shutdown. Best
+     * effort — the socket may already be torn down. Called from
+     * disconnect() and from the registered shutdown hook.
+     */
+    public function emitWrapperDisconnected(): void
+    {
+        $this->emitStateChange('wrapper_disconnected');
+    }
+
+    /**
+     * Process a ?:<request> from the proxy. Today the only request is
+     * `snapshot` (the proxy asks for current counters; we reply with
+     * R:<json>). Future request types can extend this without breaking
+     * older proxies — they just won't be expecting the reply.
+     */
+    private function processRequest(string $body): void
+    {
+        $body = trim($body);
+        if ($body === '' || $body === 'snapshot') {
+            $this->emitResponse();
+        }
+    }
+
+    /**
+     * Emit S:<json> with snapshot + state name. Subclasses may override
+     * emitLine() to capture the line for testing.
+     */
+    private function emitStateChange(string $state): void
+    {
+        if (!$this->reportStats) {
+            return;
+        }
+        $payload = $this->buildSnapshot();
+        $payload['state'] = $state;
+        $payload['ts_ms'] = (int) (microtime(true) * 1000);
+        $encoded = self::encodeJson($payload);
+        if ($encoded === null) {
+            return;
+        }
+        $this->emitLine('S:' . $encoded);
+    }
+
+    /**
+     * Emit R:<json> snapshot reply to a ?:<request>.
+     */
+    private function emitResponse(): void
+    {
+        if (!$this->reportStats) {
+            return;
+        }
+        $payload = $this->buildSnapshot();
+        $payload['ts_ms'] = (int) (microtime(true) * 1000);
+        $encoded = self::encodeJson($payload);
+        if ($encoded === null) {
+            return;
+        }
+        $this->emitLine('R:' . $encoded);
+    }
+
+    /**
+     * Best-effort write of a single newline-delimited line to the
+     * invalidation socket. Socket errors are swallowed (the recv path
+     * will detect the dead connection and the reconnect logic will
+     * rebuild). Visibility is `protected` so test subclasses can capture
+     * emissions without needing a real socket.
+     */
+    protected function emitLine(string $line): void
+    {
+        if (!$this->reportStats) {
+            return;
+        }
+        $sock = $this->socket;
+        if ($sock === null || !is_resource($sock)) {
+            return;
+        }
+        $data = str_ends_with($line, "\n") ? $line : ($line . "\n");
+        // PHP without pthreads is single-threaded — no send-lock needed
+        // outside the Amp event loop. Within a single fiber, fwrite is
+        // atomic for stream resources. Two fibers writing concurrently
+        // on the same stream would race, but the cache is only ever
+        // written to from the calling fiber (Amp's CachedConnection
+        // serializes its calls), so this is safe.
+        @fwrite($sock, $data);
+    }
+
+    /**
+     * Record a put() outcome (1 = evicted, 0 = inserted) into the
+     * bounded sliding-window ring. Append until full, then overwrite
+     * oldest in O(1).
+     */
+    private function recordEviction(int $evicted): void
+    {
+        if (count($this->recentEvictions) < self::EVICT_RATE_WINDOW) {
+            $this->recentEvictions[] = $evicted;
+        } else {
+            $this->recentEvictions[$this->recentEvictionsIdx] = $evicted;
+            $this->recentEvictionsIdx = ($this->recentEvictionsIdx + 1) % self::EVICT_RATE_WINDOW;
+        }
+    }
+
+    /**
+     * Check the eviction-rate sliding window and emit a state change if
+     * the latched flag should flip. Hysteresis-guarded: crossing HIGH
+     * emits cache_full, falling back below LOW emits cache_recovered;
+     * rates between LOW and HIGH leave the latched state unchanged.
+     */
+    private function maybeEmitEvictionRateStateChange(): void
+    {
+        $n = count($this->recentEvictions);
+        if ($n < self::EVICT_RATE_WINDOW) {
+            // Warmup gate — a single eviction in 3 puts is noise.
+            return;
+        }
+        $rate = array_sum($this->recentEvictions) / $n;
+        $emit = null;
+        if (!$this->stateCacheFull && $rate >= self::EVICT_RATE_HIGH) {
+            $this->stateCacheFull = true;
+            $emit = 'cache_full';
+        } elseif ($this->stateCacheFull && $rate <= self::EVICT_RATE_LOW) {
+            $this->stateCacheFull = false;
+            $emit = 'cache_recovered';
+        }
+        if ($emit !== null) {
+            $this->emitStateChange($emit);
+        }
+    }
+
+    /**
+     * Register the shutdown hook that emits wrapper_disconnected on
+     * graceful process exit. Idempotent — called on every connect, but
+     * the actual register_shutdown_function only fires once per
+     * instance. The hook captures `$this` weakly via WeakReference so a
+     * reset() that forgets the singleton doesn't keep us pinned.
+     */
+    private function registerShutdownEmit(): void
+    {
+        if ($this->shutdownRegistered) {
+            return;
+        }
+        $this->shutdownRegistered = true;
+        $weak = \WeakReference::create($this);
+        register_shutdown_function(static function () use ($weak) {
+            $self = $weak->get();
+            if ($self !== null) {
+                try {
+                    $self->emitWrapperDisconnected();
+                } catch (\Throwable $e) {
+                    // Shutdown-time errors must not abort the process.
+                }
+            }
+        });
+    }
+
+    private static function generateUuidV4(): string
+    {
+        $bytes = random_bytes(16);
+        // Set version (4) + variant (10xx) bits per RFC 4122.
+        $bytes[6] = chr((ord($bytes[6]) & 0x0f) | 0x40);
+        $bytes[8] = chr((ord($bytes[8]) & 0x3f) | 0x80);
+        $hex = bin2hex($bytes);
+        return sprintf(
+            '%s-%s-%s-%s-%s',
+            substr($hex, 0, 8),
+            substr($hex, 8, 4),
+            substr($hex, 12, 4),
+            substr($hex, 16, 4),
+            substr($hex, 20, 12),
+        );
+    }
+
+    /**
+     * Resolve the wrapper version from composer.json (walking up from
+     * this file's location). Falls back to "unknown" if the manifest
+     * isn't found or doesn't declare a version. We avoid hardcoding
+     * because Packagist serves whatever the git tag declares, not the
+     * manifest, so a hardcoded version drifts from the tag at release
+     * time.
+     */
+    private static function resolveWrapperVersion(): string
+    {
+        // composer.json sits at the package root; this file is at
+        // src/NativeCache.php. Walk up two directories.
+        $manifest = dirname(__DIR__) . '/composer.json';
+        if (!is_file($manifest)) {
+            return 'unknown';
+        }
+        $raw = @file_get_contents($manifest);
+        if ($raw === false) {
+            return 'unknown';
+        }
+        $decoded = json_decode($raw, true);
+        if (!is_array($decoded)) {
+            return 'unknown';
+        }
+        $version = $decoded['version'] ?? null;
+        if (is_string($version) && $version !== '') {
+            return $version;
+        }
+        return 'unknown';
+    }
+
+    /**
+     * Decide whether telemetry should be sent on the wire.
+     *
+     * - Explicit GOLDLAPEL_REPORT_STATS=true|false wins.
+     * - Otherwise, default ON only under the CLI SAPI. Short-lived
+     *   request-handling SAPIs (fpm-fcgi, cgi-fcgi, apache2handler,
+     *   etc.) connect, do one query, and exit — telemetry would emit
+     *   wrapper_connected/wrapper_disconnected on every request and
+     *   flood the proxy. The cache itself continues to function in
+     *   those SAPIs; only S:/R: emissions are suppressed.
+     */
+    private static function resolveReportStats(): bool
+    {
+        $env = getenv('GOLDLAPEL_REPORT_STATS');
+        if ($env !== false && $env !== '') {
+            return strtolower($env) !== 'false';
+        }
+        return PHP_SAPI === 'cli' || PHP_SAPI === 'phpdbg';
+    }
+
+    private static function encodeJson(array $payload): ?string
+    {
+        $encoded = json_encode($payload, JSON_UNESCAPED_SLASHES);
+        if ($encoded === false) {
+            return null;
+        }
+        return $encoded;
     }
 }
