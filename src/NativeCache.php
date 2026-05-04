@@ -38,6 +38,13 @@ class NativeCache
     private int $counter = 0;
     private int $maxEntries;
     private bool $enabled;
+    // disable_l1: when true the cache acts as a no-op pass-through. Distinct
+    // from $enabled (the env-var/legacy toggle) — disabled() ticks misses on
+    // every get() so the proxy can still see the wrapper's traffic shape via
+    // telemetry, while $enabled=false (cache_size=0 family) goes fully dark.
+    // Invalidation polling + state-change emissions continue to run regardless,
+    // so the proxy's telemetry path is unaffected.
+    private bool $disabled;
     private bool $invalidationConnected = false;
     private int $invalidationPort = 0;
     /** @var resource|null */
@@ -78,11 +85,12 @@ class NativeCache
 
     private static ?self $instance = null;
 
-    public function __construct(?int $maxEntries = null, ?bool $enabled = null)
+    public function __construct(?int $maxEntries = null, ?bool $enabled = null, bool $disabled = false)
     {
         $this->maxEntries = $maxEntries ?? (int) (getenv('GOLDLAPEL_NATIVE_CACHE_SIZE') ?: '32768');
         $envEnabled = getenv('GOLDLAPEL_NATIVE_CACHE');
         $this->enabled = $enabled ?? ($envEnabled === false || strtolower($envEnabled) !== 'false');
+        $this->disabled = $disabled;
         $this->wrapperId = self::generateUuidV4();
         $this->wrapperVersion = self::resolveWrapperVersion();
         $this->reportStats = self::resolveReportStats();
@@ -114,6 +122,24 @@ class NativeCache
         return $this->enabled;
     }
 
+    /**
+     * Toggle the L1 no-op pass-through. When true, get() returns null and
+     * ticks misses, put() is a silent no-op, and the wrapper_connected
+     * snapshot reports `l1_disabled: true`. Invalidation polling continues
+     * either way so telemetry stays live. Used by the canonical
+     * `disable_l1` startup option — the singleton is configured by
+     * GoldLapel::wrapPDO()/wrapPDOStatic() before the first cache op.
+     */
+    public function setDisabled(bool $disabled): void
+    {
+        $this->disabled = $disabled;
+    }
+
+    public function isDisabled(): bool
+    {
+        return $this->disabled;
+    }
+
     public function size(): int
     {
         return count($this->cache);
@@ -124,6 +150,13 @@ class NativeCache
     public function get(string $sql, ?array $params = null): ?array
     {
         if (!$this->enabled || !$this->invalidationConnected) {
+            return null;
+        }
+        // disable_l1: tick misses (so the proxy still sees the request rate
+        // through telemetry) but never serve a hit. Hits + evictions stay
+        // at zero; put() is a sibling no-op below.
+        if ($this->disabled) {
+            $this->statsMisses++;
             return null;
         }
         $key = self::makeKey($sql, $params);
@@ -143,6 +176,9 @@ class NativeCache
     public function put(string $sql, ?array $params, array $rows, ?array $columns): void
     {
         if (!$this->enabled || !$this->invalidationConnected) {
+            return;
+        }
+        if ($this->disabled) {
             return;
         }
         $key = self::makeKey($sql, $params);
@@ -650,7 +686,7 @@ class NativeCache
      */
     public function buildSnapshot(): array
     {
-        return [
+        $snap = [
             'wrapper_id' => $this->wrapperId,
             'lang' => $this->wrapperLang,
             'version' => $this->wrapperVersion,
@@ -661,6 +697,13 @@ class NativeCache
             'current_size_entries' => count($this->cache),
             'capacity_entries' => $this->maxEntries,
         ];
+        // Surfaced only when set, so existing snapshot consumers keep their
+        // current key shape and the proxy can detect disabled wrappers
+        // without an extra version negotiation.
+        if ($this->disabled) {
+            $snap['l1_disabled'] = true;
+        }
+        return $snap;
     }
 
     /**

@@ -86,6 +86,7 @@ class GoldLapel
     private bool $mesh;
     private ?string $meshTag;
     private bool $enableL2ForWrappers;
+    private bool $disableL1;
     private array $config;
     private array $extraArgs;
     /** @var resource|null */
@@ -159,6 +160,7 @@ class GoldLapel
      *   mesh?: bool,
      *   mesh_tag?: string,
      *   enable_l2_for_wrappers?: bool,
+     *   disable_l1?: bool,
      * } $options
      */
     public function __construct(string $upstream, array $options = [])
@@ -207,6 +209,12 @@ class GoldLapel
         // (multi-pod, frequent restarts, mesh) flip this on so the proxy's
         // shared L2 still serves wrapper queries.
         $this->enableL2ForWrappers = !empty($options['enable_l2_for_wrappers']);
+        // disable_l1 turns the wrapper-side L1 (NativeCache) into a no-op
+        // pass-through without forcing the user to drop their tuned
+        // `cache_size`. The flag is applied to the singleton NativeCache the
+        // first time wrapPDO()/wrapPDOStatic() is called from this instance,
+        // and surfaces on the L1 telemetry snapshot as `l1_disabled: true`.
+        $this->disableL1 = !empty($options['disable_l1']);
 
         // Nested namespaces — see src/Documents.php, src/Streams.php, plus
         // the Phase 5 Redis-compat families under src/{Counters,Zsets,
@@ -240,6 +248,7 @@ class GoldLapel
      *   - 'mesh' (bool): opt into the mesh at startup (HQ enforces license; denial is non-fatal)
      *   - 'mesh_tag' (string): optional mesh tag — instances with the same tag cluster together
      *   - 'enable_l2_for_wrappers' (bool): opt the wrapper into the proxy's L2 result cache. Default false (wrapper traffic skips L2 because L1 covers it). Useful for fleet deployments (multi-pod, frequent restarts) where shared L2 still adds value.
+     *   - 'disable_l1' (bool): turn the wrapper's NativeCache into a no-op pass-through. Default false. Lets you toggle the layer off without losing your tuned `cache_size` — get() returns null, put() is a no-op, misses still tick (so the proxy sees the traffic shape via telemetry), the snapshot reports `l1_disabled: true`.
      *
      * Promoted top-level concepts (proxy_port, dashboard_port, etc.) are NOT
      * valid keys inside `config` — passing them there raises at construction
@@ -854,17 +863,27 @@ class GoldLapel
                 : $this->proxyPort + 2;
         }
 
-        return self::wrapPDOStatic($pdo, $invalidationPort);
+        return self::wrapPDOStatic($pdo, $invalidationPort, $this->disableL1);
     }
 
     /**
      * Low-level helper: wrap a PDO with the L1 cache, connecting the cache
      * to the given invalidation port. Used by the Laravel integration where
      * PDOs are constructed by the framework outside the factory lifecycle.
+     *
+     * `$disableL1` is tri-state: null leaves the singleton's current
+     * disabled state untouched (so Laravel callers that don't know about
+     * the option don't accidentally re-enable a previously-disabled
+     * cache), while true/false set it explicitly. wrapPDO() forwards the
+     * factory's `disable_l1` startup option here, so the disable_l1=true
+     * path always wins over a passive Laravel wrap that follows it.
      */
-    public static function wrapPDOStatic(\PDO $pdo, int $invalidationPort): CachedPDO
+    public static function wrapPDOStatic(\PDO $pdo, int $invalidationPort, ?bool $disableL1 = null): CachedPDO
     {
         $cache = NativeCache::getInstance();
+        if ($disableL1 !== null) {
+            $cache->setDisabled($disableL1);
+        }
         if (!$cache->isConnected()) {
             $cache->connectInvalidation($invalidationPort);
         }
