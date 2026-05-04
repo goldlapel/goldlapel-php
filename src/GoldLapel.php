@@ -85,6 +85,7 @@ class GoldLapel
     private bool $silent;
     private bool $mesh;
     private ?string $meshTag;
+    private bool $enableL2ForWrappers;
     private array $config;
     private array $extraArgs;
     /** @var resource|null */
@@ -157,6 +158,7 @@ class GoldLapel
      *   silent?: bool,
      *   mesh?: bool,
      *   mesh_tag?: string,
+     *   enable_l2_for_wrappers?: bool,
      * } $options
      */
     public function __construct(string $upstream, array $options = [])
@@ -199,6 +201,12 @@ class GoldLapel
         $this->mesh = !empty($options['mesh']);
         $tag = isset($options['mesh_tag']) ? (string) $options['mesh_tag'] : '';
         $this->meshTag = $tag === '' ? null : $tag;
+        // Opt the wrapper into L2 (proxy result cache). Default false: per-
+        // connection L2 wrapper-skip is the global default since the L1 cache
+        // on the wrapper side handles single-pod traffic. Fleet customers
+        // (multi-pod, frequent restarts, mesh) flip this on so the proxy's
+        // shared L2 still serves wrapper queries.
+        $this->enableL2ForWrappers = !empty($options['enable_l2_for_wrappers']);
 
         // Nested namespaces — see src/Documents.php, src/Streams.php, plus
         // the Phase 5 Redis-compat families under src/{Counters,Zsets,
@@ -231,6 +239,7 @@ class GoldLapel
      *   - 'silent' (bool): suppress the startup banner
      *   - 'mesh' (bool): opt into the mesh at startup (HQ enforces license; denial is non-fatal)
      *   - 'mesh_tag' (string): optional mesh tag — instances with the same tag cluster together
+     *   - 'enable_l2_for_wrappers' (bool): opt the wrapper into the proxy's L2 result cache. Default false (wrapper traffic skips L2 because L1 covers it). Useful for fleet deployments (multi-pod, frequent restarts) where shared L2 still adds value.
      *
      * Promoted top-level concepts (proxy_port, dashboard_port, etc.) are NOT
      * valid keys inside `config` — passing them there raises at construction
@@ -530,6 +539,9 @@ class GoldLapel
         if ($this->meshTag !== null) {
             $cmd[] = '--mesh-tag';
             $cmd[] = $this->meshTag;
+        }
+        if ($this->enableL2ForWrappers) {
+            $cmd[] = '--enable-l2-for-wrappers';
         }
         $cmd = array_merge($cmd, self::configToArgs($this->config), $this->extraArgs);
 

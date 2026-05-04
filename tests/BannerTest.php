@@ -277,4 +277,190 @@ class BannerTest extends TestCase
             );
         }
     }
+
+    // ─── enable_l2_for_wrappers startup option ────────────────────────────
+    //
+    // Per-connection L2 wrapper-skip is the global default — wrappers carry
+    // an L1 cache and tag their PG application_name so the proxy bypasses L2
+    // for them. Fleet customers (multi-pod, frequent restarts, mesh) flip
+    // this on so the proxy's shared L2 keeps adding value across pods.
+
+    private function enableL2ForWrappersFieldValue(GoldLapel $gl): bool
+    {
+        $ref = new \ReflectionProperty(GoldLapel::class, 'enableL2ForWrappers');
+        $ref->setAccessible(true);
+        return $ref->getValue($gl);
+    }
+
+    public function testEnableL2ForWrappersDefaultsToFalse(): void
+    {
+        $gl = new GoldLapel('postgresql://u:p@h/d');
+        $this->assertFalse($this->enableL2ForWrappersFieldValue($gl));
+    }
+
+    public function testEnableL2ForWrappersOptionParsedAsTrue(): void
+    {
+        $gl = new GoldLapel('postgresql://u:p@h/d', ['enable_l2_for_wrappers' => true]);
+        $this->assertTrue($this->enableL2ForWrappersFieldValue($gl));
+    }
+
+    public function testEnableL2ForWrappersAsConfigKeyRejected(): void
+    {
+        // Belt-and-braces: enable_l2_for_wrappers is a top-level canonical-
+        // surface option, never valid inside the structured config map.
+        $this->expectException(\InvalidArgumentException::class);
+        new GoldLapel('postgresql://u:p@h/d', [
+            'config' => ['enable_l2_for_wrappers' => true],
+        ]);
+    }
+
+    public function testEnableL2ForWrappersNotForwardedAsConfigArg(): void
+    {
+        $gl = new GoldLapel('postgresql://u:p@h/d', [
+            'enable_l2_for_wrappers' => true,
+        ]);
+        // configToArgs only sees the structured config map; the wrapper-L2
+        // flag lives on the instance and is emitted in
+        // startProxyWithoutConnect.
+        $args = GoldLapel::configToArgs($this->configFieldValue($gl));
+        $this->assertNotContains('--enable-l2-for-wrappers', $args);
+        $this->assertNotContains('enable_l2_for_wrappers', $args);
+    }
+
+    public function testEnableL2ForWrappersFalseyValuesTreatedAsFalse(): void
+    {
+        foreach ([false, 0, '', null] as $falsey) {
+            $gl = new GoldLapel('postgresql://u:p@h/d', ['enable_l2_for_wrappers' => $falsey]);
+            $this->assertFalse(
+                $this->enableL2ForWrappersFieldValue($gl),
+                'enable_l2_for_wrappers => ' . var_export($falsey, true) . ' should be false'
+            );
+        }
+    }
+
+    public function testEnableL2ForWrappersFlagAppearsInSpawnedArgv(): void
+    {
+        // End-to-end assertion: start() with enable_l2_for_wrappers => true
+        // must pass --enable-l2-for-wrappers to the spawned binary. Use a
+        // fake binary that records its argv to a tempfile and listens on the
+        // requested port long enough for waitForPort() to succeed.
+        if (PHP_OS_FAMILY === 'Windows') {
+            $this->markTestSkipped('Fake-binary spawn test uses /bin/sh.');
+        }
+
+        $port = $this->findFreePort();
+        $argvFile = tempnam(sys_get_temp_dir(), 'gl_argv_');
+        register_shutdown_function(fn() => @unlink($argvFile));
+
+        // Shell records its own argv (one arg per line) to $argvFile, then
+        // python3 binds the port and idles long enough for the test to
+        // observe it.
+        $script = "#!/bin/sh\n"
+            . "for arg in \"\$@\"; do\n"
+            . "  printf '%s\\n' \"\$arg\" >> '{$argvFile}'\n"
+            . "done\n"
+            . "exec python3 -c \"import socket,time\n"
+            . "s=socket.socket()\n"
+            . "s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)\n"
+            . "s.bind(('127.0.0.1',{$port}))\n"
+            . "s.listen(5)\n"
+            . "time.sleep(30)\"\n";
+
+        $fake = tempnam(sys_get_temp_dir(), 'gl_fake_');
+        file_put_contents($fake, $script);
+        chmod($fake, 0755);
+        register_shutdown_function(fn() => @unlink($fake));
+
+        $origBinary = getenv('GOLDLAPEL_BINARY');
+
+        try {
+            putenv("GOLDLAPEL_BINARY={$fake}");
+            GoldLapel::startProxyOnly(
+                'postgresql://user:pass@localhost:5432/db',
+                [
+                    'proxy_port' => $port,
+                    'dashboard_port' => 0,
+                    'enable_l2_for_wrappers' => true,
+                ]
+            );
+
+            $argv = file_get_contents($argvFile);
+            $this->assertIsString($argv);
+            $this->assertStringContainsString(
+                "--enable-l2-for-wrappers\n",
+                $argv,
+                "spawned argv must contain --enable-l2-for-wrappers when the option is true; got: {$argv}"
+            );
+        } finally {
+            GoldLapel::cleanupAll();
+            if ($origBinary === false) {
+                putenv('GOLDLAPEL_BINARY');
+            } else {
+                putenv("GOLDLAPEL_BINARY={$origBinary}");
+            }
+        }
+    }
+
+    public function testEnableL2ForWrappersDefaultOmitsFlagFromSpawnedArgv(): void
+    {
+        // Negative case: when the option is not set (default false), the
+        // flag must NOT appear in argv. Guards against a regression that
+        // would force the flag on for everyone.
+        if (PHP_OS_FAMILY === 'Windows') {
+            $this->markTestSkipped('Fake-binary spawn test uses /bin/sh.');
+        }
+
+        $port = $this->findFreePort();
+        $argvFile = tempnam(sys_get_temp_dir(), 'gl_argv_');
+        register_shutdown_function(fn() => @unlink($argvFile));
+
+        $script = "#!/bin/sh\n"
+            . "for arg in \"\$@\"; do\n"
+            . "  printf '%s\\n' \"\$arg\" >> '{$argvFile}'\n"
+            . "done\n"
+            . "exec python3 -c \"import socket,time\n"
+            . "s=socket.socket()\n"
+            . "s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)\n"
+            . "s.bind(('127.0.0.1',{$port}))\n"
+            . "s.listen(5)\n"
+            . "time.sleep(30)\"\n";
+
+        $fake = tempnam(sys_get_temp_dir(), 'gl_fake_');
+        file_put_contents($fake, $script);
+        chmod($fake, 0755);
+        register_shutdown_function(fn() => @unlink($fake));
+
+        $origBinary = getenv('GOLDLAPEL_BINARY');
+
+        try {
+            putenv("GOLDLAPEL_BINARY={$fake}");
+            GoldLapel::startProxyOnly(
+                'postgresql://user:pass@localhost:5432/db',
+                ['proxy_port' => $port, 'dashboard_port' => 0]
+            );
+
+            $argv = (string) file_get_contents($argvFile);
+            $this->assertStringNotContainsString(
+                '--enable-l2-for-wrappers',
+                $argv,
+                "spawned argv must not contain --enable-l2-for-wrappers by default; got: {$argv}"
+            );
+        } finally {
+            GoldLapel::cleanupAll();
+            if ($origBinary === false) {
+                putenv('GOLDLAPEL_BINARY');
+            } else {
+                putenv("GOLDLAPEL_BINARY={$origBinary}");
+            }
+        }
+    }
+
+    private function findFreePort(): int
+    {
+        $server = stream_socket_server('tcp://127.0.0.1:0');
+        $name = stream_socket_get_name($server, false);
+        $port = (int) explode(':', $name)[1];
+        fclose($server);
+        return $port;
+    }
 }
