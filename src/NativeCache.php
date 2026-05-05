@@ -18,6 +18,34 @@ class NativeCache
         'except', 'all', 'distinct', 'lateral', 'values',
     ];
 
+    // ---- Unsafe-GUC state hash (Option Y — mirrors proxy `src/guc_state.rs`) ----
+    //
+    // Custom-GUC-driven RLS (`SET app.user_id = '42'; SELECT * FROM accounts;`
+    // where the policy reads `current_setting('app.user_id')`) was a real
+    // cache leak: keying purely by SQL+params, user A's cached rows could
+    // be served to user B. Mirroring the proxy commit, the wrapper cache
+    // tracks the same per-connection unsafe-GUC fingerprint and folds it
+    // into the cache key — so a `SET app.user_id = '7'` followed by the
+    // same SELECT can't hit the slot populated for user `42`.
+    //
+    // A GUC name is unsafe if it's in this short hardcoded list OR if it
+    // contains a `.` (namespaced — `app.*`, `myapp.*`, the canonical
+    // custom-RLS pattern). Comparison is case-insensitive.
+    //
+    // `SET LOCAL` is intentionally observed-but-ignored: the cache is
+    // gated on transaction-idle, so SET LOCAL effects never influence a
+    // cacheable response. Tracking the parser shape lets tests assert on
+    // it without affecting state.
+    private const UNSAFE_GUC_SHORT_LIST = [
+        'search_path',
+        'role',
+        'session_authorization',
+        'default_transaction_isolation',
+        'default_transaction_read_only',
+        'transaction_isolation',
+        'row_security',
+    ];
+
     // --- Native-cache telemetry tuning ---
     //
     // Demand-driven model (mirrors goldlapel-python). Counters bump on
@@ -36,6 +64,24 @@ class NativeCache
     private array $tableIndex = [];
     private array $accessOrder = [];
     private int $counter = 0;
+    /**
+     * Unsafe-GUC state map: lowercased name → raw value. Only unsafe GUCs
+     * (per UNSAFE_GUC_SHORT_LIST + namespace `.` rule) ever enter the
+     * map; harmless GUCs (timezone, application_name, work_mem, etc.) are
+     * never tracked and never affect the hash.
+     *
+     * @var array<string, string>
+     */
+    private array $gucState = [];
+    /**
+     * Cached hex hash of $gucState, recomputed on every mutation. The
+     * string `"0"` is used for the empty (default) state — matches the
+     * proxy's u64 zero formatted as `{:x}`. Including this in the cache
+     * key means a fresh connection's slot is shared with peer connections
+     * that also haven't set any unsafe GUCs (the `SET app.user_id`-free
+     * majority), which is exactly what we want.
+     */
+    private string $gucStateHash = '0';
     private int $maxEntries;
     private bool $enabled;
     // disable_native_cache: when true the cache acts as a no-op pass-through.
@@ -160,7 +206,7 @@ class NativeCache
             $this->statsMisses++;
             return null;
         }
-        $key = self::makeKey($sql, $params);
+        $key = self::makeKey($sql, $params, $this->gucStateHash);
         if ($key === null) {
             return null;
         }
@@ -182,7 +228,7 @@ class NativeCache
         if ($this->disabled) {
             return;
         }
-        $key = self::makeKey($sql, $params);
+        $key = self::makeKey($sql, $params, $this->gucStateHash);
         if ($key === null) {
             return;
         }
@@ -372,12 +418,20 @@ class NativeCache
 
     // --- SQL parsing (static) ---
 
-    public static function makeKey(string $sql, ?array $params = null): ?string
+    /**
+     * Build a deterministic cache key from sql + bind params + the
+     * connection's unsafe-GUC state hash. The state hash is folded in
+     * unconditionally; for connections that haven't run any unsafe SET,
+     * the hash is `"0"` and shared with peer connections — so a shared
+     * slot still works for the SET-free majority.
+     */
+    public static function makeKey(string $sql, ?array $params = null, string $stateHash = '0'): ?string
     {
+        $base = $stateHash . "\0" . $sql;
         if ($params === null || empty($params)) {
-            return $sql . "\0null";
+            return $base . "\0null";
         }
-        return $sql . "\0" . serialize($params);
+        return $base . "\0" . serialize($params);
     }
 
     public static function detectWrite(string $sql): ?string
@@ -516,6 +570,347 @@ class NativeCache
     public static function isTxEnd(string $sql): bool
     {
         return (bool) preg_match(self::TX_END, $sql);
+    }
+
+    // ------------------------------------------------------------------
+    // Unsafe-GUC state hash (Option Y — wrapper-side mirror of the proxy)
+    // ------------------------------------------------------------------
+
+    /**
+     * Classify a GUC name as state-affecting (true) or harmless (false).
+     * Unsafe if name is in the short hardcoded list OR contains a `.`
+     * (namespaced — `app.*`, `myapp.*`, the canonical custom-RLS
+     * pattern). Comparison is case-insensitive.
+     */
+    public static function isUnsafeGuc(string $name): bool
+    {
+        $lower = strtolower($name);
+        if (str_contains($lower, '.')) {
+            return true;
+        }
+        return in_array($lower, self::UNSAFE_GUC_SHORT_LIST, true);
+    }
+
+    /**
+     * Split a SQL string on top-level `;`, respecting single- and
+     * double-quoted string literals (PG `''` and `""` doubled-quote
+     * escapes handled). Returns trimmed segments, dropping empty ones.
+     *
+     * Lightest-possible splitter — does not understand dollar-quoted
+     * strings, comments, or anything else lexical. Good enough for
+     * splitting `SET foo = 'a'; SELECT 1`-style multi-statement Q
+     * bodies, which is the entire reason it exists.
+     *
+     * @return list<string>
+     */
+    public static function splitStatements(string $sql): array
+    {
+        $out = [];
+        $start = 0;
+        $quote = null;
+        $i = 0;
+        $len = strlen($sql);
+        while ($i < $len) {
+            $c = $sql[$i];
+            if ($quote !== null) {
+                if ($c === $quote) {
+                    // PG `''` and SQL-standard `""` doubled-quote escapes.
+                    if ($i + 1 < $len && $sql[$i + 1] === $quote) {
+                        $i += 2;
+                        continue;
+                    }
+                    $quote = null;
+                }
+            } else {
+                if ($c === "'" || $c === '"') {
+                    $quote = $c;
+                } elseif ($c === ';') {
+                    $segment = trim(substr($sql, $start, $i - $start));
+                    if ($segment !== '') {
+                        $out[] = $segment;
+                    }
+                    $start = $i + 1;
+                }
+            }
+            $i++;
+        }
+        $tail = trim(substr($sql, $start));
+        if ($tail !== '') {
+            $out[] = $tail;
+        }
+        return $out;
+    }
+
+    /**
+     * Parse a single SET / RESET command out of one SQL statement. Returns
+     * an array describing the parsed shape, or null if the statement isn't
+     * one of the recognised forms.
+     *
+     * Recognised forms:
+     *   * `SET name = value`, `SET name TO value`
+     *   * `SET SESSION name = value`, `SET SESSION name TO value`
+     *   * `SET LOCAL name = value`, `SET LOCAL name TO value`
+     *   * `RESET name`
+     *   * `RESET ALL`
+     *
+     * Return shape (or null):
+     *   ['type' => 'set' | 'set_local' | 'reset' | 'reset_all',
+     *    'name' => string|null, 'value' => string|null]
+     *
+     * Anything else (including `SET TIME ZONE ...`) returns null —
+     * timezone is harmless and the unusual two-word GUC name doesn't
+     * fit this pattern.
+     *
+     * @return array{type: string, name: ?string, value: ?string}|null
+     */
+    public static function parseSetCommand(string $sql): ?array
+    {
+        // Trim whitespace + a single trailing semicolon.
+        $s = trim($sql);
+        if (str_ends_with($s, ';')) {
+            $s = rtrim(substr($s, 0, -1));
+        }
+        if ($s === '') {
+            return null;
+        }
+
+        $tokens = preg_split('/\s+/', $s);
+        if ($tokens === false || count($tokens) === 0) {
+            return null;
+        }
+        $head = $tokens[0];
+
+        if (strcasecmp($head, 'RESET') === 0) {
+            if (!isset($tokens[1])) {
+                return null;
+            }
+            $target = $tokens[1];
+            // `RESET name` — anything after `name` is junk we don't expect.
+            if (isset($tokens[2])) {
+                return null;
+            }
+            if (strcasecmp($target, 'ALL') === 0) {
+                return ['type' => 'reset_all', 'name' => null, 'value' => null];
+            }
+            $name = self::normalizeGucName($target);
+            if ($name === null) {
+                return null;
+            }
+            return ['type' => 'reset', 'name' => $name, 'value' => null];
+        }
+
+        if (strcasecmp($head, 'SET') !== 0) {
+            return null;
+        }
+
+        // Optional `LOCAL` / `SESSION` modifier.
+        if (!isset($tokens[1])) {
+            return null;
+        }
+        $next = $tokens[1];
+        $cursor = 2;
+        $isLocal = false;
+        if (strcasecmp($next, 'LOCAL') === 0) {
+            if (!isset($tokens[$cursor])) {
+                return null;
+            }
+            $next = $tokens[$cursor];
+            $cursor++;
+            $isLocal = true;
+        } elseif (strcasecmp($next, 'SESSION') === 0) {
+            if (!isset($tokens[$cursor])) {
+                return null;
+            }
+            $next = $tokens[$cursor];
+            $cursor++;
+        }
+
+        // The name token may have an `=` glued onto it (e.g.
+        // `SET app.user='42'`). Split on `=` if present.
+        $gluedValue = null;
+        $eqPos = strpos($next, '=');
+        if ($eqPos !== false) {
+            $nameToken = substr($next, 0, $eqPos);
+            $rest = substr($next, $eqPos + 1);
+            $gluedValue = $rest === '' ? null : $rest;
+        } else {
+            $nameToken = $next;
+        }
+
+        $name = self::normalizeGucName($nameToken);
+        if ($name === null) {
+            return null;
+        }
+
+        if ($gluedValue !== null) {
+            $tail = array_slice($tokens, $cursor);
+            $valueStr = empty($tail) ? $gluedValue : $gluedValue . ' ' . implode(' ', $tail);
+        } else {
+            if (!isset($tokens[$cursor])) {
+                return null;
+            }
+            $sep = $tokens[$cursor];
+            $cursor++;
+            if (!($sep === '=' || strcasecmp($sep, 'TO') === 0)) {
+                return null;
+            }
+            $valueStr = implode(' ', array_slice($tokens, $cursor));
+        }
+
+        $value = self::stripValueQuotes(trim($valueStr));
+        if ($value === '' && trim($valueStr) === '') {
+            return null;
+        }
+
+        return [
+            'type' => $isLocal ? 'set_local' : 'set',
+            'name' => $name,
+            'value' => $value,
+        ];
+    }
+
+    /**
+     * Lowercase the GUC name and strip surrounding double quotes.
+     */
+    private static function normalizeGucName(string $token): ?string
+    {
+        $trimmed = trim($token, '"');
+        if ($trimmed === '') {
+            return null;
+        }
+        return strtolower($trimmed);
+    }
+
+    /**
+     * Strip a single layer of matching surrounding quotes (`'...'` or
+     * `"..."`) from a value. Multi-token quoted values arrive joined
+     * already; this peels the outer quotes. Unquoted values are
+     * returned trimmed.
+     */
+    private static function stripValueQuotes(string $value): string
+    {
+        $v = trim($value);
+        if (strlen($v) >= 2) {
+            $first = $v[0];
+            $last = $v[strlen($v) - 1];
+            if (($first === "'" && $last === "'") || ($first === '"' && $last === '"')) {
+                return substr($v, 1, -1);
+            }
+        }
+        return $v;
+    }
+
+    /**
+     * Apply a parsed SET / RESET command to this connection's unsafe-GUC
+     * state. No-op for `set_local` (transient — cache is gated on
+     * transaction-idle), no-op for safe GUC names. Recomputes the cached
+     * state hash on mutation.
+     *
+     * @param array{type: string, name: ?string, value: ?string} $cmd
+     */
+    private function applySetCommand(array $cmd): void
+    {
+        switch ($cmd['type']) {
+            case 'set':
+                if ($cmd['name'] !== null && self::isUnsafeGuc($cmd['name'])) {
+                    $this->gucState[$cmd['name']] = (string) $cmd['value'];
+                    $this->recomputeStateHash();
+                }
+                break;
+            case 'set_local':
+                // Intentionally ignored. SET LOCAL only takes effect inside
+                // a transaction; the proxy's cache is gated on
+                // transaction-idle, so SET LOCAL never influences a
+                // cacheable response.
+                break;
+            case 'reset':
+                if ($cmd['name'] !== null
+                    && self::isUnsafeGuc($cmd['name'])
+                    && array_key_exists($cmd['name'], $this->gucState)
+                ) {
+                    unset($this->gucState[$cmd['name']]);
+                    $this->recomputeStateHash();
+                }
+                break;
+            case 'reset_all':
+                if (!empty($this->gucState)) {
+                    $this->gucState = [];
+                    $this->recomputeStateHash();
+                }
+                break;
+        }
+    }
+
+    /**
+     * Observe a SQL string and apply any SET / RESET commands it contains
+     * to this connection's unsafe-GUC state. Multi-statement bodies are
+     * split on top-level `;` (string-literal-aware) so a single Q like
+     * `SET app.user_id = '42'; SELECT 1` still updates state.
+     *
+     * Returns true if the call mutated the state hash, false otherwise —
+     * convenient for tests; CachedPDO doesn't need the return value.
+     */
+    public function observeSql(string $sql): bool
+    {
+        $before = $this->gucStateHash;
+        // Fast path for the common single-statement case — avoid the
+        // splitter alloc when there's no inner `;`.
+        $tail = rtrim($sql);
+        if (str_ends_with($tail, ';')) {
+            $tail = rtrim(substr($tail, 0, -1));
+        }
+        if (!str_contains($tail, ';')) {
+            $cmd = self::parseSetCommand($sql);
+            if ($cmd !== null) {
+                $this->applySetCommand($cmd);
+            }
+        } else {
+            foreach (self::splitStatements($sql) as $stmt) {
+                $cmd = self::parseSetCommand($stmt);
+                if ($cmd !== null) {
+                    $this->applySetCommand($cmd);
+                }
+            }
+        }
+        return $this->gucStateHash !== $before;
+    }
+
+    /**
+     * Read-only accessor for the current state hash. Hex-encoded
+     * lowercase 64-bit value, or `"0"` for empty state.
+     */
+    public function getStateHash(): string
+    {
+        return $this->gucStateHash;
+    }
+
+    /**
+     * Recompute the hash from $gucState. Sorted-key serialization gives
+     * us insertion-order independence (proxy uses BTreeMap, same
+     * guarantee). xxh64 picked for speed and 64-bit width matching the
+     * proxy's u64; output is lowercase hex with no leading zero so
+     * `"0"` cleanly represents the empty state.
+     */
+    private function recomputeStateHash(): void
+    {
+        if (empty($this->gucState)) {
+            $this->gucStateHash = '0';
+            return;
+        }
+        $sorted = $this->gucState;
+        ksort($sorted);
+        $serialized = '';
+        foreach ($sorted as $k => $v) {
+            $serialized .= $k . "\0" . $v . "\0";
+        }
+        // xxh64: PHP 8.1+, fast non-crypto 64-bit hash. Output is the
+        // raw 16-char lowercase hex digest — populated-state hashes are
+        // therefore always 16 chars long, while the empty-state
+        // sentinel is the 1-char string `"0"`, so they cannot collide
+        // by construction. Matches the proxy's u64 width (state is
+        // formatted into the cache key with `{:x}` on the proxy side,
+        // so values cross-checkable across language boundaries).
+        $this->gucStateHash = hash('xxh64', $serialized);
     }
 
     // --- Private helpers ---

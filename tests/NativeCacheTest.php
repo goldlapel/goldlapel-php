@@ -551,17 +551,21 @@ class NativeCacheTest extends TestCase
     }
 
     // --- makeKey ---
+    //
+    // Key format: "<state_hash>\0<sql>\0<params-or-null>". The state hash
+    // defaults to "0" (empty unsafe-GUC state) when callers omit it; see
+    // NativeCacheStateHashTest for the state-hash-folding semantics.
 
     public function testMakeKeyNullParams(): void
     {
         $key = NativeCache::makeKey('SELECT 1', null);
-        $this->assertSame("SELECT 1\0null", $key);
+        $this->assertSame("0\0SELECT 1\0null", $key);
     }
 
     public function testMakeKeyEmptyParams(): void
     {
         $key = NativeCache::makeKey('SELECT 1', []);
-        $this->assertSame("SELECT 1\0null", $key);
+        $this->assertSame("0\0SELECT 1\0null", $key);
     }
 
     public function testMakeKeyWithParams(): void

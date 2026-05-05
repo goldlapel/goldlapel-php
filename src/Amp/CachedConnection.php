@@ -67,6 +67,11 @@ class CachedConnection implements PostgresExecutor
     {
         $this->cache->pollSignals();
 
+        // Observe unsafe-GUC SET / RESET so the state hash reflects the
+        // post-statement state when the result is keyed (mirrors the
+        // sync CachedPDO path).
+        $this->cache->observeSql($sql);
+
         if (NativeCache::isTxStart($sql)) {
             $this->inTransaction = true;
             return $miss();

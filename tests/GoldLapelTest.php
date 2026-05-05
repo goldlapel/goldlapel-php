@@ -345,8 +345,8 @@ class GoldLapelTest extends TestCase
     public function testConfigBooleanTrue(): void
     {
         $this->assertSame(
-            ['--disable-matviews'],
-            GoldLapel::configToArgs(['disable_matviews' => true])
+            ['--disable-pool'],
+            GoldLapel::configToArgs(['disable_pool' => true])
         );
     }
 
@@ -354,7 +354,7 @@ class GoldLapelTest extends TestCase
     {
         $this->assertSame(
             [],
-            GoldLapel::configToArgs(['disable_matviews' => false])
+            GoldLapel::configToArgs(['disable_pool' => false])
         );
     }
 
@@ -417,7 +417,7 @@ class GoldLapelTest extends TestCase
     {
         $gl = new GoldLapel('postgresql://host:5432/db', [
             'mode' => 'waiter',
-            'config' => ['disable_matviews' => true],
+            'config' => ['disable_rewrite' => true],
         ]);
         $this->assertSame(7932, $gl->getProxyPort());
         $this->assertFalse($gl->isRunning());
@@ -475,14 +475,16 @@ class GoldLapelTest extends TestCase
         // Tuning knobs still live in the structured config map.
         $keys = GoldLapel::configKeys();
         $this->assertContains('pool_size', $keys);
-        $this->assertContains('disable_matviews', $keys);
+        $this->assertContains('disable_rewrite', $keys);
         $this->assertContains('replica', $keys);
     }
 
     public function testConfigKeysDoesNotContainPromotedTopLevelKeys(): void
     {
         // Top-level concepts (mode, log_level, dashboard_port, etc.) were
-        // promoted out of the structured config map.
+        // promoted out of the structured config map. The four "master"
+        // disable flags (proxy_cache / matviews / sqloptimize /
+        // auto_indexes) were also promoted to top-level options.
         $keys = GoldLapel::configKeys();
         $this->assertNotContains('mode', $keys);
         $this->assertNotContains('log_level', $keys);
@@ -491,12 +493,19 @@ class GoldLapelTest extends TestCase
         $this->assertNotContains('config', $keys);
         $this->assertNotContains('license', $keys);
         $this->assertNotContains('client', $keys);
+        $this->assertNotContains('disable_proxy_cache', $keys);
+        $this->assertNotContains('disable_matviews', $keys);
+        $this->assertNotContains('disable_sqloptimize', $keys);
+        $this->assertNotContains('disable_auto_indexes', $keys);
     }
 
     public function testConfigKeysCount(): void
     {
         $keys = GoldLapel::configKeys();
-        $this->assertCount(38, $keys);
+        // 38 pre-pivot, minus 2 (disable_proxy_cache, disable_matviews)
+        // promoted to top-level. disable_sqloptimize and
+        // disable_auto_indexes were never in the structured map.
+        $this->assertCount(36, $keys);
     }
 
     // -- urlToPdoDsn (3 tests) --

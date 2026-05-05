@@ -35,6 +35,12 @@ class CachedPDO extends \PDO
 
     public function query(string $sql, ...$args): CachedPDOStatement|false
     {
+        // Observe unsafe-GUC SET / RESET before any other handling so the
+        // state hash reflects the effective post-statement state when the
+        // result is keyed (matters for `SET app.user_id = '7'; SELECT ...`
+        // multi-statements).
+        $this->cache->observeSql($sql);
+
         // Transaction tracking
         if (NativeCache::isTxStart($sql)) {
             $this->inTransaction = true;
@@ -97,6 +103,12 @@ class CachedPDO extends \PDO
 
     public function exec(string $sql): int|false
     {
+        // Observe unsafe-GUC SET / RESET before write detection. Mirrors
+        // query(); a `SET app.user_id = '7'` issued via exec() must
+        // update the state hash so subsequent reads on the same
+        // connection key correctly.
+        $this->cache->observeSql($sql);
+
         // Write detection
         $writeTable = NativeCache::detectWrite($sql);
         if ($writeTable !== null) {
@@ -225,6 +237,15 @@ class CachedPDOStatement extends \PDOStatement
         $this->cachedColumns = null;
         $this->fetchIndex = 0;
         $this->fromCache = false;
+
+        // Observe unsafe-GUC SET / RESET. Prepared `SET app.user_id = $1`
+        // is unusual but legal; observeSql() captures the placeholder
+        // string `$1` as the recorded value, which won't match the
+        // proxy's per-bind hash — at worst the wrapper sees cache misses
+        // for that connection's reads. The proxy still keys correctly
+        // because it sees the bound value on the wire, so this is
+        // never a leak.
+        $this->cache->observeSql($this->sql);
 
         // Transaction tracking
         if (NativeCache::isTxStart($this->sql)) {

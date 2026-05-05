@@ -41,19 +41,19 @@ class GoldLapel
         'pool_mode', 'mgmt_idle_timeout', 'fallback', 'read_after_write_secs',
         'n1_threshold', 'n1_window_ms', 'n1_cross_threshold',
         'tls_cert', 'tls_key', 'tls_client_ca',
-        'disable_matviews', 'disable_consolidation', 'disable_btree_indexes',
+        'disable_consolidation', 'disable_btree_indexes',
         'disable_trigram_indexes', 'disable_expression_indexes',
         'disable_partial_indexes', 'disable_rewrite', 'disable_rewrite_prepared_cache',
-        'disable_proxy_cache', 'disable_pool',
+        'disable_pool',
         'disable_n1', 'disable_n1_cross_connection', 'disable_shadow_mode',
         'enable_coalescing', 'replica', 'exclude_tables',
     ];
 
     private const BOOLEAN_KEYS = [
-        'disable_matviews', 'disable_consolidation', 'disable_btree_indexes',
+        'disable_consolidation', 'disable_btree_indexes',
         'disable_trigram_indexes', 'disable_expression_indexes',
         'disable_partial_indexes', 'disable_rewrite', 'disable_rewrite_prepared_cache',
-        'disable_proxy_cache', 'disable_pool',
+        'disable_pool',
         'disable_n1', 'disable_n1_cross_connection', 'disable_shadow_mode',
         'enable_coalescing',
     ];
@@ -85,8 +85,11 @@ class GoldLapel
     private bool $silent;
     private bool $mesh;
     private ?string $meshTag;
-    private bool $enableProxyCacheForWrappers;
     private bool $disableNativeCache;
+    private bool $disableProxyCache;
+    private bool $disableMatviews;
+    private bool $disableSqloptimize;
+    private bool $disableAutoIndexes;
     private array $config;
     private array $extraArgs;
     /** @var resource|null */
@@ -159,8 +162,11 @@ class GoldLapel
      *   silent?: bool,
      *   mesh?: bool,
      *   mesh_tag?: string,
-     *   enable_proxy_cache_for_wrappers?: bool,
      *   disable_native_cache?: bool,
+     *   disable_proxy_cache?: bool,
+     *   disable_matviews?: bool,
+     *   disable_sqloptimize?: bool,
+     *   disable_auto_indexes?: bool,
      * } $options
      */
     public function __construct(string $upstream, array $options = [])
@@ -203,12 +209,14 @@ class GoldLapel
         $this->mesh = !empty($options['mesh']);
         $tag = isset($options['mesh_tag']) ? (string) $options['mesh_tag'] : '';
         $this->meshTag = $tag === '' ? null : $tag;
-        // Opt the wrapper into the proxy cache. Default false: per-connection
-        // proxy-cache wrapper-skip is the global default since the native
-        // cache on the wrapper side handles single-pod traffic. Fleet
-        // customers (multi-pod, frequent restarts, mesh) flip this on so the
-        // proxy's shared cache still serves wrapper queries.
-        $this->enableProxyCacheForWrappers = !empty($options['enable_proxy_cache_for_wrappers']);
+        // Promoted top-level disable flags. Each maps 1:1 to a proxy CLI
+        // flag at spawn time. Atomic break from `config['disable_…']`:
+        // the keys are no longer accepted inside the structured config
+        // map (validation in __construct above raises on unknown keys).
+        $this->disableProxyCache = !empty($options['disable_proxy_cache']);
+        $this->disableMatviews = !empty($options['disable_matviews']);
+        $this->disableSqloptimize = !empty($options['disable_sqloptimize']);
+        $this->disableAutoIndexes = !empty($options['disable_auto_indexes']);
         // disable_native_cache turns the wrapper-side NativeCache into a no-op
         // pass-through without forcing the user to drop their tuned
         // `cache_size`. The flag is applied to the singleton NativeCache the
@@ -248,8 +256,11 @@ class GoldLapel
      *   - 'silent' (bool): suppress the startup banner
      *   - 'mesh' (bool): opt into the mesh at startup (HQ enforces license; denial is non-fatal)
      *   - 'mesh_tag' (string): optional mesh tag — instances with the same tag cluster together
-     *   - 'enable_proxy_cache_for_wrappers' (bool): opt the wrapper into the proxy's shared cache. Default false (wrapper traffic skips the proxy cache because the native cache covers it). Useful for fleet deployments (multi-pod, frequent restarts) where the shared proxy cache still adds value.
      *   - 'disable_native_cache' (bool): turn the wrapper's NativeCache into a no-op pass-through. Default false. Lets you toggle the layer off without losing your tuned `cache_size` — get() returns null, put() is a no-op, misses still tick (so the proxy sees the traffic shape via telemetry), the snapshot reports `disabled: true`.
+     *   - 'disable_proxy_cache' (bool): emit `--disable-proxy-cache`. Master kill-switch for the proxy's shared cache.
+     *   - 'disable_matviews' (bool): emit `--disable-matviews`. Skip materialized-view rewrites.
+     *   - 'disable_sqloptimize' (bool): emit `--disable-sqloptimize`. Master kill-switch for query rewriting + coalescing.
+     *   - 'disable_auto_indexes' (bool): emit `--disable-auto-indexes`. Master kill-switch for automatic index creation.
      *
      * Promoted top-level concepts (proxy_port, dashboard_port, etc.) are NOT
      * valid keys inside `config` — passing them there raises at construction
@@ -550,8 +561,20 @@ class GoldLapel
             $cmd[] = '--mesh-tag';
             $cmd[] = $this->meshTag;
         }
-        if ($this->enableProxyCacheForWrappers) {
-            $cmd[] = '--enable-proxy-cache-for-wrappers';
+        // Promoted top-level disable flags. Each maps 1:1 to a proxy CLI
+        // flag; the flag is emitted only when the option is true so the
+        // Rust binary applies its own defaults otherwise.
+        if ($this->disableProxyCache) {
+            $cmd[] = '--disable-proxy-cache';
+        }
+        if ($this->disableMatviews) {
+            $cmd[] = '--disable-matviews';
+        }
+        if ($this->disableSqloptimize) {
+            $cmd[] = '--disable-sqloptimize';
+        }
+        if ($this->disableAutoIndexes) {
+            $cmd[] = '--disable-auto-indexes';
         }
         $cmd = array_merge($cmd, self::configToArgs($this->config), $this->extraArgs);
 
