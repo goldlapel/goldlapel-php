@@ -88,6 +88,12 @@ final class CachedConnectionTest extends TestCase
         return new FakePostgresResult($rows, $colCount);
     }
 
+    private function makeCommandResult(): PostgresResult
+    {
+        // PostgresCommandResult.getColumnCount() returns null. Empty rows.
+        return new FakePostgresResult([], null);
+    }
+
     /**
      * Bug 1 — multi-statement SET; INSERT must invalidate the orders
      * cache slot. Use a safe-GUC name (`search_path`) so the connection
@@ -172,5 +178,48 @@ final class CachedConnectionTest extends TestCase
         $cached->query('SELECT * FROM users');
 
         $this->assertSame(1, $this->cache->statsHits);
+    }
+
+    // --- Bug fix: SET / RESET / LISTEN responses no longer cached ---
+    //
+    // `query("SET …")` returns a PostgresCommandResult whose
+    // getColumnCount() is null. Without a guard, the empty-row reply
+    // was put in the cache, bloating the table with no-row entries
+    // that never serve real data. Mirrors the JS NON_CACHEABLE_COMMANDS
+    // skip and the sync CachedPDOTest equivalents.
+
+    public function testQuerySetDoesNotPolluteCache(): void
+    {
+        $real = $this->createMock(PostgresExecutor::class);
+        $real->method('query')->willReturn($this->makeCommandResult());
+
+        $cached = new CachedConnection($real, $this->cache);
+        $cached->query("SET search_path = public");
+
+        $this->assertSame(0, $this->cache->size());
+    }
+
+    public function testQueryResetDoesNotPolluteCache(): void
+    {
+        $real = $this->createMock(PostgresExecutor::class);
+        $real->method('query')->willReturn($this->makeCommandResult());
+
+        $cached = new CachedConnection($real, $this->cache);
+        $cached->query("RESET search_path");
+
+        $this->assertSame(0, $this->cache->size());
+    }
+
+    public function testQueryListenUnlistenNotifyDoNotPolluteCache(): void
+    {
+        $real = $this->createMock(PostgresExecutor::class);
+        $real->method('query')->willReturnCallback(fn() => $this->makeCommandResult());
+
+        $cached = new CachedConnection($real, $this->cache);
+        $cached->query("LISTEN ch1");
+        $cached->query("UNLISTEN ch1");
+        $cached->query("NOTIFY ch1, 'hi'");
+
+        $this->assertSame(0, $this->cache->size());
     }
 }

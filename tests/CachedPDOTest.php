@@ -789,4 +789,79 @@ class CachedPDOTest extends TestCase
         $cached->query('SELECT * FROM orders');
         $this->assertSame(0, $this->cache->statsHits);
     }
+
+    // --- Bug fix: SET / RESET / LISTEN responses no longer cached ---
+    //
+    // PDO::query("SET app.user_id = '7'") returns a PDOStatement whose
+    // fetchAll() yields []. Without a guard, that empty-row reply gets
+    // cached under the SET text, bloating the cache with no-row entries
+    // that never serve real data and triggering needless eviction
+    // pressure on session-heavy workloads.
+
+    public function testQuerySetDoesNotPolluteCache(): void
+    {
+        $pdo = $this->makeMockPDO();
+        $setStmt = $this->makeMockStmt([], 0);
+        $pdo->method('query')->willReturn($setStmt);
+
+        $cached = new CachedPDO($pdo, $this->cache);
+        $cached->query("SET search_path = public");
+
+        $this->assertSame(0, $this->cache->size());
+    }
+
+    public function testQueryResetDoesNotPolluteCache(): void
+    {
+        $pdo = $this->makeMockPDO();
+        $setStmt = $this->makeMockStmt([], 0);
+        $pdo->method('query')->willReturn($setStmt);
+
+        $cached = new CachedPDO($pdo, $this->cache);
+        $cached->query("RESET search_path");
+
+        $this->assertSame(0, $this->cache->size());
+    }
+
+    public function testQueryListenDoesNotPolluteCache(): void
+    {
+        $pdo = $this->makeMockPDO();
+        $stmt = $this->makeMockStmt([], 0);
+        $pdo->method('query')->willReturn($stmt);
+
+        $cached = new CachedPDO($pdo, $this->cache);
+        $cached->query("LISTEN ch1");
+        $cached->query("UNLISTEN ch1");
+        $cached->query("NOTIFY ch1, 'hi'");
+
+        $this->assertSame(0, $this->cache->size());
+    }
+
+    public function testQuerySavepointDoesNotPolluteCache(): void
+    {
+        $pdo = $this->makeMockPDO();
+        $stmt = $this->makeMockStmt([], 0);
+        $pdo->method('query')->willReturn($stmt);
+
+        $cached = new CachedPDO($pdo, $this->cache);
+        $cached->query("SAVEPOINT s1");
+        $cached->query("RELEASE SAVEPOINT s1");
+
+        $this->assertSame(0, $this->cache->size());
+    }
+
+    public function testPrepareExecuteSetDoesNotPolluteCache(): void
+    {
+        // Prepared SET is unusual but legal; the columnCount() > 0 guard
+        // already covers this. Test pins the existing behavior so a
+        // future refactor doesn't regress.
+        $pdo = $this->makeMockPDO();
+        $stmt = $this->makeMockStmt([], 0);
+        $pdo->method('prepare')->willReturn($stmt);
+
+        $cached = new CachedPDO($pdo, $this->cache);
+        $s = $cached->prepare("SET search_path = ?");
+        $s->execute(['public']);
+
+        $this->assertSame(0, $this->cache->size());
+    }
 }

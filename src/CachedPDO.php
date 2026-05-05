@@ -94,6 +94,18 @@ class CachedPDO extends \PDO
             return $stmt !== false ? new CachedPDOStatement($stmt, $this->cache, $this->gucState, $sql, null, true) : false;
         }
 
+        // Skip the cache entirely for session-state commands (SET / RESET /
+        // LISTEN / etc). PDO::query("SET app.user_id = '7'") would otherwise
+        // fetchAll an empty row set and put it in the cache, bloating the
+        // table with no-row entries that never serve real data and
+        // triggering needless eviction pressure on session-heavy
+        // workloads. The prepare/execute path is gated by columnCount() > 0
+        // already, so this only catches the direct-query path.
+        if (NativeCache::isNonCacheableCommand($sql)) {
+            $stmt = $this->pdo->query($sql, ...$args);
+            return $stmt !== false ? new CachedPDOStatement($stmt, $this->cache, $this->gucState, $sql, null, $this->inTransaction) : false;
+        }
+
         // Read path: check native cache, keyed on this connection's GUC fingerprint.
         $stateHash = $this->gucState->stateHash();
         $entry = $this->cache->get($sql, null, $stateHash);
@@ -332,7 +344,10 @@ class CachedPDOStatement extends \PDOStatement
             return false;
         }
 
-        // Try to cache the result
+        // Try to cache the result. The columnCount() > 0 guard doubles as
+        // a SET / RESET / LISTEN filter — those return zero columns, so
+        // we never put their empty-row replies in the cache (parity with
+        // the JS NON_CACHEABLE_COMMANDS skip).
         if ($this->realStmt->columnCount() > 0) {
             try {
                 $rows = $this->realStmt->fetchAll(\PDO::FETCH_ASSOC);

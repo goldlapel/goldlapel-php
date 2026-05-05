@@ -129,14 +129,22 @@ class CachedConnection implements PostgresExecutor
         }
 
         $result = $miss();
-        // Buffer the rows so we can both cache and return them — amphp
-        // Results are iterable-once, so we drain into an array.
+        // Drain the result regardless — PostgresResult is iterable-once,
+        // so consumers downstream still need a buffered replay (CachedResult).
+        // But only put the slot in the cache when the result actually has a
+        // column shape: SET / RESET / LISTEN / etc return PostgresCommandResult
+        // whose getColumnCount() is null, and we don't want to bloat the cache
+        // with empty-row entries that never serve real data. Mirrors the JS
+        // NON_CACHEABLE_COMMANDS skip.
         $rows = [];
         foreach ($result as $row) {
             $rows[] = $row;
         }
         $columns = !empty($rows) ? array_keys($rows[0]) : [];
-        $this->cache->put($sql, $params, $rows, $columns, $stateHash);
+        $colCount = $result->getColumnCount();
+        if ($colCount !== null && $colCount > 0) {
+            $this->cache->put($sql, $params, $rows, $columns, $stateHash);
+        }
         return new CachedResult($rows);
     }
 

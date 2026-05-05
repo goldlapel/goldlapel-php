@@ -580,6 +580,44 @@ class NativeCache
         return empty($tables) ? null : array_keys($tables);
     }
 
+    /**
+     * Postgres SQL-prefix commands whose response is a session-state /
+     * control-flow signal rather than a cacheable read. Caching their
+     * empty-row reply bloats the cache with no-row entries that never
+     * serve real data and triggers needless eviction pressure.
+     *
+     * The async-libpq path (PostgresResult.getColumnCount() === null)
+     * already filters most of these out, but the sync PDO::query()
+     * path has no equivalent column-count signal, so we gate on the
+     * SQL prefix instead. Mirrors JS NON_CACHEABLE_COMMANDS.
+     */
+    private const NON_CACHEABLE_COMMAND_TOKENS = [
+        'SET', 'RESET', 'LISTEN', 'UNLISTEN', 'NOTIFY',
+        'BEGIN', 'COMMIT', 'ROLLBACK', 'SAVEPOINT', 'END',
+        'START', // START TRANSACTION
+        'RELEASE', // RELEASE SAVEPOINT
+    ];
+
+    /**
+     * True if the SQL's first token is one of the
+     * NON_CACHEABLE_COMMAND_TOKENS. Used as a put-side guard so
+     * `query("SET app.user_id = '7'")` doesn't pollute the cache with
+     * an empty-row entry keyed under the SET text.
+     */
+    public static function isNonCacheableCommand(string $sql): bool
+    {
+        $trimmed = ltrim($sql);
+        if ($trimmed === '') {
+            return false;
+        }
+        $tokens = preg_split('/\s+/', $trimmed, 2);
+        if ($tokens === false || $tokens[0] === '') {
+            return false;
+        }
+        $first = strtoupper($tokens[0]);
+        return in_array($first, self::NON_CACHEABLE_COMMAND_TOKENS, true);
+    }
+
     public static function extractTables(string $sql): array
     {
         $tables = [];
