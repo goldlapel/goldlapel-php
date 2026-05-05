@@ -654,4 +654,139 @@ class CachedPDOTest extends TestCase
         $this->assertSame(1, $result[0][0]);
         $this->assertSame('alice', $result[0]['name']);
     }
+
+    // --- Bug fix: multi-statement write detection ---
+    //
+    // detectWrite looks at the first token only, so a single Q like
+    // `SET app.tenant = 'x'; INSERT INTO orders VALUES (1)` (one Q, two
+    // statements) would slip past as `SET`, return null, and the cached
+    // `SELECT * FROM orders` slot would survive while the INSERT ran on
+    // the server. Same shape for `BEGIN; INSERT; COMMIT` and any other
+    // multi-statement body where the first token isn't a write.
+
+    public function testQueryMultiStatementSetThenInsertInvalidatesTable(): void
+    {
+        $rowsBefore = [['id' => 1]];
+
+        $pdo = $this->makeMockPDO();
+        $selectStmt = $this->makeMockStmt($rowsBefore, 1);
+        // Multi-statement write — fetchAll on it returns no rows (the
+        // server returns a CommandComplete for the INSERT, not a result
+        // set). columnCount() = 0 mirrors libpq's behavior.
+        $multiStmt = $this->makeMockStmt([], 0);
+        $selectStmt2 = $this->makeMockStmt($rowsBefore, 1);
+
+        $pdo->method('query')->willReturnOnConsecutiveCalls(
+            $selectStmt,
+            $multiStmt,
+            $selectStmt2,
+        );
+
+        $cached = new CachedPDO($pdo, $this->cache);
+
+        // Prime cache for orders. Use a non-unsafe-GUC SET name so the
+        // state hash doesn't change underneath us — proving that the
+        // miss on the third query is from invalidation, not a state-hash
+        // mismatch.
+        $cached->query('SELECT * FROM orders');
+
+        // Multi-statement write — the safe-GUC SET keeps the state hash
+        // stable, but the embedded INSERT must invalidate `orders`.
+        $cached->query("SET search_path = public; INSERT INTO orders VALUES (1)");
+
+        // Should miss now — cache was invalidated for `orders`.
+        $cached->query('SELECT * FROM orders');
+        $this->assertSame(0, $this->cache->statsHits);
+    }
+
+    public function testQueryMultiStatementBeginInsertCommitInvalidatesTable(): void
+    {
+        $rows = [['id' => 1]];
+
+        $pdo = $this->makeMockPDO();
+        $selectStmt = $this->makeMockStmt($rows, 1);
+        $multiStmt = $this->makeMockStmt([], 0);
+        $selectStmt2 = $this->makeMockStmt($rows, 1);
+
+        $pdo->method('query')->willReturnOnConsecutiveCalls(
+            $selectStmt,
+            $multiStmt,
+            $selectStmt2,
+        );
+
+        $cached = new CachedPDO($pdo, $this->cache);
+
+        $cached->query('SELECT * FROM orders');
+        $cached->query('BEGIN; INSERT INTO orders VALUES (1); COMMIT');
+        $cached->query('SELECT * FROM orders');
+
+        $this->assertSame(0, $this->cache->statsHits);
+        // BEGIN/COMMIT inside the multi-statement body never toggle our
+        // local inTransaction flag — the proxy handles it server-side
+        // and we exit early on write detection.
+        $this->assertFalse($cached->inTransaction());
+    }
+
+    public function testExecMultiStatementWriteInvalidatesTable(): void
+    {
+        $rows = [['id' => 1]];
+
+        $pdo = $this->makeMockPDO();
+        $selectStmt = $this->makeMockStmt($rows, 1);
+        $selectStmt2 = $this->makeMockStmt($rows, 1);
+        $pdo->method('query')->willReturnOnConsecutiveCalls($selectStmt, $selectStmt2);
+        $pdo->method('exec')->willReturn(1);
+
+        $cached = new CachedPDO($pdo, $this->cache);
+
+        $cached->query('SELECT * FROM orders');
+        $cached->exec("SET search_path = public; INSERT INTO orders VALUES (1)");
+        $cached->query('SELECT * FROM orders');
+
+        $this->assertSame(0, $this->cache->statsHits);
+    }
+
+    public function testExecMultiStatementDdlInvalidatesAll(): void
+    {
+        $rows = [['id' => 1]];
+
+        $pdo = $this->makeMockPDO();
+        $selectStmt = $this->makeMockStmt($rows, 1);
+        $selectStmt2 = $this->makeMockStmt($rows, 1);
+        $pdo->method('query')->willReturnOnConsecutiveCalls($selectStmt, $selectStmt2);
+        $pdo->method('exec')->willReturn(0);
+
+        $cached = new CachedPDO($pdo, $this->cache);
+
+        $cached->query('SELECT * FROM orders');
+        // Multi-statement with DDL — must invalidateAll regardless of
+        // first-segment shape.
+        $cached->exec("SET search_path = public; CREATE TABLE other (id INT)");
+        $cached->query('SELECT * FROM orders');
+
+        $this->assertSame(0, $this->cache->statsHits);
+    }
+
+    public function testPrepareExecuteMultiStatementWriteInvalidatesTable(): void
+    {
+        $rows = [['id' => 1]];
+
+        $pdo = $this->makeMockPDO();
+        $selectStmt = $this->makeMockStmt($rows, 1);
+        $multiStmt = $this->makeMockStmt([], 0);
+        $selectStmt2 = $this->makeMockStmt($rows, 1);
+
+        $pdo->method('query')->willReturnOnConsecutiveCalls($selectStmt, $selectStmt2);
+        $pdo->method('prepare')->willReturn($multiStmt);
+
+        $cached = new CachedPDO($pdo, $this->cache);
+
+        $cached->query('SELECT * FROM orders');
+
+        $stmt = $cached->prepare("SET search_path = public; INSERT INTO orders VALUES (1)");
+        $stmt->execute();
+
+        $cached->query('SELECT * FROM orders');
+        $this->assertSame(0, $this->cache->statsHits);
+    }
 }

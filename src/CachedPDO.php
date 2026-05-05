@@ -55,6 +55,27 @@ class CachedPDO extends \PDO
         // connections never share gucState.
         $this->gucState->observeSql($sql);
 
+        // Multi-statement-aware write detection. Runs BEFORE transaction
+        // tracking so a single Q message like `BEGIN; INSERT INTO orders
+        // VALUES (1); COMMIT` still surfaces the INSERT for invalidation
+        // — TX_START's first-token check would otherwise swallow the
+        // whole body as a transaction-boundary marker and the INSERT
+        // would never invalidate the `orders` cache slot. Same gap fixed
+        // for `SET app.tenant = 'x'; INSERT INTO t ...` (SET hides the
+        // INSERT from detectWrite's single-token shape).
+        $writeTables = NativeCache::detectWritesMulti($sql);
+        if ($writeTables !== null) {
+            if ($writeTables === NativeCache::DDL_SENTINEL) {
+                $this->cache->invalidateAll();
+            } else {
+                foreach ($writeTables as $t) {
+                    $this->cache->invalidateTable($t);
+                }
+            }
+            $stmt = $this->pdo->query($sql, ...$args);
+            return $stmt !== false ? new CachedPDOStatement($stmt, $this->cache, $this->gucState, $sql, null, $this->inTransaction) : false;
+        }
+
         // Transaction tracking
         if (NativeCache::isTxStart($sql)) {
             $this->inTransaction = true;
@@ -63,18 +84,6 @@ class CachedPDO extends \PDO
         }
         if (NativeCache::isTxEnd($sql)) {
             $this->inTransaction = false;
-            $stmt = $this->pdo->query($sql, ...$args);
-            return $stmt !== false ? new CachedPDOStatement($stmt, $this->cache, $this->gucState, $sql, null, $this->inTransaction) : false;
-        }
-
-        // Write detection + self-invalidation
-        $writeTable = NativeCache::detectWrite($sql);
-        if ($writeTable !== null) {
-            if ($writeTable === NativeCache::DDL_SENTINEL) {
-                $this->cache->invalidateAll();
-            } else {
-                $this->cache->invalidateTable($writeTable);
-            }
             $stmt = $this->pdo->query($sql, ...$args);
             return $stmt !== false ? new CachedPDOStatement($stmt, $this->cache, $this->gucState, $sql, null, $this->inTransaction) : false;
         }
@@ -125,13 +134,19 @@ class CachedPDO extends \PDO
         // same CachedPDO key correctly.
         $this->gucState->observeSql($sql);
 
-        // Write detection
-        $writeTable = NativeCache::detectWrite($sql);
-        if ($writeTable !== null) {
-            if ($writeTable === NativeCache::DDL_SENTINEL) {
+        // Multi-statement-aware write detection. `exec()` doesn't return a
+        // result set, so we can't fall through to a read path — but a
+        // multi-statement body still needs every write surfaced for
+        // invalidation (e.g. `SET app.tenant = 'x'; INSERT INTO orders
+        // VALUES (1)` would otherwise let the orders cache survive).
+        $writeTables = NativeCache::detectWritesMulti($sql);
+        if ($writeTables !== null) {
+            if ($writeTables === NativeCache::DDL_SENTINEL) {
                 $this->cache->invalidateAll();
             } else {
-                $this->cache->invalidateTable($writeTable);
+                foreach ($writeTables as $t) {
+                    $this->cache->invalidateTable($t);
+                }
             }
         }
 
@@ -273,22 +288,25 @@ class CachedPDOStatement extends \PDOStatement
         // never a leak.
         $this->gucState->observeSql($this->sql);
 
+        // Multi-statement-aware write detection. Runs BEFORE transaction
+        // tracking — see CachedPDO::query() for the reasoning.
+        $writeTables = NativeCache::detectWritesMulti($this->sql);
+        if ($writeTables !== null) {
+            if ($writeTables === NativeCache::DDL_SENTINEL) {
+                $this->cache->invalidateAll();
+            } else {
+                foreach ($writeTables as $t) {
+                    $this->cache->invalidateTable($t);
+                }
+            }
+            return $this->realStmt->execute($params);
+        }
+
         // Transaction tracking
         if (NativeCache::isTxStart($this->sql)) {
             return $this->realStmt->execute($params);
         }
         if (NativeCache::isTxEnd($this->sql)) {
-            return $this->realStmt->execute($params);
-        }
-
-        // Write detection + self-invalidation
-        $writeTable = NativeCache::detectWrite($this->sql);
-        if ($writeTable !== null) {
-            if ($writeTable === NativeCache::DDL_SENTINEL) {
-                $this->cache->invalidateAll();
-            } else {
-                $this->cache->invalidateTable($writeTable);
-            }
             return $this->realStmt->execute($params);
         }
 

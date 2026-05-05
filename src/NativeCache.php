@@ -529,6 +529,57 @@ class NativeCache
         return strtolower($table);
     }
 
+    /**
+     * Multi-statement-aware write detection. Reuses splitStatements so a
+     * single Q message like `SET app.user_id = '42'; INSERT INTO orders
+     * VALUES (1)` doesn't slip past detectWrite's first-token check —
+     * which would otherwise see `SET`, return null, and let the INSERT
+     * run on the server while the cached `SELECT * FROM orders` slot
+     * survives. Mirrors the JS wrap.js detectWritesMulti shape.
+     *
+     * Returns:
+     *   - DDL_SENTINEL  if any segment is DDL (caller invalidateAll's)
+     *   - list<string>  of unique table names if any segments are
+     *                   table-scoped writes
+     *   - null          if no segment is a write
+     *
+     * Single-statement bodies skip the splitter entirely (hot path).
+     *
+     * @return string|list<string>|null
+     */
+    public static function detectWritesMulti(string $sql): string|array|null
+    {
+        if ($sql === '') {
+            return null;
+        }
+        // Fast path: no inner `;` → single-statement, original detectWrite.
+        $tail = rtrim($sql);
+        if (str_ends_with($tail, ';')) {
+            $tail = rtrim(substr($tail, 0, -1));
+        }
+        if (!str_contains($tail, ';')) {
+            $t = self::detectWrite($sql);
+            if ($t === null) {
+                return null;
+            }
+            if ($t === self::DDL_SENTINEL) {
+                return self::DDL_SENTINEL;
+            }
+            return [$t];
+        }
+        $tables = [];
+        foreach (self::splitStatements($sql) as $seg) {
+            $t = self::detectWrite($seg);
+            if ($t === self::DDL_SENTINEL) {
+                return self::DDL_SENTINEL;
+            }
+            if ($t !== null) {
+                $tables[$t] = true;
+            }
+        }
+        return empty($tables) ? null : array_keys($tables);
+    }
+
     public static function extractTables(string $sql): array
     {
         $tables = [];

@@ -89,22 +89,32 @@ class CachedConnection implements PostgresExecutor
         // expected, but each CachedConnection has its own gucState.
         $this->gucState->observeSql($sql);
 
+        // Multi-statement-aware write detection. Runs BEFORE transaction
+        // tracking so a single Q message like `BEGIN; INSERT INTO orders
+        // VALUES (1); COMMIT` still surfaces the INSERT for invalidation
+        // — TX_START's first-token check would otherwise swallow the
+        // whole body and the INSERT would never invalidate the orders
+        // cache slot. Same gap fixed for `SET app.tenant = 'x'; INSERT
+        // INTO t ...` (SET hides the INSERT from detectWrite's
+        // single-token shape).
+        $writeTables = NativeCache::detectWritesMulti($sql);
+        if ($writeTables !== null) {
+            if ($writeTables === NativeCache::DDL_SENTINEL) {
+                $this->cache->invalidateAll();
+            } else {
+                foreach ($writeTables as $t) {
+                    $this->cache->invalidateTable($t);
+                }
+            }
+            return $miss();
+        }
+
         if (NativeCache::isTxStart($sql)) {
             $this->inTransaction = true;
             return $miss();
         }
         if (NativeCache::isTxEnd($sql)) {
             $this->inTransaction = false;
-            return $miss();
-        }
-
-        $writeTable = NativeCache::detectWrite($sql);
-        if ($writeTable !== null) {
-            if ($writeTable === NativeCache::DDL_SENTINEL) {
-                $this->cache->invalidateAll();
-            } else {
-                $this->cache->invalidateTable($writeTable);
-            }
             return $miss();
         }
 
