@@ -121,6 +121,56 @@ class NativeCacheTest extends TestCase
         $this->assertSame('orders', NativeCache::detectWrite("COPY orders(id, name) FROM '/tmp/data.csv'"));
     }
 
+    // --- detectWrite SELECT-INTO false positive on string literals ---
+    //
+    // Pre-fix, detectWrite's SELECT branch tokenized by whitespace, so a
+    // bare `INTO` inside a `'...'` literal or `"..."` identifier was
+    // classified as SELECT-INTO DDL and returned DDL_SENTINEL — silently
+    // flushing the cache on plain reads. The fix re-tokenizes from a
+    // literal-stripped form via stripStringLiterals(). Mirrors
+    // goldlapel-js commit 63753fe.
+
+    public function testDetectWriteSelectIntoInSingleQuoteLiteral(): void
+    {
+        $this->assertNull(NativeCache::detectWrite("SELECT 'INSERT INTO orders' FROM audit_log"));
+    }
+
+    public function testDetectWriteSelectIntoInDoubleQuotedIdentifier(): void
+    {
+        $this->assertNull(NativeCache::detectWrite('SELECT * FROM "into_table"'));
+    }
+
+    public function testDetectWriteSelectIntoInLikePattern(): void
+    {
+        $this->assertNull(NativeCache::detectWrite("SELECT message FROM logs WHERE message LIKE '%INTO%'"));
+    }
+
+    public function testDetectWriteSelectIntoWithDoubledQuoteEscape(): void
+    {
+        // `''` inside a literal escapes a single quote; the literal as
+        // a whole is `it''s INTO orders`. Must not trigger DDL.
+        $this->assertNull(NativeCache::detectWrite("SELECT 'it''s INTO orders' FROM audit_log"));
+    }
+
+    public function testDetectWriteRealSelectIntoStillDetected(): void
+    {
+        // Regression guard: a real SELECT ... INTO ... FROM ... must
+        // still be classified as DDL.
+        $this->assertSame(
+            NativeCache::DDL_SENTINEL,
+            NativeCache::detectWrite('SELECT * INTO new_table FROM orders')
+        );
+    }
+
+    public function testStripStringLiteralsPreservesLength(): void
+    {
+        $sql = "SELECT 'INSERT INTO orders' FROM audit_log";
+        $stripped = NativeCache::stripStringLiterals($sql);
+        $this->assertSame(strlen($sql), strlen($stripped));
+        // Quotes themselves are preserved, contents blanked.
+        $this->assertSame("SELECT '                  ' FROM audit_log", $stripped);
+    }
+
     // --- extractTables ---
 
     public function testExtractTablesSimpleFrom(): void

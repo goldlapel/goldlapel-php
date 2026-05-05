@@ -465,10 +465,17 @@ class NativeCache
                 }
                 return self::bareTable($tokens[2]);
             case 'SELECT':
+                // Re-tokenize from a literal-stripped form so that bare
+                // words like `INTO` or `FROM` inside `'...'` / `"..."`
+                // don't trigger the SELECT-INTO DDL classifier (e.g.
+                // `SELECT 'INSERT INTO orders' FROM audit_log`,
+                // `SELECT * FROM "into_table"`). Mirrors goldlapel-js
+                // commit 63753fe.
+                $scanTokens = preg_split('/\s+/', self::stripStringLiterals($trimmed));
                 $sawInto = false;
                 $intoTarget = null;
-                for ($i = 1; $i < count($tokens); $i++) {
-                    $upper = strtoupper($tokens[$i]);
+                for ($i = 1; $i < count($scanTokens); $i++) {
+                    $upper = strtoupper($scanTokens[$i]);
                     if ($upper === 'INTO' && !$sawInto) {
                         $sawInto = true;
                         continue;
@@ -477,7 +484,7 @@ class NativeCache
                         if (in_array($upper, ['TEMPORARY', 'TEMP', 'UNLOGGED'], true)) {
                             continue;
                         }
-                        $intoTarget = $tokens[$i];
+                        $intoTarget = $scanTokens[$i];
                         continue;
                     }
                     if ($sawInto && $intoTarget !== null && $upper === 'FROM') {
@@ -660,6 +667,50 @@ class NativeCache
             return true;
         }
         return in_array($lower, self::UNSAFE_GUC_SHORT_LIST, true);
+    }
+
+    /**
+     * Replace the contents of `'...'` and `"..."` string literals with
+     * spaces, preserving overall length so positions line up with the
+     * original. PG's doubled-quote `''` / `""` escapes are handled the
+     * same way as in splitStatements. Used by detectWrite's SELECT branch
+     * so that bare words like `INTO` inside a literal (e.g.
+     * `SELECT 'INSERT INTO orders' FROM audit_log`) don't trip the
+     * SELECT-INTO DDL classifier. Mirrors goldlapel-js commit 63753fe.
+     */
+    public static function stripStringLiterals(string $sql): string
+    {
+        $len = strlen($sql);
+        if ($len === 0) {
+            return $sql;
+        }
+        $out = $sql;
+        $quote = null;
+        $i = 0;
+        while ($i < $len) {
+            $c = $sql[$i];
+            if ($quote !== null) {
+                if ($c === $quote) {
+                    if ($i + 1 < $len && $sql[$i + 1] === $quote) {
+                        // Doubled-quote escape: blank both, stay inside literal.
+                        $out[$i] = ' ';
+                        $out[$i + 1] = ' ';
+                        $i += 2;
+                        continue;
+                    }
+                    // Closing quote: leave the delimiter, drop the literal body.
+                    $quote = null;
+                } else {
+                    $out[$i] = ' ';
+                }
+            } else {
+                if ($c === "'" || $c === '"') {
+                    $quote = $c;
+                }
+            }
+            $i++;
+        }
+        return $out;
     }
 
     /**
