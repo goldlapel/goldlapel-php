@@ -18,7 +18,7 @@ class NativeCache
         'except', 'all', 'distinct', 'lateral', 'values',
     ];
 
-    // --- L1 telemetry tuning ---
+    // --- Native-cache telemetry tuning ---
     //
     // Demand-driven model (mirrors goldlapel-python). Counters bump on
     // cache ops; state-change events emit synchronously when a relevant
@@ -38,12 +38,12 @@ class NativeCache
     private int $counter = 0;
     private int $maxEntries;
     private bool $enabled;
-    // disable_l1: when true the cache acts as a no-op pass-through. Distinct
-    // from $enabled (the env-var/legacy toggle) — disabled() ticks misses on
-    // every get() so the proxy can still see the wrapper's traffic shape via
-    // telemetry, while $enabled=false (cache_size=0 family) goes fully dark.
-    // Invalidation polling + state-change emissions continue to run regardless,
-    // so the proxy's telemetry path is unaffected.
+    // disable_native_cache: when true the cache acts as a no-op pass-through.
+    // Distinct from $enabled (the env-var/legacy toggle) — disabled() ticks
+    // misses on every get() so the proxy can still see the wrapper's traffic
+    // shape via telemetry, while $enabled=false (cache_size=0 family) goes
+    // fully dark. Invalidation polling + state-change emissions continue to
+    // run regardless, so the proxy's telemetry path is unaffected.
     private bool $disabled;
     private bool $invalidationConnected = false;
     private int $invalidationPort = 0;
@@ -54,13 +54,13 @@ class NativeCache
     public int $statsHits = 0;
     public int $statsMisses = 0;
     public int $statsInvalidations = 0;
-    // L1 telemetry — was missing before; bumped in evictOne(). Public so
-    // tests + external integrations can read it the same way they read
-    // the other counters.
+    // Native-cache telemetry — was missing before; bumped in evictOne().
+    // Public so tests + external integrations can read it the same way they
+    // read the other counters.
     public int $statsEvictions = 0;
 
-    // L1 telemetry state. wrapperId is generated once per process and
-    // stable across reconnects; lets the proxy aggregate per-wrapper.
+    // Native-cache telemetry state. wrapperId is generated once per process
+    // and stable across reconnects; lets the proxy aggregate per-wrapper.
     private string $wrapperId;
     private string $wrapperLang = 'php';
     private string $wrapperVersion;
@@ -123,12 +123,13 @@ class NativeCache
     }
 
     /**
-     * Toggle the L1 no-op pass-through. When true, get() returns null and
-     * ticks misses, put() is a silent no-op, and the wrapper_connected
-     * snapshot reports `l1_disabled: true`. Invalidation polling continues
-     * either way so telemetry stays live. Used by the canonical
-     * `disable_l1` startup option — the singleton is configured by
-     * GoldLapel::wrapPDO()/wrapPDOStatic() before the first cache op.
+     * Toggle the native-cache no-op pass-through. When true, get() returns
+     * null and ticks misses, put() is a silent no-op, and the
+     * wrapper_connected snapshot reports `disabled: true`. Invalidation
+     * polling continues either way so telemetry stays live. Used by the
+     * canonical `disable_native_cache` startup option — the singleton is
+     * configured by GoldLapel::wrapPDO()/wrapPDOStatic() before the first
+     * cache op.
      */
     public function setDisabled(bool $disabled): void
     {
@@ -152,9 +153,9 @@ class NativeCache
         if (!$this->enabled || !$this->invalidationConnected) {
             return null;
         }
-        // disable_l1: tick misses (so the proxy still sees the request rate
-        // through telemetry) but never serve a hit. Hits + evictions stay
-        // at zero; put() is a sibling no-op below.
+        // disable_native_cache: tick misses (so the proxy still sees the
+        // request rate through telemetry) but never serve a hit. Hits +
+        // evictions stay at zero; put() is a sibling no-op below.
         if ($this->disabled) {
             $this->statsMisses++;
             return null;
@@ -661,7 +662,7 @@ class NativeCache
     }
 
     // ------------------------------------------------------------------
-    // L1 telemetry
+    // Native-cache telemetry
     // ------------------------------------------------------------------
 
     /**
@@ -680,7 +681,7 @@ class NativeCache
     }
 
     /**
-     * Build the L1 snapshot dict the proxy aggregates per-tick. All
+     * Build the native-cache snapshot dict the proxy aggregates per-tick. All
      * counters + cache size read in a single pass for internal
      * consistency. Public so external dashboards can call it directly.
      */
@@ -701,7 +702,7 @@ class NativeCache
         // current key shape and the proxy can detect disabled wrappers
         // without an extra version negotiation.
         if ($this->disabled) {
-            $snap['l1_disabled'] = true;
+            $snap['disabled'] = true;
         }
         return $snap;
     }

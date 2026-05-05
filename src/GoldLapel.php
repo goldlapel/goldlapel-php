@@ -36,15 +36,15 @@ class GoldLapel
     private const VALID_CONFIG_KEYS = [
         'min_pattern_count', 'refresh_interval_secs', 'pattern_ttl_secs',
         'max_tables_per_view', 'max_columns_per_view', 'deep_pagination_threshold',
-        'report_interval_secs', 'result_cache_size', 'batch_cache_size',
+        'report_interval_secs', 'proxy_cache_size', 'batch_cache_size',
         'batch_cache_ttl_secs', 'pool_size', 'pool_timeout_secs',
         'pool_mode', 'mgmt_idle_timeout', 'fallback', 'read_after_write_secs',
         'n1_threshold', 'n1_window_ms', 'n1_cross_threshold',
         'tls_cert', 'tls_key', 'tls_client_ca',
         'disable_matviews', 'disable_consolidation', 'disable_btree_indexes',
         'disable_trigram_indexes', 'disable_expression_indexes',
-        'disable_partial_indexes', 'disable_rewrite', 'disable_prepared_cache',
-        'disable_result_cache', 'disable_pool',
+        'disable_partial_indexes', 'disable_rewrite', 'disable_rewrite_prepared_cache',
+        'disable_proxy_cache', 'disable_pool',
         'disable_n1', 'disable_n1_cross_connection', 'disable_shadow_mode',
         'enable_coalescing', 'replica', 'exclude_tables',
     ];
@@ -52,8 +52,8 @@ class GoldLapel
     private const BOOLEAN_KEYS = [
         'disable_matviews', 'disable_consolidation', 'disable_btree_indexes',
         'disable_trigram_indexes', 'disable_expression_indexes',
-        'disable_partial_indexes', 'disable_rewrite', 'disable_prepared_cache',
-        'disable_result_cache', 'disable_pool',
+        'disable_partial_indexes', 'disable_rewrite', 'disable_rewrite_prepared_cache',
+        'disable_proxy_cache', 'disable_pool',
         'disable_n1', 'disable_n1_cross_connection', 'disable_shadow_mode',
         'enable_coalescing',
     ];
@@ -85,8 +85,8 @@ class GoldLapel
     private bool $silent;
     private bool $mesh;
     private ?string $meshTag;
-    private bool $enableL2ForWrappers;
-    private bool $disableL1;
+    private bool $enableProxyCacheForWrappers;
+    private bool $disableNativeCache;
     private array $config;
     private array $extraArgs;
     /** @var resource|null */
@@ -159,8 +159,8 @@ class GoldLapel
      *   silent?: bool,
      *   mesh?: bool,
      *   mesh_tag?: string,
-     *   enable_l2_for_wrappers?: bool,
-     *   disable_l1?: bool,
+     *   enable_proxy_cache_for_wrappers?: bool,
+     *   disable_native_cache?: bool,
      * } $options
      */
     public function __construct(string $upstream, array $options = [])
@@ -203,18 +203,19 @@ class GoldLapel
         $this->mesh = !empty($options['mesh']);
         $tag = isset($options['mesh_tag']) ? (string) $options['mesh_tag'] : '';
         $this->meshTag = $tag === '' ? null : $tag;
-        // Opt the wrapper into L2 (proxy result cache). Default false: per-
-        // connection L2 wrapper-skip is the global default since the L1 cache
-        // on the wrapper side handles single-pod traffic. Fleet customers
-        // (multi-pod, frequent restarts, mesh) flip this on so the proxy's
-        // shared L2 still serves wrapper queries.
-        $this->enableL2ForWrappers = !empty($options['enable_l2_for_wrappers']);
-        // disable_l1 turns the wrapper-side L1 (NativeCache) into a no-op
+        // Opt the wrapper into the proxy cache. Default false: per-connection
+        // proxy-cache wrapper-skip is the global default since the native
+        // cache on the wrapper side handles single-pod traffic. Fleet
+        // customers (multi-pod, frequent restarts, mesh) flip this on so the
+        // proxy's shared cache still serves wrapper queries.
+        $this->enableProxyCacheForWrappers = !empty($options['enable_proxy_cache_for_wrappers']);
+        // disable_native_cache turns the wrapper-side NativeCache into a no-op
         // pass-through without forcing the user to drop their tuned
         // `cache_size`. The flag is applied to the singleton NativeCache the
         // first time wrapPDO()/wrapPDOStatic() is called from this instance,
-        // and surfaces on the L1 telemetry snapshot as `l1_disabled: true`.
-        $this->disableL1 = !empty($options['disable_l1']);
+        // and surfaces on the native-cache telemetry snapshot as
+        // `disabled: true`.
+        $this->disableNativeCache = !empty($options['disable_native_cache']);
 
         // Nested namespaces — see src/Documents.php, src/Streams.php, plus
         // the Phase 5 Redis-compat families under src/{Counters,Zsets,
@@ -247,8 +248,8 @@ class GoldLapel
      *   - 'silent' (bool): suppress the startup banner
      *   - 'mesh' (bool): opt into the mesh at startup (HQ enforces license; denial is non-fatal)
      *   - 'mesh_tag' (string): optional mesh tag — instances with the same tag cluster together
-     *   - 'enable_l2_for_wrappers' (bool): opt the wrapper into the proxy's L2 result cache. Default false (wrapper traffic skips L2 because L1 covers it). Useful for fleet deployments (multi-pod, frequent restarts) where shared L2 still adds value.
-     *   - 'disable_l1' (bool): turn the wrapper's NativeCache into a no-op pass-through. Default false. Lets you toggle the layer off without losing your tuned `cache_size` — get() returns null, put() is a no-op, misses still tick (so the proxy sees the traffic shape via telemetry), the snapshot reports `l1_disabled: true`.
+     *   - 'enable_proxy_cache_for_wrappers' (bool): opt the wrapper into the proxy's shared cache. Default false (wrapper traffic skips the proxy cache because the native cache covers it). Useful for fleet deployments (multi-pod, frequent restarts) where the shared proxy cache still adds value.
+     *   - 'disable_native_cache' (bool): turn the wrapper's NativeCache into a no-op pass-through. Default false. Lets you toggle the layer off without losing your tuned `cache_size` — get() returns null, put() is a no-op, misses still tick (so the proxy sees the traffic shape via telemetry), the snapshot reports `disabled: true`.
      *
      * Promoted top-level concepts (proxy_port, dashboard_port, etc.) are NOT
      * valid keys inside `config` — passing them there raises at construction
@@ -549,8 +550,8 @@ class GoldLapel
             $cmd[] = '--mesh-tag';
             $cmd[] = $this->meshTag;
         }
-        if ($this->enableL2ForWrappers) {
-            $cmd[] = '--enable-l2-for-wrappers';
+        if ($this->enableProxyCacheForWrappers) {
+            $cmd[] = '--enable-proxy-cache-for-wrappers';
         }
         $cmd = array_merge($cmd, self::configToArgs($this->config), $this->extraArgs);
 
@@ -852,7 +853,7 @@ class GoldLapel
     }
 
     // ------------------------------------------------------------------
-    // Integration helper: wrap a PDO with the L1 cache
+    // Integration helper: wrap a PDO with the native cache
     // ------------------------------------------------------------------
 
     public function wrapPDO(\PDO $pdo, ?int $invalidationPort = null): CachedPDO
@@ -863,26 +864,28 @@ class GoldLapel
                 : $this->proxyPort + 2;
         }
 
-        return self::wrapPDOStatic($pdo, $invalidationPort, $this->disableL1);
+        return self::wrapPDOStatic($pdo, $invalidationPort, $this->disableNativeCache);
     }
 
     /**
-     * Low-level helper: wrap a PDO with the L1 cache, connecting the cache
-     * to the given invalidation port. Used by the Laravel integration where
-     * PDOs are constructed by the framework outside the factory lifecycle.
+     * Low-level helper: wrap a PDO with the native cache, connecting the
+     * cache to the given invalidation port. Used by the Laravel integration
+     * where PDOs are constructed by the framework outside the factory
+     * lifecycle.
      *
-     * `$disableL1` is tri-state: null leaves the singleton's current
-     * disabled state untouched (so Laravel callers that don't know about
-     * the option don't accidentally re-enable a previously-disabled
+     * `$disableNativeCache` is tri-state: null leaves the singleton's
+     * current disabled state untouched (so Laravel callers that don't know
+     * about the option don't accidentally re-enable a previously-disabled
      * cache), while true/false set it explicitly. wrapPDO() forwards the
-     * factory's `disable_l1` startup option here, so the disable_l1=true
-     * path always wins over a passive Laravel wrap that follows it.
+     * factory's `disable_native_cache` startup option here, so the
+     * disable_native_cache=true path always wins over a passive Laravel
+     * wrap that follows it.
      */
-    public static function wrapPDOStatic(\PDO $pdo, int $invalidationPort, ?bool $disableL1 = null): CachedPDO
+    public static function wrapPDOStatic(\PDO $pdo, int $invalidationPort, ?bool $disableNativeCache = null): CachedPDO
     {
         $cache = NativeCache::getInstance();
-        if ($disableL1 !== null) {
-            $cache->setDisabled($disableL1);
+        if ($disableNativeCache !== null) {
+            $cache->setDisabled($disableNativeCache);
         }
         if (!$cache->isConnected()) {
             $cache->connectInvalidation($invalidationPort);
@@ -893,7 +896,7 @@ class GoldLapel
 
     /**
      * Convenience: return a CachedPDO wrapping this instance's internal PDO.
-     * Useful when you want the L1 cache on the factory-managed connection.
+     * Useful when you want the native cache on the factory-managed connection.
      */
     public function cached(): CachedPDO
     {
@@ -1188,8 +1191,8 @@ class GoldLapel
     /**
      * Append `application_name=goldlapel:php:<version>` to the URL unless one
      * is already present (or PGAPPNAME is set). Tells the proxy this is
-     * wrapper traffic so it can skip L2 result cache (the wrapper has its
-     * own L1). Idempotent and override-respecting.
+     * wrapper traffic so it can skip the proxy cache (the wrapper has its
+     * own native cache). Idempotent and override-respecting.
      */
     public static function injectApplicationName(string $url): string
     {

@@ -65,7 +65,7 @@ class CachedPDO extends \PDO
             return $stmt !== false ? new CachedPDOStatement($stmt, $this->cache, $sql, null, true) : false;
         }
 
-        // Read path: check L1 cache
+        // Read path: check native cache
         $entry = $this->cache->get($sql, null);
         if ($entry !== null) {
             return CachedPDOStatement::fromCache($entry, $this->cache, $sql);
@@ -250,7 +250,7 @@ class CachedPDOStatement extends \PDOStatement
             return $this->realStmt->execute($params);
         }
 
-        // Read path: check L1 cache
+        // Read path: check native cache
         $entry = $this->cache->get($this->sql, $effectiveParams);
         if ($entry !== null) {
             $this->cachedRows = $entry['rows'];

@@ -14,8 +14,8 @@ class GoldLapelServiceProvider extends ServiceProvider
      * Keyed by Laravel connection name. Holds the live `GoldLapel` instance
      * so the terminating callback can call `->stop()` on it under long-lived
      * workers (Octane / Swoole / RoadRunner), plus the invalidation port the
-     * matching `GoldLapelConnection` needs when it wraps its PDO with the L1
-     * cache.
+     * matching `GoldLapelConnection` needs when it wraps its PDO with the
+     * native cache.
      *
      * @var array<string, array{proxy_port:int, invalidation_port:?int, instance:GoldLapel}>
      */

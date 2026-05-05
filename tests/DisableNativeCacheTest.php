@@ -7,15 +7,15 @@ use GoldLapel\NativeCache;
 use PHPUnit\Framework\TestCase;
 
 /**
- * Tests for the canonical `disable_l1` top-level option.
+ * Tests for the canonical `disable_native_cache` top-level option.
  *
- * disable_l1: true puts the wrapper's NativeCache into a no-op
+ * disable_native_cache: true puts the wrapper's NativeCache into a no-op
  * pass-through. get() returns null (and ticks misses so the proxy sees
  * the request rate via telemetry); put() is silent. Distinct from
- * `cache_size: 0` / GOLDLAPEL_NATIVE_CACHE=false — disable_l1 lets the
- * customer keep their tuned cache size and toggle just the layer.
+ * `cache_size: 0` / GOLDLAPEL_NATIVE_CACHE=false — disable_native_cache
+ * lets the customer keep their tuned cache size and toggle just the layer.
  */
-class DisableL1Test extends TestCase
+class DisableNativeCacheTest extends TestCase
 {
     protected function setUp(): void
     {
@@ -31,9 +31,9 @@ class DisableL1Test extends TestCase
         putenv('GOLDLAPEL_REPORT_STATS');
     }
 
-    private function disableL1FieldValue(GoldLapel $gl): bool
+    private function disableNativeCacheFieldValue(GoldLapel $gl): bool
     {
-        $ref = new \ReflectionProperty(GoldLapel::class, 'disableL1');
+        $ref = new \ReflectionProperty(GoldLapel::class, 'disableNativeCache');
         $ref->setAccessible(true);
         return $ref->getValue($gl);
     }
@@ -52,46 +52,46 @@ class DisableL1Test extends TestCase
         $this->assertFalse($cache->isDisabled());
     }
 
-    public function testDisableL1OptionDefaultsToFalse(): void
+    public function testDisableNativeCacheOptionDefaultsToFalse(): void
     {
         $gl = new GoldLapel('postgresql://u:p@h/d');
-        $this->assertFalse($this->disableL1FieldValue($gl));
+        $this->assertFalse($this->disableNativeCacheFieldValue($gl));
     }
 
-    public function testDefaultSnapshotOmitsL1DisabledKey(): void
+    public function testDefaultSnapshotOmitsDisabledKey(): void
     {
         $cache = new NativeCache();
         $cache->setConnected(true);
         $snap = $cache->buildSnapshot();
-        $this->assertArrayNotHasKey('l1_disabled', $snap);
+        $this->assertArrayNotHasKey('disabled', $snap);
     }
 
-    // ─── disable_l1 on the GoldLapel factory ────────────────────────────
+    // ─── disable_native_cache on the GoldLapel factory ──────────────────
 
-    public function testDisableL1OptionParsedAsTrue(): void
+    public function testDisableNativeCacheOptionParsedAsTrue(): void
     {
-        $gl = new GoldLapel('postgresql://u:p@h/d', ['disable_l1' => true]);
-        $this->assertTrue($this->disableL1FieldValue($gl));
+        $gl = new GoldLapel('postgresql://u:p@h/d', ['disable_native_cache' => true]);
+        $this->assertTrue($this->disableNativeCacheFieldValue($gl));
     }
 
-    public function testDisableL1FalseyValuesTreatedAsFalse(): void
+    public function testDisableNativeCacheFalseyValuesTreatedAsFalse(): void
     {
         foreach ([false, 0, '', null] as $falsey) {
-            $gl = new GoldLapel('postgresql://u:p@h/d', ['disable_l1' => $falsey]);
+            $gl = new GoldLapel('postgresql://u:p@h/d', ['disable_native_cache' => $falsey]);
             $this->assertFalse(
-                $this->disableL1FieldValue($gl),
-                'disable_l1 => ' . var_export($falsey, true) . ' should be false'
+                $this->disableNativeCacheFieldValue($gl),
+                'disable_native_cache => ' . var_export($falsey, true) . ' should be false'
             );
         }
     }
 
-    public function testDisableL1AsConfigKeyRejected(): void
+    public function testDisableNativeCacheAsConfigKeyRejected(): void
     {
-        // disable_l1 is a top-level canonical-surface option; it must not
-        // be valid inside the structured config map.
+        // disable_native_cache is a top-level canonical-surface option; it
+        // must not be valid inside the structured config map.
         $this->expectException(\InvalidArgumentException::class);
         new GoldLapel('postgresql://u:p@h/d', [
-            'config' => ['disable_l1' => true],
+            'config' => ['disable_native_cache' => true],
         ]);
     }
 
@@ -125,8 +125,8 @@ class DisableL1Test extends TestCase
         // Tri-state contract: passing null must not flip a previously
         // disabled cache back to enabled. Laravel's GoldLapelConnection
         // calls wrapPDOStatic without the third arg, so a Laravel wrap
-        // following a `disable_l1: true` factory must not clobber the
-        // disabled state.
+        // following a `disable_native_cache: true` factory must not
+        // clobber the disabled state.
         $server = stream_socket_server('tcp://127.0.0.1:0', $errno, $errstr);
         $this->assertNotFalse($server);
         $port = (int) explode(':', stream_socket_get_name($server, false))[1];
@@ -135,7 +135,7 @@ class DisableL1Test extends TestCase
         $pdo = $this->createStub(\PDO::class);
 
         try {
-            // First call: factory wraps with disable_l1=true.
+            // First call: factory wraps with disable_native_cache=true.
             GoldLapel::wrapPDOStatic($pdo, $port, true);
             $cache = NativeCache::getInstance();
             $this->assertTrue($cache->isDisabled());
@@ -208,35 +208,35 @@ class DisableL1Test extends TestCase
 
     // ─── snapshot field ────────────────────────────────────────────────
 
-    public function testSnapshotIncludesL1DisabledWhenDisabled(): void
+    public function testSnapshotIncludesDisabledWhenDisabled(): void
     {
         $cache = new NativeCache(null, null, true);
         $cache->setConnected(true);
         $cache->get('SELECT 1', null); // tick a miss
         $snap = $cache->buildSnapshot();
-        $this->assertArrayHasKey('l1_disabled', $snap);
-        $this->assertTrue($snap['l1_disabled']);
+        $this->assertArrayHasKey('disabled', $snap);
+        $this->assertTrue($snap['disabled']);
         $this->assertSame(1, $snap['misses']);
         $this->assertSame(0, $snap['hits']);
         $this->assertSame(0, $snap['evictions']);
         $this->assertSame(0, $snap['current_size_entries']);
     }
 
-    public function testSnapshotOmitsL1DisabledAfterReenable(): void
+    public function testSnapshotOmitsDisabledAfterReenable(): void
     {
         $cache = new NativeCache(null, null, true);
         $cache->setConnected(true);
-        $this->assertArrayHasKey('l1_disabled', $cache->buildSnapshot());
+        $this->assertArrayHasKey('disabled', $cache->buildSnapshot());
         $cache->setDisabled(false);
-        $this->assertArrayNotHasKey('l1_disabled', $cache->buildSnapshot());
+        $this->assertArrayNotHasKey('disabled', $cache->buildSnapshot());
     }
 
     // ─── invalidation polling/listener still runs ──────────────────────
 
     public function testDisabledStillProcessesInvalidationSignals(): void
     {
-        // disable_l1 must not silence the proxy's signal stream — the
-        // wrapper still receives I:* / I:<table> / ?:snapshot and the
+        // disable_native_cache must not silence the proxy's signal stream —
+        // the wrapper still receives I:* / I:<table> / ?:snapshot and the
         // listener must keep running for telemetry. Easiest assertion:
         // processSignal() still routes correctly and bumps the
         // invalidation counter when a wildcard arrives.

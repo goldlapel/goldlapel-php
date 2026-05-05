@@ -278,72 +278,75 @@ class BannerTest extends TestCase
         }
     }
 
-    // ─── enable_l2_for_wrappers startup option ────────────────────────────
+    // ─── enable_proxy_cache_for_wrappers startup option ───────────────────
     //
-    // Per-connection L2 wrapper-skip is the global default — wrappers carry
-    // an L1 cache and tag their PG application_name so the proxy bypasses L2
-    // for them. Fleet customers (multi-pod, frequent restarts, mesh) flip
-    // this on so the proxy's shared L2 keeps adding value across pods.
+    // Per-connection proxy-cache wrapper-skip is the global default —
+    // wrappers carry a native cache and tag their PG application_name so
+    // the proxy bypasses its shared cache for them. Fleet customers
+    // (multi-pod, frequent restarts, mesh) flip this on so the proxy's
+    // shared cache keeps adding value across pods.
 
-    private function enableL2ForWrappersFieldValue(GoldLapel $gl): bool
+    private function enableProxyCacheForWrappersFieldValue(GoldLapel $gl): bool
     {
-        $ref = new \ReflectionProperty(GoldLapel::class, 'enableL2ForWrappers');
+        $ref = new \ReflectionProperty(GoldLapel::class, 'enableProxyCacheForWrappers');
         $ref->setAccessible(true);
         return $ref->getValue($gl);
     }
 
-    public function testEnableL2ForWrappersDefaultsToFalse(): void
+    public function testEnableProxyCacheForWrappersDefaultsToFalse(): void
     {
         $gl = new GoldLapel('postgresql://u:p@h/d');
-        $this->assertFalse($this->enableL2ForWrappersFieldValue($gl));
+        $this->assertFalse($this->enableProxyCacheForWrappersFieldValue($gl));
     }
 
-    public function testEnableL2ForWrappersOptionParsedAsTrue(): void
+    public function testEnableProxyCacheForWrappersOptionParsedAsTrue(): void
     {
-        $gl = new GoldLapel('postgresql://u:p@h/d', ['enable_l2_for_wrappers' => true]);
-        $this->assertTrue($this->enableL2ForWrappersFieldValue($gl));
+        $gl = new GoldLapel('postgresql://u:p@h/d', ['enable_proxy_cache_for_wrappers' => true]);
+        $this->assertTrue($this->enableProxyCacheForWrappersFieldValue($gl));
     }
 
-    public function testEnableL2ForWrappersAsConfigKeyRejected(): void
+    public function testEnableProxyCacheForWrappersAsConfigKeyRejected(): void
     {
-        // Belt-and-braces: enable_l2_for_wrappers is a top-level canonical-
-        // surface option, never valid inside the structured config map.
+        // Belt-and-braces: enable_proxy_cache_for_wrappers is a top-level
+        // canonical-surface option, never valid inside the structured
+        // config map.
         $this->expectException(\InvalidArgumentException::class);
         new GoldLapel('postgresql://u:p@h/d', [
-            'config' => ['enable_l2_for_wrappers' => true],
+            'config' => ['enable_proxy_cache_for_wrappers' => true],
         ]);
     }
 
-    public function testEnableL2ForWrappersNotForwardedAsConfigArg(): void
+    public function testEnableProxyCacheForWrappersNotForwardedAsConfigArg(): void
     {
         $gl = new GoldLapel('postgresql://u:p@h/d', [
-            'enable_l2_for_wrappers' => true,
+            'enable_proxy_cache_for_wrappers' => true,
         ]);
-        // configToArgs only sees the structured config map; the wrapper-L2
-        // flag lives on the instance and is emitted in
-        // startProxyWithoutConnect.
+        // configToArgs only sees the structured config map; the
+        // wrapper-proxy-cache flag lives on the instance and is emitted
+        // in startProxyWithoutConnect.
         $args = GoldLapel::configToArgs($this->configFieldValue($gl));
-        $this->assertNotContains('--enable-l2-for-wrappers', $args);
-        $this->assertNotContains('enable_l2_for_wrappers', $args);
+        $this->assertNotContains('--enable-proxy-cache-for-wrappers', $args);
+        $this->assertNotContains('enable_proxy_cache_for_wrappers', $args);
     }
 
-    public function testEnableL2ForWrappersFalseyValuesTreatedAsFalse(): void
+    public function testEnableProxyCacheForWrappersFalseyValuesTreatedAsFalse(): void
     {
         foreach ([false, 0, '', null] as $falsey) {
-            $gl = new GoldLapel('postgresql://u:p@h/d', ['enable_l2_for_wrappers' => $falsey]);
+            $gl = new GoldLapel('postgresql://u:p@h/d', ['enable_proxy_cache_for_wrappers' => $falsey]);
             $this->assertFalse(
-                $this->enableL2ForWrappersFieldValue($gl),
-                'enable_l2_for_wrappers => ' . var_export($falsey, true) . ' should be false'
+                $this->enableProxyCacheForWrappersFieldValue($gl),
+                'enable_proxy_cache_for_wrappers => ' . var_export($falsey, true) . ' should be false'
             );
         }
     }
 
-    public function testEnableL2ForWrappersFlagAppearsInSpawnedArgv(): void
+    public function testEnableProxyCacheForWrappersFlagAppearsInSpawnedArgv(): void
     {
-        // End-to-end assertion: start() with enable_l2_for_wrappers => true
-        // must pass --enable-l2-for-wrappers to the spawned binary. Use a
-        // fake binary that records its argv to a tempfile and listens on the
-        // requested port long enough for waitForPort() to succeed.
+        // End-to-end assertion: start() with enable_proxy_cache_for_wrappers
+        // => true must pass --enable-proxy-cache-for-wrappers to the spawned
+        // binary. Use a fake binary that records its argv to a tempfile and
+        // listens on the requested port long enough for waitForPort() to
+        // succeed.
         if (PHP_OS_FAMILY === 'Windows') {
             $this->markTestSkipped('Fake-binary spawn test uses /bin/sh.');
         }
@@ -380,16 +383,16 @@ class BannerTest extends TestCase
                 [
                     'proxy_port' => $port,
                     'dashboard_port' => 0,
-                    'enable_l2_for_wrappers' => true,
+                    'enable_proxy_cache_for_wrappers' => true,
                 ]
             );
 
             $argv = file_get_contents($argvFile);
             $this->assertIsString($argv);
             $this->assertStringContainsString(
-                "--enable-l2-for-wrappers\n",
+                "--enable-proxy-cache-for-wrappers\n",
                 $argv,
-                "spawned argv must contain --enable-l2-for-wrappers when the option is true; got: {$argv}"
+                "spawned argv must contain --enable-proxy-cache-for-wrappers when the option is true; got: {$argv}"
             );
         } finally {
             GoldLapel::cleanupAll();
@@ -401,7 +404,7 @@ class BannerTest extends TestCase
         }
     }
 
-    public function testEnableL2ForWrappersDefaultOmitsFlagFromSpawnedArgv(): void
+    public function testEnableProxyCacheForWrappersDefaultOmitsFlagFromSpawnedArgv(): void
     {
         // Negative case: when the option is not set (default false), the
         // flag must NOT appear in argv. Guards against a regression that
@@ -441,9 +444,9 @@ class BannerTest extends TestCase
 
             $argv = (string) file_get_contents($argvFile);
             $this->assertStringNotContainsString(
-                '--enable-l2-for-wrappers',
+                '--enable-proxy-cache-for-wrappers',
                 $argv,
-                "spawned argv must not contain --enable-l2-for-wrappers by default; got: {$argv}"
+                "spawned argv must not contain --enable-proxy-cache-for-wrappers by default; got: {$argv}"
             );
         } finally {
             GoldLapel::cleanupAll();
