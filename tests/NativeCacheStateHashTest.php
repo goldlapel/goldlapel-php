@@ -2,6 +2,7 @@
 
 namespace GoldLapel\Tests;
 
+use GoldLapel\ConnectionGucState;
 use GoldLapel\NativeCache;
 use PHPUnit\Framework\TestCase;
 
@@ -12,8 +13,10 @@ use PHPUnit\Framework\TestCase;
  * cache safety"). The wrapper cache must fold a per-connection
  * unsafe-GUC fingerprint into the cache key so that a `SET app.user_id =
  * '7'` followed by the same SELECT can't hit a slot populated for user
- * `42`. Same idea, smaller surface — the wrapper only handles the
- * single-connection case.
+ * `42`. State lives on ConnectionGucState — one tracker per CachedPDO /
+ * CachedConnection — so concurrent connections can never share GUC
+ * state through a singleton (matches goldlapel-python /
+ * goldlapel-ruby / goldlapel-js).
  *
  * Coverage:
  *   1. is_unsafe_guc classification (short list, namespaced, case)
@@ -27,6 +30,8 @@ use PHPUnit\Framework\TestCase;
  *      independent, reset round-trip restores the old hash
  *   6. End-to-end cache: same SQL with different unsafe GUC state must
  *      not share a cache slot
+ *   7. Cross-connection isolation — two ConnectionGucState instances
+ *      pointing at the same shared NativeCache never collide.
  */
 class NativeCacheStateHashTest extends TestCase
 {
@@ -45,6 +50,11 @@ class NativeCacheStateHashTest extends TestCase
         $cache = new NativeCache();
         $cache->setConnected(true);
         return $cache;
+    }
+
+    private function makeState(): ConnectionGucState
+    {
+        return new ConnectionGucState();
     }
 
     // ─── is_unsafe_guc ───────────────────────────────────────────────────
@@ -255,31 +265,31 @@ class NativeCacheStateHashTest extends TestCase
         $this->assertSame(['SELECT 1'], NativeCache::splitStatements(';;SELECT 1;;'));
     }
 
-    // ─── observeSql + state hash ────────────────────────────────────────
+    // ─── observeSql + state hash (ConnectionGucState) ───────────────────
 
     public function testEmptyStateHashIsZero(): void
     {
-        $cache = $this->makeCache();
-        $this->assertSame('0', $cache->getStateHash());
+        $state = $this->makeState();
+        $this->assertSame('0', $state->stateHash());
     }
 
     public function testObserveUnsafeSetMutatesHash(): void
     {
-        $cache = $this->makeCache();
-        $changed = $cache->observeSql("SET app.user_id = '42'");
+        $state = $this->makeState();
+        $changed = $state->observeSql("SET app.user_id = '42'");
         $this->assertTrue($changed);
-        $this->assertNotSame('0', $cache->getStateHash());
+        $this->assertNotSame('0', $state->stateHash());
         // Populated-state hashes are 16-char lowercase hex (xxh64 width).
-        $this->assertSame(16, strlen($cache->getStateHash()));
-        $this->assertMatchesRegularExpression('/^[0-9a-f]{16}$/', $cache->getStateHash());
+        $this->assertSame(16, strlen($state->stateHash()));
+        $this->assertMatchesRegularExpression('/^[0-9a-f]{16}$/', $state->stateHash());
     }
 
     public function testObserveSafeSetDoesNotMutateHash(): void
     {
-        $cache = $this->makeCache();
-        $changed = $cache->observeSql("SET application_name = 'myapp'");
+        $state = $this->makeState();
+        $changed = $state->observeSql("SET application_name = 'myapp'");
         $this->assertFalse($changed);
-        $this->assertSame('0', $cache->getStateHash());
+        $this->assertSame('0', $state->stateHash());
     }
 
     public function testObserveSetLocalIsNoOpForState(): void
@@ -287,51 +297,51 @@ class NativeCacheStateHashTest extends TestCase
         // SET LOCAL is parsed but ignored — cache is gated on
         // transaction-idle so SET LOCAL never influences a cacheable
         // response.
-        $cache = $this->makeCache();
-        $changed = $cache->observeSql("SET LOCAL app.user_id = '42'");
+        $state = $this->makeState();
+        $changed = $state->observeSql("SET LOCAL app.user_id = '42'");
         $this->assertFalse($changed);
-        $this->assertSame('0', $cache->getStateHash());
+        $this->assertSame('0', $state->stateHash());
     }
 
     public function testObserveResetClearsSpecificGuc(): void
     {
-        $cache = $this->makeCache();
-        $cache->observeSql("SET app.user_id = '42'");
-        $with = $cache->getStateHash();
-        $cache->observeSql('RESET app.user_id');
-        $this->assertSame('0', $cache->getStateHash());
-        $this->assertNotSame($with, $cache->getStateHash());
+        $state = $this->makeState();
+        $state->observeSql("SET app.user_id = '42'");
+        $with = $state->stateHash();
+        $state->observeSql('RESET app.user_id');
+        $this->assertSame('0', $state->stateHash());
+        $this->assertNotSame($with, $state->stateHash());
     }
 
     public function testObserveResetAllClearsAllUnsafeGucs(): void
     {
-        $cache = $this->makeCache();
-        $cache->observeSql("SET app.user_id = '42'");
-        $cache->observeSql("SET role = 'tenant'");
-        $this->assertNotSame('0', $cache->getStateHash());
-        $cache->observeSql('RESET ALL');
-        $this->assertSame('0', $cache->getStateHash());
+        $state = $this->makeState();
+        $state->observeSql("SET app.user_id = '42'");
+        $state->observeSql("SET role = 'tenant'");
+        $this->assertNotSame('0', $state->stateHash());
+        $state->observeSql('RESET ALL');
+        $this->assertSame('0', $state->stateHash());
     }
 
     public function testObserveDifferentValuesYieldDifferentHashes(): void
     {
-        $cache1 = $this->makeCache();
-        $cache1->observeSql("SET app.user_id = '42'");
-        $cache2 = $this->makeCache();
-        $cache2->observeSql("SET app.user_id = '43'");
-        $this->assertNotSame($cache1->getStateHash(), $cache2->getStateHash());
+        $a = $this->makeState();
+        $a->observeSql("SET app.user_id = '42'");
+        $b = $this->makeState();
+        $b->observeSql("SET app.user_id = '43'");
+        $this->assertNotSame($a->stateHash(), $b->stateHash());
     }
 
     public function testObserveInsertionOrderIndependent(): void
     {
         // BTreeMap parity: hash is stable across insertion orders.
-        $cache1 = $this->makeCache();
-        $cache1->observeSql("SET app.a = '1'");
-        $cache1->observeSql("SET app.b = '2'");
-        $cache2 = $this->makeCache();
-        $cache2->observeSql("SET app.b = '2'");
-        $cache2->observeSql("SET app.a = '1'");
-        $this->assertSame($cache1->getStateHash(), $cache2->getStateHash());
+        $a = $this->makeState();
+        $a->observeSql("SET app.a = '1'");
+        $a->observeSql("SET app.b = '2'");
+        $b = $this->makeState();
+        $b->observeSql("SET app.b = '2'");
+        $b->observeSql("SET app.a = '1'");
+        $this->assertSame($a->stateHash(), $b->stateHash());
     }
 
     public function testObserveResetRoundTripRestoresHash(): void
@@ -339,32 +349,32 @@ class NativeCacheStateHashTest extends TestCase
         // Starting from empty, set then reset should restore the empty
         // hash exactly. Set+reset is the canonical "audit your handler
         // didn't leak state" round-trip.
-        $cache = $this->makeCache();
-        $before = $cache->getStateHash();
-        $cache->observeSql("SET app.user_id = '42'");
-        $cache->observeSql('RESET app.user_id');
-        $this->assertSame($before, $cache->getStateHash());
+        $state = $this->makeState();
+        $before = $state->stateHash();
+        $state->observeSql("SET app.user_id = '42'");
+        $state->observeSql('RESET app.user_id');
+        $this->assertSame($before, $state->stateHash());
     }
 
     public function testObserveMultiStatementBodyAppliesAllSets(): void
     {
-        $cache = $this->makeCache();
-        $changed = $cache->observeSql("SET app.user_id = '42'; SET role = 'tenant'; SELECT 1");
+        $state = $this->makeState();
+        $changed = $state->observeSql("SET app.user_id = '42'; SET role = 'tenant'; SELECT 1");
         $this->assertTrue($changed);
         // The hash should match observing the same SETs individually.
-        $other = $this->makeCache();
+        $other = $this->makeState();
         $other->observeSql("SET app.user_id = '42'");
         $other->observeSql("SET role = 'tenant'");
-        $this->assertSame($other->getStateHash(), $cache->getStateHash());
+        $this->assertSame($other->stateHash(), $state->stateHash());
     }
 
     public function testObserveReSetSameValueIsIdempotent(): void
     {
-        $cache = $this->makeCache();
-        $cache->observeSql("SET app.user_id = '42'");
-        $h = $cache->getStateHash();
-        $cache->observeSql("SET app.user_id = '42'");
-        $this->assertSame($h, $cache->getStateHash());
+        $state = $this->makeState();
+        $state->observeSql("SET app.user_id = '42'");
+        $h = $state->stateHash();
+        $state->observeSql("SET app.user_id = '42'");
+        $this->assertSame($h, $state->stateHash());
     }
 
     // ─── End-to-end cache: state hash gates cache-key sharing ───────────
@@ -384,27 +394,28 @@ class NativeCacheStateHashTest extends TestCase
         // Populate cache slot under user A's state, then switch to user B
         // and try to read the same SQL — must miss.
         $cache = $this->makeCache();
+        $state = $this->makeState();
         $sql = 'SELECT * FROM accounts';
 
-        $cache->observeSql("SET app.user_id = 'A'");
-        $cache->put($sql, null, [['id' => 'A1']], ['id']);
-        $hitA = $cache->get($sql, null);
+        $state->observeSql("SET app.user_id = 'A'");
+        $cache->put($sql, null, [['id' => 'A1']], ['id'], $state->stateHash());
+        $hitA = $cache->get($sql, null, $state->stateHash());
         $this->assertSame([['id' => 'A1']], $hitA['rows']);
 
         // Switch to user B — state hash changes — same SQL must miss.
         $missesBefore = $cache->statsMisses;
-        $cache->observeSql("SET app.user_id = 'B'");
-        $hitB = $cache->get($sql, null);
+        $state->observeSql("SET app.user_id = 'B'");
+        $hitB = $cache->get($sql, null, $state->stateHash());
         $this->assertNull($hitB);
         $this->assertSame($missesBefore + 1, $cache->statsMisses);
 
         // And user B can populate their own slot without colliding.
-        $cache->put($sql, null, [['id' => 'B1']], ['id']);
-        $this->assertSame([['id' => 'B1']], $cache->get($sql, null)['rows']);
+        $cache->put($sql, null, [['id' => 'B1']], ['id'], $state->stateHash());
+        $this->assertSame([['id' => 'B1']], $cache->get($sql, null, $state->stateHash())['rows']);
 
         // Swap back — user A still gets their own slot.
-        $cache->observeSql("SET app.user_id = 'A'");
-        $this->assertSame([['id' => 'A1']], $cache->get($sql, null)['rows']);
+        $state->observeSql("SET app.user_id = 'A'");
+        $this->assertSame([['id' => 'A1']], $cache->get($sql, null, $state->stateHash())['rows']);
     }
 
     public function testCacheSlotSharedAcrossSetLocalSinceLocalIsIgnored(): void
@@ -414,12 +425,13 @@ class NativeCacheStateHashTest extends TestCase
         // get()s sandwiched around a SET LOCAL on the same SQL must hit
         // the same slot.
         $cache = $this->makeCache();
+        $state = $this->makeState();
         $sql = 'SELECT 1';
-        $cache->put($sql, null, [['n' => 1]], ['n']);
+        $cache->put($sql, null, [['n' => 1]], ['n'], $state->stateHash());
 
-        $hitBefore = $cache->get($sql, null);
-        $cache->observeSql("SET LOCAL app.tenant = 'x'");
-        $hitAfter = $cache->get($sql, null);
+        $hitBefore = $cache->get($sql, null, $state->stateHash());
+        $state->observeSql("SET LOCAL app.tenant = 'x'");
+        $hitAfter = $cache->get($sql, null, $state->stateHash());
 
         $this->assertSame($hitBefore['rows'], $hitAfter['rows']);
     }
@@ -429,14 +441,69 @@ class NativeCacheStateHashTest extends TestCase
         // Safe GUCs (timezone, application_name, statement_timeout, …)
         // never enter the state map.
         $cache = $this->makeCache();
+        $state = $this->makeState();
         $sql = 'SELECT 1';
-        $cache->put($sql, null, [['n' => 1]], ['n']);
+        $cache->put($sql, null, [['n' => 1]], ['n'], $state->stateHash());
 
-        $cache->observeSql("SET application_name = 'svc-a'");
-        $hitA = $cache->get($sql, null);
-        $cache->observeSql("SET application_name = 'svc-b'");
-        $hitB = $cache->get($sql, null);
+        $state->observeSql("SET application_name = 'svc-a'");
+        $hitA = $cache->get($sql, null, $state->stateHash());
+        $state->observeSql("SET application_name = 'svc-b'");
+        $hitB = $cache->get($sql, null, $state->stateHash());
 
         $this->assertSame($hitA['rows'], $hitB['rows']);
+    }
+
+    // ─── Cross-connection isolation (regression — was the original bug) ─
+
+    public function testTwoConnectionsDoNotShareGucState(): void
+    {
+        // Two ConnectionGucState instances pointing at the same shared
+        // NativeCache must never see each other's GUC writes. This is the
+        // canonical regression: putting state on the singleton cache (as
+        // the wrapper originally did) lets connection A's `SET
+        // app.user_id = 'A'` poison connection B's reads of the same SQL.
+        $cache = $this->makeCache();
+        $stateA = $this->makeState();
+        $stateB = $this->makeState();
+
+        $sql = 'SELECT * FROM accounts';
+
+        // Connection A: SET, then put.
+        $stateA->observeSql("SET app.user_id = 'A'");
+        $cache->put($sql, null, [['id' => 'A1']], ['id'], $stateA->stateHash());
+
+        // Connection B has issued no SET — its state hash is still '0',
+        // distinct from A's. It must miss.
+        $this->assertSame('0', $stateB->stateHash());
+        $hitB = $cache->get($sql, null, $stateB->stateHash());
+        $this->assertNull(
+            $hitB,
+            'connection B (no GUCs set) must NOT hit a slot populated under connection A\'s GUCs',
+        );
+
+        // Connection A still hits its own slot.
+        $hitA = $cache->get($sql, null, $stateA->stateHash());
+        $this->assertSame([['id' => 'A1']], $hitA['rows']);
+    }
+
+    public function testTwoConnectionsWithDifferentSetsDoNotShareSlots(): void
+    {
+        // Both connections do SETs, with different values. Each must see
+        // only its own slot.
+        $cache = $this->makeCache();
+        $stateA = $this->makeState();
+        $stateB = $this->makeState();
+
+        $sql = 'SELECT * FROM rls_table';
+
+        $stateA->observeSql("SET app.user_id = 'A'");
+        $stateB->observeSql("SET app.user_id = 'B'");
+        $this->assertNotSame($stateA->stateHash(), $stateB->stateHash());
+
+        $cache->put($sql, null, [['id' => 'A-row']], ['id'], $stateA->stateHash());
+        $cache->put($sql, null, [['id' => 'B-row']], ['id'], $stateB->stateHash());
+
+        $this->assertSame([['id' => 'A-row']], $cache->get($sql, null, $stateA->stateHash())['rows']);
+        $this->assertSame([['id' => 'B-row']], $cache->get($sql, null, $stateB->stateHash())['rows']);
     }
 }

@@ -4,6 +4,7 @@ namespace GoldLapel\Amp;
 
 use Amp\Postgres\PostgresExecutor;
 use Amp\Postgres\PostgresResult;
+use GoldLapel\ConnectionGucState;
 use GoldLapel\NativeCache;
 
 /**
@@ -34,10 +35,19 @@ class CachedConnection implements PostgresExecutor
 
     private bool $inTransaction = false;
 
+    /**
+     * Per-connection GUC state — see ConnectionGucState. Each
+     * CachedConnection has its own, never shared with a peer fiber's
+     * connection, so a `SET app.user_id` on connection A can't poison
+     * cache reads on connection B.
+     */
+    private ConnectionGucState $gucState;
+
     public function __construct(
         private PostgresExecutor $real,
         private NativeCache $cache,
     ) {
+        $this->gucState = new ConnectionGucState();
     }
 
     public function getWrappedExecutor(): PostgresExecutor
@@ -55,6 +65,11 @@ class CachedConnection implements PostgresExecutor
         return $this->cache;
     }
 
+    public function getGucState(): ConnectionGucState
+    {
+        return $this->gucState;
+    }
+
     /**
      * Handle cache semantics for a SQL statement:
      *   - detect TX boundaries (bypass cache inside a tx)
@@ -67,10 +82,12 @@ class CachedConnection implements PostgresExecutor
     {
         $this->cache->pollSignals();
 
-        // Observe unsafe-GUC SET / RESET so the state hash reflects the
-        // post-statement state when the result is keyed (mirrors the
-        // sync CachedPDO path).
-        $this->cache->observeSql($sql);
+        // Observe unsafe-GUC SET / RESET so this connection's state hash
+        // reflects the post-statement state when the result is keyed
+        // (mirrors the sync CachedPDO path). State is per-connection —
+        // shared use of a single NativeCache across many fibers is
+        // expected, but each CachedConnection has its own gucState.
+        $this->gucState->observeSql($sql);
 
         if (NativeCache::isTxStart($sql)) {
             $this->inTransaction = true;
@@ -95,7 +112,8 @@ class CachedConnection implements PostgresExecutor
             return $miss();
         }
 
-        $entry = $this->cache->get($sql, $params);
+        $stateHash = $this->gucState->stateHash();
+        $entry = $this->cache->get($sql, $params, $stateHash);
         if ($entry !== null) {
             return new CachedResult($entry['rows']);
         }
@@ -108,7 +126,7 @@ class CachedConnection implements PostgresExecutor
             $rows[] = $row;
         }
         $columns = !empty($rows) ? array_keys($rows[0]) : [];
-        $this->cache->put($sql, $params, $rows, $columns);
+        $this->cache->put($sql, $params, $rows, $columns, $stateHash);
         return new CachedResult($rows);
     }
 

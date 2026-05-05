@@ -18,24 +18,24 @@ class NativeCache
         'except', 'all', 'distinct', 'lateral', 'values',
     ];
 
-    // ---- Unsafe-GUC state hash (Option Y — mirrors proxy `src/guc_state.rs`) ----
+    // ---- Unsafe-GUC classification (Option Y — mirrors proxy `src/guc_state.rs`) ----
     //
     // Custom-GUC-driven RLS (`SET app.user_id = '42'; SELECT * FROM accounts;`
-    // where the policy reads `current_setting('app.user_id')`) was a real
+    // where the policy reads `current_setting('app.user_id')`) is a real
     // cache leak: keying purely by SQL+params, user A's cached rows could
-    // be served to user B. Mirroring the proxy commit, the wrapper cache
-    // tracks the same per-connection unsafe-GUC fingerprint and folds it
-    // into the cache key — so a `SET app.user_id = '7'` followed by the
-    // same SELECT can't hit the slot populated for user `42`.
+    // be served to user B. The wrapper folds a per-connection unsafe-GUC
+    // fingerprint into the cache key — see ConnectionGucState for the
+    // per-connection mutable state. NativeCache only owns the
+    // classification rules (the `is_unsafe_guc` short list + namespace
+    // `.` rule) plus the SET/RESET parser primitives, both static.
     //
     // A GUC name is unsafe if it's in this short hardcoded list OR if it
     // contains a `.` (namespaced — `app.*`, `myapp.*`, the canonical
     // custom-RLS pattern). Comparison is case-insensitive.
     //
-    // `SET LOCAL` is intentionally observed-but-ignored: the cache is
-    // gated on transaction-idle, so SET LOCAL effects never influence a
-    // cacheable response. Tracking the parser shape lets tests assert on
-    // it without affecting state.
+    // `SET LOCAL` is observed-but-ignored by ConnectionGucState: the
+    // cache is gated on transaction-idle, so SET LOCAL effects never
+    // influence a cacheable response.
     private const UNSAFE_GUC_SHORT_LIST = [
         'search_path',
         'role',
@@ -64,24 +64,6 @@ class NativeCache
     private array $tableIndex = [];
     private array $accessOrder = [];
     private int $counter = 0;
-    /**
-     * Unsafe-GUC state map: lowercased name → raw value. Only unsafe GUCs
-     * (per UNSAFE_GUC_SHORT_LIST + namespace `.` rule) ever enter the
-     * map; harmless GUCs (timezone, application_name, work_mem, etc.) are
-     * never tracked and never affect the hash.
-     *
-     * @var array<string, string>
-     */
-    private array $gucState = [];
-    /**
-     * Cached hex hash of $gucState, recomputed on every mutation. The
-     * string `"0"` is used for the empty (default) state — matches the
-     * proxy's u64 zero formatted as `{:x}`. Including this in the cache
-     * key means a fresh connection's slot is shared with peer connections
-     * that also haven't set any unsafe GUCs (the `SET app.user_id`-free
-     * majority), which is exactly what we want.
-     */
-    private string $gucStateHash = '0';
     private int $maxEntries;
     private bool $enabled;
     // disable_native_cache: when true the cache acts as a no-op pass-through.
@@ -194,7 +176,7 @@ class NativeCache
 
     // --- Cache operations ---
 
-    public function get(string $sql, ?array $params = null): ?array
+    public function get(string $sql, ?array $params = null, string $stateHash = '0'): ?array
     {
         if (!$this->enabled || !$this->invalidationConnected) {
             return null;
@@ -206,7 +188,7 @@ class NativeCache
             $this->statsMisses++;
             return null;
         }
-        $key = self::makeKey($sql, $params, $this->gucStateHash);
+        $key = self::makeKey($sql, $params, $stateHash);
         if ($key === null) {
             return null;
         }
@@ -220,7 +202,7 @@ class NativeCache
         return null;
     }
 
-    public function put(string $sql, ?array $params, array $rows, ?array $columns): void
+    public function put(string $sql, ?array $params, array $rows, ?array $columns, string $stateHash = '0'): void
     {
         if (!$this->enabled || !$this->invalidationConnected) {
             return;
@@ -228,7 +210,7 @@ class NativeCache
         if ($this->disabled) {
             return;
         }
-        $key = self::makeKey($sql, $params, $this->gucStateHash);
+        $key = self::makeKey($sql, $params, $stateHash);
         if ($key === null) {
             return;
         }
@@ -800,118 +782,10 @@ class NativeCache
         return $v;
     }
 
-    /**
-     * Apply a parsed SET / RESET command to this connection's unsafe-GUC
-     * state. No-op for `set_local` (transient — cache is gated on
-     * transaction-idle), no-op for safe GUC names. Recomputes the cached
-     * state hash on mutation.
-     *
-     * @param array{type: string, name: ?string, value: ?string} $cmd
-     */
-    private function applySetCommand(array $cmd): void
-    {
-        switch ($cmd['type']) {
-            case 'set':
-                if ($cmd['name'] !== null && self::isUnsafeGuc($cmd['name'])) {
-                    $this->gucState[$cmd['name']] = (string) $cmd['value'];
-                    $this->recomputeStateHash();
-                }
-                break;
-            case 'set_local':
-                // Intentionally ignored. SET LOCAL only takes effect inside
-                // a transaction; the proxy's cache is gated on
-                // transaction-idle, so SET LOCAL never influences a
-                // cacheable response.
-                break;
-            case 'reset':
-                if ($cmd['name'] !== null
-                    && self::isUnsafeGuc($cmd['name'])
-                    && array_key_exists($cmd['name'], $this->gucState)
-                ) {
-                    unset($this->gucState[$cmd['name']]);
-                    $this->recomputeStateHash();
-                }
-                break;
-            case 'reset_all':
-                if (!empty($this->gucState)) {
-                    $this->gucState = [];
-                    $this->recomputeStateHash();
-                }
-                break;
-        }
-    }
-
-    /**
-     * Observe a SQL string and apply any SET / RESET commands it contains
-     * to this connection's unsafe-GUC state. Multi-statement bodies are
-     * split on top-level `;` (string-literal-aware) so a single Q like
-     * `SET app.user_id = '42'; SELECT 1` still updates state.
-     *
-     * Returns true if the call mutated the state hash, false otherwise —
-     * convenient for tests; CachedPDO doesn't need the return value.
-     */
-    public function observeSql(string $sql): bool
-    {
-        $before = $this->gucStateHash;
-        // Fast path for the common single-statement case — avoid the
-        // splitter alloc when there's no inner `;`.
-        $tail = rtrim($sql);
-        if (str_ends_with($tail, ';')) {
-            $tail = rtrim(substr($tail, 0, -1));
-        }
-        if (!str_contains($tail, ';')) {
-            $cmd = self::parseSetCommand($sql);
-            if ($cmd !== null) {
-                $this->applySetCommand($cmd);
-            }
-        } else {
-            foreach (self::splitStatements($sql) as $stmt) {
-                $cmd = self::parseSetCommand($stmt);
-                if ($cmd !== null) {
-                    $this->applySetCommand($cmd);
-                }
-            }
-        }
-        return $this->gucStateHash !== $before;
-    }
-
-    /**
-     * Read-only accessor for the current state hash. Hex-encoded
-     * lowercase 64-bit value, or `"0"` for empty state.
-     */
-    public function getStateHash(): string
-    {
-        return $this->gucStateHash;
-    }
-
-    /**
-     * Recompute the hash from $gucState. Sorted-key serialization gives
-     * us insertion-order independence (proxy uses BTreeMap, same
-     * guarantee). xxh64 picked for speed and 64-bit width matching the
-     * proxy's u64; output is lowercase hex with no leading zero so
-     * `"0"` cleanly represents the empty state.
-     */
-    private function recomputeStateHash(): void
-    {
-        if (empty($this->gucState)) {
-            $this->gucStateHash = '0';
-            return;
-        }
-        $sorted = $this->gucState;
-        ksort($sorted);
-        $serialized = '';
-        foreach ($sorted as $k => $v) {
-            $serialized .= $k . "\0" . $v . "\0";
-        }
-        // xxh64: PHP 8.1+, fast non-crypto 64-bit hash. Output is the
-        // raw 16-char lowercase hex digest — populated-state hashes are
-        // therefore always 16 chars long, while the empty-state
-        // sentinel is the 1-char string `"0"`, so they cannot collide
-        // by construction. Matches the proxy's u64 width (state is
-        // formatted into the cache key with `{:x}` on the proxy side,
-        // so values cross-checkable across language boundaries).
-        $this->gucStateHash = hash('xxh64', $serialized);
-    }
+    // Per-connection unsafe-GUC state lives on ConnectionGucState; see
+    // src/ConnectionGucState.php. NativeCache only owns the
+    // classification rules (isUnsafeGuc, parseSetCommand,
+    // splitStatements) above — they're pure functions.
 
     // --- Private helpers ---
 
