@@ -109,12 +109,16 @@ class CachedConnection implements PostgresExecutor
             return $miss();
         }
 
-        if (NativeCache::isTxStart($sql)) {
-            $this->inTransaction = true;
-            return $miss();
-        }
-        if (NativeCache::isTxEnd($sql)) {
-            $this->inTransaction = false;
+        // Transaction tracking. Walks every segment in multi-statement
+        // bodies so a Q like `BEGIN; LISTEN foo; COMMIT` ends with
+        // inTransaction=false — matching the server. Pre-fix, only the
+        // leading BEGIN was seen and the wrapper stayed stuck thinking a
+        // tx was open, bypassing the cache for every subsequent read
+        // until a fresh BEGIN/COMMIT cycle reset state. Single-statement
+        // bodies skip the splitter.
+        $txState = NativeCache::applyTxBoundaries($sql);
+        if ($txState !== null) {
+            $this->inTransaction = $txState;
             return $miss();
         }
 

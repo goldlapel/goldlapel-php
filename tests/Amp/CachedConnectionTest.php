@@ -180,6 +180,102 @@ final class CachedConnectionTest extends TestCase
         $this->assertSame(1, $this->cache->statsHits);
     }
 
+    // --- Bug fix: tx-flag bookkeeping for multi-statement BEGIN/COMMIT ---
+    //
+    // Pre-fix, a single Q like `BEGIN; LISTEN foo; COMMIT` flipped the
+    // wrapper-side inTransaction flag based on the first token only —
+    // server ends out-of-tx, wrapper thinks still in tx. Cache bypass
+    // forever until a fresh BEGIN/COMMIT cycle reset state. The fix
+    // walks every segment via applyTxBoundaries(). Mirrors goldlapel-js
+    // commit 0d19816.
+
+    /**
+     * Reach into the private inTransaction property for assertion. The
+     * class doesn't expose a getter (matches the JS reference's internal
+     * `_inTransaction`), and these regression tests are validating that
+     * internal flag matches the server's view.
+     */
+    private function readInTransaction(CachedConnection $c): bool
+    {
+        $ref = new \ReflectionClass($c);
+        $prop = $ref->getProperty('inTransaction');
+        return $prop->getValue($c);
+    }
+
+    public function testQueryMultiStatementBeginCommitNoWriteEndsOutOfTx(): void
+    {
+        // BEGIN; LISTEN foo; COMMIT — no write detection, must still
+        // walk segments to land on inTransaction=false.
+        $real = $this->createMock(PostgresExecutor::class);
+        $real->method('query')->willReturn($this->makeCommandResult());
+
+        $cached = new CachedConnection($real, $this->cache);
+        $cached->query('BEGIN; LISTEN foo; COMMIT');
+
+        $this->assertFalse($this->readInTransaction($cached));
+    }
+
+    public function testQueryMultiStatementBeginNoCommitStaysInTx(): void
+    {
+        // BEGIN; SELECT 1 — no closing COMMIT, server still in tx.
+        $rows = [['?column?' => 1]];
+
+        $real = $this->createMock(PostgresExecutor::class);
+        $real->method('query')->willReturn($this->makeResult($rows));
+
+        $cached = new CachedConnection($real, $this->cache);
+        $cached->query('BEGIN; SELECT 1');
+
+        $this->assertTrue($this->readInTransaction($cached));
+    }
+
+    public function testQueryMultiStatementBeginRollbackEndsOutOfTx(): void
+    {
+        $real = $this->createMock(PostgresExecutor::class);
+        $real->method('query')->willReturn($this->makeCommandResult());
+
+        $cached = new CachedConnection($real, $this->cache);
+        $cached->query('BEGIN; SELECT 1; ROLLBACK');
+
+        $this->assertFalse($this->readInTransaction($cached));
+    }
+
+    public function testQueryPostMultiStatementCommitStillCaches(): void
+    {
+        // The user-visible regression: pre-fix, a `BEGIN; LISTEN foo;
+        // COMMIT` body left inTransaction stuck at true, so every
+        // subsequent SELECT bypassed the cache forever. Post-fix, the
+        // SELECT after the body must be cacheable.
+        $rows = [['id' => 1]];
+
+        $real = $this->createMock(PostgresExecutor::class);
+        $real->method('query')->willReturnOnConsecutiveCalls(
+            $this->makeCommandResult(),
+            $this->makeResult($rows),
+        );
+
+        $cached = new CachedConnection($real, $this->cache);
+        $cached->query('BEGIN; LISTEN foo; COMMIT');
+        $cached->query('SELECT * FROM orders');
+        $cached->query('SELECT * FROM orders');
+
+        $this->assertSame(1, $this->cache->statsHits);
+        $this->assertFalse($this->readInTransaction($cached));
+    }
+
+    public function testQueryCloseThenReopenEndsInTx(): void
+    {
+        // Walking segments in order: COMMIT closes, then BEGIN reopens —
+        // final state is `in tx`. Guards against last-segment-only impls.
+        $real = $this->createMock(PostgresExecutor::class);
+        $real->method('query')->willReturn($this->makeCommandResult());
+
+        $cached = new CachedConnection($real, $this->cache);
+        $cached->query('COMMIT; BEGIN');
+
+        $this->assertTrue($this->readInTransaction($cached));
+    }
+
     // --- Bug fix: SET / RESET / LISTEN responses no longer cached ---
     //
     // `query("SET …")` returns a PostgresCommandResult whose

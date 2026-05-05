@@ -76,14 +76,16 @@ class CachedPDO extends \PDO
             return $stmt !== false ? new CachedPDOStatement($stmt, $this->cache, $this->gucState, $sql, null, $this->inTransaction) : false;
         }
 
-        // Transaction tracking
-        if (NativeCache::isTxStart($sql)) {
-            $this->inTransaction = true;
-            $stmt = $this->pdo->query($sql, ...$args);
-            return $stmt !== false ? new CachedPDOStatement($stmt, $this->cache, $this->gucState, $sql, null, $this->inTransaction) : false;
-        }
-        if (NativeCache::isTxEnd($sql)) {
-            $this->inTransaction = false;
+        // Transaction tracking. Walks every segment in multi-statement
+        // bodies so a Q like `BEGIN; LISTEN foo; COMMIT` ends with
+        // inTransaction=false — matching the server, which ran the
+        // COMMIT. Pre-fix, only the leading BEGIN was seen and the
+        // wrapper stayed stuck thinking a tx was open, bypassing the
+        // cache for every subsequent read until the next BEGIN/COMMIT
+        // pair reset state. Single-statement bodies skip the splitter.
+        $txState = NativeCache::applyTxBoundaries($sql);
+        if ($txState !== null) {
+            $this->inTransaction = $txState;
             $stmt = $this->pdo->query($sql, ...$args);
             return $stmt !== false ? new CachedPDOStatement($stmt, $this->cache, $this->gucState, $sql, null, $this->inTransaction) : false;
         }
@@ -162,11 +164,13 @@ class CachedPDO extends \PDO
             }
         }
 
-        // Transaction tracking
-        if (NativeCache::isTxStart($sql)) {
-            $this->inTransaction = true;
-        } elseif (NativeCache::isTxEnd($sql)) {
-            $this->inTransaction = false;
+        // Transaction tracking. Walks every segment in multi-statement
+        // bodies so a Q like `BEGIN; LISTEN foo; COMMIT` ends with
+        // inTransaction=false — matching the server. Single-statement
+        // bodies skip the splitter.
+        $txState = NativeCache::applyTxBoundaries($sql);
+        if ($txState !== null) {
+            $this->inTransaction = $txState;
         }
 
         return $this->pdo->exec($sql);

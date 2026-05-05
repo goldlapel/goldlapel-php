@@ -650,6 +650,61 @@ class NativeCache
         return (bool) preg_match(self::TX_END, $sql);
     }
 
+    /**
+     * Multi-statement-aware transaction-boundary classification. A single
+     * Q message like `BEGIN; LISTEN foo; COMMIT` opens AND closes a
+     * transaction server-side, but a first-token check (`isTxStart($sql)`)
+     * only sees `BEGIN` and would leave the wrapper stuck thinking it was
+     * still in a tx — so subsequent reads bypass the cache forever (or
+     * until a fresh BEGIN/COMMIT cycle resets state). The fix walks every
+     * segment and applies the boundary that segment carries, so the
+     * caller's final tx flag matches what the server actually did.
+     *
+     * Returns:
+     *   - true   if the body's final segment-walked tx state is `in tx`
+     *   - false  if the body's final segment-walked tx state is `out of tx`
+     *   - null   if no segment is a tx boundary (caller's state unchanged)
+     *
+     * Single-statement bodies (no inner `;`) skip the splitter — the
+     * existing TX_START / TX_END regex check is sufficient and the hot
+     * path is hot. Mirrors goldlapel-js commit 0d19816.
+     */
+    public static function applyTxBoundaries(string $sql): ?bool
+    {
+        if ($sql === '') {
+            return null;
+        }
+        // Fast path: no inner `;` → single-statement, original first-token check.
+        $tail = rtrim($sql);
+        if (str_ends_with($tail, ';')) {
+            $tail = rtrim(substr($tail, 0, -1));
+        }
+        if (!str_contains($tail, ';')) {
+            if (self::isTxStart($sql)) {
+                return true;
+            }
+            if (self::isTxEnd($sql)) {
+                return false;
+            }
+            return null;
+        }
+        // Multi-statement body: walk segments, track the running tx state.
+        // Final state reflects the last tx-boundary segment in execution
+        // order, mirroring how the server processes the Q message.
+        $touched = false;
+        $state = false;
+        foreach (self::splitStatements($sql) as $seg) {
+            if (self::isTxStart($seg)) {
+                $state = true;
+                $touched = true;
+            } elseif (self::isTxEnd($seg)) {
+                $state = false;
+                $touched = true;
+            }
+        }
+        return $touched ? $state : null;
+    }
+
     // ------------------------------------------------------------------
     // Unsafe-GUC state hash (Option Y — wrapper-side mirror of the proxy)
     // ------------------------------------------------------------------

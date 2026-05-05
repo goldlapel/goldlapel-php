@@ -250,6 +250,84 @@ class NativeCacheTest extends TestCase
         $this->assertFalse(NativeCache::isTxStart('SELECT 1'));
     }
 
+    // --- applyTxBoundaries (multi-statement-aware tx tracking) ---
+    //
+    // Pre-fix, a single Q like `BEGIN; LISTEN foo; COMMIT` flipped the
+    // wrapper-side inTransaction flag based on the first token only —
+    // server ends out-of-tx, wrapper thinks still in tx. Cache bypass
+    // forever until a fresh BEGIN/COMMIT cycle reset state.
+    // applyTxBoundaries walks segments and returns the final tx state,
+    // matching what the server actually did. Mirrors goldlapel-js commit
+    // 0d19816.
+
+    public function testApplyTxBoundariesBeginCommitMultiStatementClosesTx(): void
+    {
+        // BEGIN; INSERT...; COMMIT — server ends out-of-tx, wrapper too.
+        $this->assertFalse(NativeCache::applyTxBoundaries(
+            'BEGIN; INSERT INTO orders VALUES (1); COMMIT'
+        ));
+    }
+
+    public function testApplyTxBoundariesBeginInsertWithoutCommitStaysOpen(): void
+    {
+        // No closing COMMIT — server is still in tx, wrapper too.
+        $this->assertTrue(NativeCache::applyTxBoundaries(
+            'BEGIN; INSERT INTO orders VALUES (1)'
+        ));
+    }
+
+    public function testApplyTxBoundariesStrayCommitWithoutBeginClosesTx(): void
+    {
+        // Just COMMIT — final state is out-of-tx.
+        $this->assertFalse(NativeCache::applyTxBoundaries('COMMIT'));
+    }
+
+    public function testApplyTxBoundariesBeginSelectRollbackClosesTx(): void
+    {
+        $this->assertFalse(NativeCache::applyTxBoundaries(
+            'BEGIN; SELECT 1; ROLLBACK'
+        ));
+    }
+
+    public function testApplyTxBoundariesSavepointNoBoundaryChange(): void
+    {
+        // SAVEPOINT / RELEASE SAVEPOINT are nested markers — they don't
+        // change top-level tx state, so applyTxBoundaries returns null
+        // (caller's flag unchanged). Mirrors JS reference impl.
+        $this->assertNull(NativeCache::applyTxBoundaries(
+            'SAVEPOINT a; SELECT 1; RELEASE SAVEPOINT a'
+        ));
+    }
+
+    public function testApplyTxBoundariesPlainSelectNoChange(): void
+    {
+        $this->assertNull(NativeCache::applyTxBoundaries('SELECT * FROM users'));
+    }
+
+    public function testApplyTxBoundariesCloseThenReopenEndsOpen(): void
+    {
+        // Guards against a last-segment-only impl that would only see
+        // the trailing BEGIN. Walking segments in order: COMMIT closes,
+        // then BEGIN reopens — final state is `in tx`.
+        $this->assertTrue(NativeCache::applyTxBoundaries('COMMIT; BEGIN'));
+    }
+
+    public function testApplyTxBoundariesSingleBeginOpens(): void
+    {
+        // Hot path: single-statement BEGIN.
+        $this->assertTrue(NativeCache::applyTxBoundaries('BEGIN'));
+    }
+
+    public function testApplyTxBoundariesSingleCommitCloses(): void
+    {
+        $this->assertFalse(NativeCache::applyTxBoundaries('COMMIT'));
+    }
+
+    public function testApplyTxBoundariesEmptyReturnsNull(): void
+    {
+        $this->assertNull(NativeCache::applyTxBoundaries(''));
+    }
+
     // --- Cache operations ---
 
     public function testPutAndGet(): void

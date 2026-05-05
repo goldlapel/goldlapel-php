@@ -790,6 +790,98 @@ class CachedPDOTest extends TestCase
         $this->assertSame(0, $this->cache->statsHits);
     }
 
+    // --- Bug fix: tx-flag bookkeeping for multi-statement BEGIN/COMMIT ---
+    //
+    // Pre-fix, a single Q like `BEGIN; LISTEN foo; COMMIT` flipped the
+    // wrapper-side inTransaction flag based on the first token only —
+    // server ends out-of-tx, wrapper thinks still in tx. Cache bypass
+    // forever until a fresh BEGIN/COMMIT cycle reset state. The fix
+    // walks every segment via applyTxBoundaries(). Mirrors goldlapel-js
+    // commit 0d19816.
+
+    public function testQueryMultiStatementBeginCommitNoWriteEndsOutOfTx(): void
+    {
+        // BEGIN; LISTEN foo; COMMIT — no write detection, must still
+        // walk segments to land on inTransaction=false.
+        $pdo = $this->makeMockPDO();
+        $stmt = $this->makeMockStmt([], 0);
+        $pdo->method('query')->willReturn($stmt);
+
+        $cached = new CachedPDO($pdo, $this->cache);
+
+        $cached->query('BEGIN; LISTEN foo; COMMIT');
+
+        $this->assertFalse($cached->inTransaction());
+    }
+
+    public function testQueryMultiStatementBeginNoCommitStaysInTx(): void
+    {
+        // BEGIN; SELECT 1 — no closing COMMIT, server still in tx.
+        $pdo = $this->makeMockPDO();
+        $stmt = $this->makeMockStmt([['?column?' => 1]], 1);
+        $pdo->method('query')->willReturn($stmt);
+
+        $cached = new CachedPDO($pdo, $this->cache);
+
+        $cached->query('BEGIN; SELECT 1');
+
+        $this->assertTrue($cached->inTransaction());
+    }
+
+    public function testQueryMultiStatementBeginRollbackEndsOutOfTx(): void
+    {
+        $pdo = $this->makeMockPDO();
+        $stmt = $this->makeMockStmt([], 0);
+        $pdo->method('query')->willReturn($stmt);
+
+        $cached = new CachedPDO($pdo, $this->cache);
+
+        $cached->query('BEGIN; SELECT 1; ROLLBACK');
+
+        $this->assertFalse($cached->inTransaction());
+    }
+
+    public function testQueryPostMultiStatementCommitStillCaches(): void
+    {
+        // The user-visible regression: pre-fix, a `BEGIN; LISTEN foo;
+        // COMMIT` body left inTransaction stuck at true, so every
+        // subsequent SELECT bypassed the cache forever. Post-fix, the
+        // SELECT after the body must be cacheable.
+        $rows = [['id' => 1]];
+
+        $pdo = $this->makeMockPDO();
+        $beginCommit = $this->makeMockStmt([], 0);
+        $selectStmt = $this->makeMockStmt($rows, 1);
+
+        // SELECT only ever hits the real client once — second call hits cache.
+        $pdo->method('query')->willReturnOnConsecutiveCalls(
+            $beginCommit,
+            $selectStmt,
+        );
+
+        $cached = new CachedPDO($pdo, $this->cache);
+
+        $cached->query('BEGIN; LISTEN foo; COMMIT');
+        $cached->query('SELECT * FROM orders');
+        $cached->query('SELECT * FROM orders');
+
+        $this->assertSame(1, $this->cache->statsHits);
+        $this->assertFalse($cached->inTransaction());
+    }
+
+    public function testExecMultiStatementBeginCommitEndsOutOfTx(): void
+    {
+        // Same fix on the exec() path.
+        $pdo = $this->makeMockPDO();
+        $pdo->method('exec')->willReturn(0);
+
+        $cached = new CachedPDO($pdo, $this->cache);
+
+        $cached->exec('BEGIN; LISTEN foo; COMMIT');
+
+        $this->assertFalse($cached->inTransaction());
+    }
+
     // --- Bug fix: SET / RESET / LISTEN responses no longer cached ---
     //
     // PDO::query("SET app.user_id = '7'") returns a PDOStatement whose
