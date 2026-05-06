@@ -36,6 +36,15 @@ class NativeCache
     // `SET LOCAL` is observed-but-ignored by ConnectionGucState: the
     // cache is gated on transaction-idle, so SET LOCAL effects never
     // influence a cacheable response.
+    // Expanded 2026-05-05: locale + formatting GUCs that can plausibly
+    // change query output shape (DateStyle/IntervalStyle change the text
+    // representation of timestamps; TimeZone shifts wall-clock conversions
+    // for `now()`, `current_timestamp`, etc.; bytea_output changes the
+    // text rendering of bytea columns; lc_* affect locale-sensitive
+    // collation / monetary / numeric formatting). None of these are
+    // common RLS pivots, but they're cheap to track and correctly avoid
+    // serving cached rows whose textual representation no longer matches
+    // the caller's session expectations.
     private const UNSAFE_GUC_SHORT_LIST = [
         'search_path',
         'role',
@@ -44,6 +53,14 @@ class NativeCache
         'default_transaction_read_only',
         'transaction_isolation',
         'row_security',
+        'datestyle',
+        'intervalstyle',
+        'timezone',
+        'bytea_output',
+        'lc_messages',
+        'lc_monetary',
+        'lc_numeric',
+        'lc_time',
     ];
 
     // --- Native-cache telemetry tuning ---

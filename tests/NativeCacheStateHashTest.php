@@ -89,12 +89,34 @@ class NativeCacheStateHashTest extends TestCase
 
     public function testSafeGucsAreSafe(): void
     {
-        $this->assertFalse(NativeCache::isUnsafeGuc('timezone'));
+        // application_name / statement_timeout / work_mem / client_encoding
+        // never affect query result content — pure operational tuning
+        // knobs. Safe to share cache slots across mutations.
         $this->assertFalse(NativeCache::isUnsafeGuc('application_name'));
         $this->assertFalse(NativeCache::isUnsafeGuc('statement_timeout'));
         $this->assertFalse(NativeCache::isUnsafeGuc('work_mem'));
         $this->assertFalse(NativeCache::isUnsafeGuc('client_encoding'));
-        $this->assertFalse(NativeCache::isUnsafeGuc('DateStyle'));
+    }
+
+    public function testFormattingGucsAreUnsafe(): void
+    {
+        // 2026-05-05 expansion: locale + textual-formatting GUCs that can
+        // change query output shape (datestyle / intervalstyle change
+        // timestamp text rep, timezone shifts wall-clock conversions,
+        // bytea_output changes bytea text encoding, lc_* affect locale-
+        // sensitive collation / monetary / numeric formatting). All
+        // case-insensitive.
+        $this->assertTrue(NativeCache::isUnsafeGuc('DateStyle'));
+        $this->assertTrue(NativeCache::isUnsafeGuc('datestyle'));
+        $this->assertTrue(NativeCache::isUnsafeGuc('IntervalStyle'));
+        $this->assertTrue(NativeCache::isUnsafeGuc('TimeZone'));
+        $this->assertTrue(NativeCache::isUnsafeGuc('timezone'));
+        $this->assertTrue(NativeCache::isUnsafeGuc('bytea_output'));
+        $this->assertTrue(NativeCache::isUnsafeGuc('Bytea_Output'));
+        $this->assertTrue(NativeCache::isUnsafeGuc('lc_messages'));
+        $this->assertTrue(NativeCache::isUnsafeGuc('lc_monetary'));
+        $this->assertTrue(NativeCache::isUnsafeGuc('lc_numeric'));
+        $this->assertTrue(NativeCache::isUnsafeGuc('lc_time'));
     }
 
     // ─── parse_set_command ───────────────────────────────────────────────
@@ -201,9 +223,15 @@ class NativeCacheStateHashTest extends TestCase
 
     public function testParseRejectsSetTimeZone(): void
     {
-        // SET TIME ZONE is harmless (timezone is a safe GUC) and the
-        // two-word GUC name doesn't fit our pattern. Returning null is
-        // correct because it doesn't affect cache safety.
+        // `SET TIME ZONE 'UTC'` is the unusual two-word GUC name shape
+        // PG accepts as an alias for `SET timezone = 'UTC'`. We don't
+        // bother decomposing the multi-token name in the parser — the
+        // far more common `SET timezone = 'UTC'` shape is already
+        // recognised by the regular SET branch. Worst case for the
+        // two-word form: a TIME ZONE change isn't reflected in the
+        // wrapper's state hash; the proxy still has its own fingerprint
+        // that catches it on the wire. Filed as a known limitation;
+        // returning null here is intentional, not a leak.
         $this->assertNull(NativeCache::parseSetCommand("SET TIME ZONE 'UTC'"));
     }
 
@@ -438,7 +466,7 @@ class NativeCacheStateHashTest extends TestCase
 
     public function testCacheSlotSharedAcrossSafeGucMutation(): void
     {
-        // Safe GUCs (timezone, application_name, statement_timeout, …)
+        // Safe GUCs (application_name, statement_timeout, work_mem, …)
         // never enter the state map.
         $cache = $this->makeCache();
         $state = $this->makeState();
