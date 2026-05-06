@@ -90,6 +90,13 @@ class GoldLapel
     private bool $disableMatviews;
     private bool $disableSqloptimize;
     private bool $disableAutoIndexes;
+    /**
+     * Aggressive-verify mode. One of `'auto'` (default — smart-auto-
+     * enable based on a pg_trigger probe), `'on'` (always run post-DML
+     * verify), or `'off'` (never run it). See AggressiveVerify for the
+     * full decision precedence (override > license payload > auto).
+     */
+    private string $aggressiveVerify;
     private array $config;
     private array $extraArgs;
     /** @var resource|null */
@@ -167,6 +174,7 @@ class GoldLapel
      *   disable_matviews?: bool,
      *   disable_sqloptimize?: bool,
      *   disable_auto_indexes?: bool,
+     *   aggressive_verify?: string,
      * } $options
      */
     public function __construct(string $upstream, array $options = [])
@@ -224,6 +232,30 @@ class GoldLapel
         // and surfaces on the native-cache telemetry snapshot as
         // `disabled: true`.
         $this->disableNativeCache = !empty($options['disable_native_cache']);
+        // Aggressive verify (post-DML verify pass for trigger-internal
+        // SET coverage). 'auto' is the default — runs a one-time
+        // pg_trigger probe on first wrap and enables only if a trigger
+        // body is found that contains a SET on a namespaced GUC (the
+        // RLS-typical shape). 'on' / 'off' are explicit overrides.
+        // Validate eagerly so a misspelled value raises before spawn,
+        // not silently at first DML.
+        $aggressiveVerifyRaw = $options['aggressive_verify'] ?? AggressiveVerify::MODE_AUTO;
+        if (!is_string($aggressiveVerifyRaw)) {
+            throw new \InvalidArgumentException(
+                "aggressive_verify must be a string ('auto', 'on', 'off')"
+            );
+        }
+        $aggressiveVerifyNormalized = strtolower($aggressiveVerifyRaw);
+        if (!in_array(
+            $aggressiveVerifyNormalized,
+            [AggressiveVerify::MODE_AUTO, AggressiveVerify::MODE_ON, AggressiveVerify::MODE_OFF],
+            true,
+        )) {
+            throw new \InvalidArgumentException(
+                "aggressive_verify must be one of: auto, on, off (got '{$aggressiveVerifyRaw}')"
+            );
+        }
+        $this->aggressiveVerify = $aggressiveVerifyNormalized;
 
         // Nested namespaces — see src/Documents.php, src/Streams.php, plus
         // the Phase 5 Redis-compat families under src/{Counters,Zsets,
@@ -261,6 +293,7 @@ class GoldLapel
      *   - 'disable_matviews' (bool): emit `--disable-matviews`. Skip materialized-view rewrites.
      *   - 'disable_sqloptimize' (bool): emit `--disable-sqloptimize`. Master kill-switch for query rewriting + coalescing.
      *   - 'disable_auto_indexes' (bool): emit `--disable-auto-indexes`. Master kill-switch for automatic index creation.
+     *   - 'aggressive_verify' (string): one of 'auto' (default), 'on', 'off'. Controls whether the wrapper runs a post-DML verify pass to close the trigger-internal-SET coverage gap. 'auto' enables it only when a one-time pg_trigger probe finds a trigger body that mutates session state (the RLS-typical shape). 'on' forces it on (~1ms tax per write); 'off' disables both detection and the probe. The proxy may also override this via the license payload (`GOLDLAPEL_AGGRESSIVE_VERIFY_ACTIVE` env var) — explicit 'on'/'off' here wins over the payload.
      *
      * Promoted top-level concepts (proxy_port, dashboard_port, etc.) are NOT
      * valid keys inside `config` — passing them there raises at construction
@@ -887,7 +920,18 @@ class GoldLapel
                 : $this->proxyPort + 2;
         }
 
-        return self::wrapPDOStatic($pdo, $invalidationPort, $this->disableNativeCache);
+        // Use the upstream URL as the detection cache key so multiple
+        // wrapPDO() calls against the same database in the same process
+        // share a single detection result. Falls back to per-PDO when
+        // upstream is unset (low-level use).
+        $cacheKey = 'upstream:' . $this->upstream;
+        return self::wrapPDOStatic(
+            $pdo,
+            $invalidationPort,
+            $this->disableNativeCache,
+            $this->aggressiveVerify,
+            $cacheKey,
+        );
     }
 
     /**
@@ -904,8 +948,13 @@ class GoldLapel
      * disable_native_cache=true path always wins over a passive Laravel
      * wrap that follows it.
      */
-    public static function wrapPDOStatic(\PDO $pdo, int $invalidationPort, ?bool $disableNativeCache = null): CachedPDO
-    {
+    public static function wrapPDOStatic(
+        \PDO $pdo,
+        int $invalidationPort,
+        ?bool $disableNativeCache = null,
+        string $aggressiveVerify = AggressiveVerify::MODE_AUTO,
+        ?string $detectionCacheKey = null,
+    ): CachedPDO {
         $cache = NativeCache::getInstance();
         if ($disableNativeCache !== null) {
             $cache->setDisabled($disableNativeCache);
@@ -914,7 +963,7 @@ class GoldLapel
             $cache->connectInvalidation($invalidationPort);
         }
 
-        return new CachedPDO($pdo, $cache);
+        return new CachedPDO($pdo, $cache, $aggressiveVerify, $detectionCacheKey);
     }
 
     /**

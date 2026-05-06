@@ -4,6 +4,7 @@ namespace GoldLapel\Amp;
 
 use Amp\Postgres\PostgresExecutor;
 use Amp\Postgres\PostgresResult;
+use GoldLapel\AggressiveVerify;
 use GoldLapel\ConnectionGucState;
 use GoldLapel\NativeCache;
 
@@ -52,11 +53,29 @@ class CachedConnection implements PostgresExecutor
      */
     private ?array $txGucSnapshot = null;
 
+    /**
+     * Aggressive-verify mode + lazy-resolved decision. See AggressiveVerify
+     * for the design; mirrors the sync CachedPDO fields exactly.
+     */
+    private string $aggressiveVerifyMode;
+    private string $detectionCacheKey;
+    private ?bool $aggressiveVerifyActive = null;
+
+    /**
+     * Aggressive-verify default mirrors the sync CachedPDO: raw
+     * constructor defaults to `'off'`; the factory path (GoldLapel\Amp\
+     * GoldLapel::wrapCached) supplies `'auto'`.
+     */
     public function __construct(
         private PostgresExecutor $real,
         private NativeCache $cache,
+        string $aggressiveVerifyMode = AggressiveVerify::MODE_OFF,
+        ?string $detectionCacheKey = null,
     ) {
         $this->gucState = new ConnectionGucState();
+        $this->aggressiveVerifyMode = $aggressiveVerifyMode;
+        $this->detectionCacheKey = $detectionCacheKey
+            ?? 'amp:' . spl_object_hash($real);
     }
 
     public function getWrappedExecutor(): PostgresExecutor
@@ -135,14 +154,91 @@ class CachedConnection implements PostgresExecutor
         if (!NativeCache::isTopLevelFunctionCall($sql)) {
             return;
         }
-        // Capture the connection + state by reference — the inner
-        // closure runs on a sibling coroutine that may outlive the
-        // calling fiber's frame. ForbidCloning on this class is
-        // enforced by the trait, so the closure can't accidentally
-        // resurrect a duplicate.
+        $this->scheduleVerifyProbe();
+    }
+
+    /**
+     * Async sibling of CachedPDO::postWriteVerify — schedules an
+     * aggressive-verify probe in a sibling coroutine after a DML write,
+     * closing the trigger-internal-SET coverage gap. Returns immediately;
+     * the verify yields a step in the event loop while the proxy round-
+     * trips. On failure marks dirty; never propagates to the user's
+     * response (already captured before this fires).
+     *
+     * Only fires when aggressive verify is active for this connection.
+     * See AggressiveVerify for the decision precedence.
+     */
+    public function postWriteVerifyAsync(string $sql): void
+    {
+        if (!$this->resolveAggressiveVerifyActive()) {
+            return;
+        }
+        $this->scheduleVerifyProbe();
+    }
+
+    /**
+     * Public accessor for the resolved aggressive-verify decision.
+     * Mirrors CachedPDO::isAggressiveVerifyActive(); detection runs
+     * lazily on first call (sync probe inside the calling fiber, since
+     * the decision is needed before scheduling further async work).
+     */
+    public function isAggressiveVerifyActive(): bool
+    {
+        return $this->resolveAggressiveVerifyActive();
+    }
+
+    /**
+     * Lazy resolver — runs once per CachedConnection. Detection probe
+     * (when needed) runs synchronously in the calling fiber via the
+     * Amp\Postgres executor; cached statically by AggressiveVerify on
+     * the supplied cache key.
+     */
+    private function resolveAggressiveVerifyActive(): bool
+    {
+        if ($this->aggressiveVerifyActive !== null) {
+            return $this->aggressiveVerifyActive;
+        }
+        $real = $this->real;
+        $detector = static function () use ($real): bool {
+            $result = $real->query(AggressiveVerify::DETECTION_SQL);
+            foreach ($result as $row) {
+                $val = $row['present'] ?? null;
+                if (is_bool($val)) {
+                    return $val;
+                }
+                if (is_int($val)) {
+                    return $val !== 0;
+                }
+                if (is_string($val)) {
+                    $lower = strtolower($val);
+                    return in_array($lower, ['t', 'true', '1', 'yes', 'on'], true);
+                }
+                return false;
+            }
+            return false;
+        };
+        $this->aggressiveVerifyActive = AggressiveVerify::decide(
+            $this->aggressiveVerifyMode,
+            $this->detectionCacheKey,
+            $detector,
+        );
+        return $this->aggressiveVerifyActive;
+    }
+
+    /**
+     * Shared async-verify body — fires the pg_settings probe in a
+     * sibling coroutine via Amp\async(). Used by both
+     * postCallVerifyAsync (top-level function-call shape) and
+     * postWriteVerifyAsync (aggressive mode, after every DML). The
+     * coroutine captures $real / $state by value — ForbidCloning on the
+     * trait means the closure can't accidentally resurrect a duplicate
+     * connection.
+     */
+    private function scheduleVerifyProbe(): void
+    {
         $real = $this->real;
         $state = $this->gucState;
-        \Amp\async(static function () use ($real, $state, $sql) {
+        \Amp\async(static function () use ($real, $state) {
             try {
                 $result = $real->query(
                     "SELECT name, setting FROM pg_settings WHERE source='session'"
@@ -246,6 +342,15 @@ class CachedConnection implements PostgresExecutor
                 $this->inTransaction = false;
             } elseif ($finalTx === true) {
                 $this->inTransaction = true;
+            }
+            // Aggressive verify (smart-auto-enable, opt-out): close the
+            // trigger-internal-SET coverage gap. Skipped inside a tx
+            // (verify-on-checkout fires after COMMIT) and for pure DDL
+            // (we already invalidate everything; the next read does a
+            // verify-on-checkout if dirty). Returns immediately —
+            // verify runs in a sibling coroutine.
+            if (!$this->inTransaction && $writeTables !== NativeCache::DDL_SENTINEL) {
+                $this->postWriteVerifyAsync($sql);
             }
             // Schedule async post-call verify if this write was actually
             // a top-level function call. Returns immediately; verify runs

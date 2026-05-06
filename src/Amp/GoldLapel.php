@@ -6,6 +6,7 @@ use Amp\Future;
 use Amp\Postgres\PostgresConfig;
 use Amp\Postgres\PostgresConnection;
 use Amp\Postgres\PostgresExecutor;
+use GoldLapel\AggressiveVerify;
 use GoldLapel\GoldLapel as SyncGoldLapel;
 use Revolt\EventLoop\FiberLocal;
 use RuntimeException;
@@ -67,6 +68,12 @@ class GoldLapel
     private ?string $client;
     private ?string $configFile;
     private bool $silent;
+    /**
+     * Aggressive-verify mode — `'auto'` (default), `'on'`, `'off'`. See
+     * GoldLapel\AggressiveVerify and the sync GoldLapel docstring for
+     * the full design.
+     */
+    private string $aggressiveVerify;
     private array $config;
     private array $extraArgs;
 
@@ -155,6 +162,27 @@ class GoldLapel
         $this->config = $options['config'] ?? [];
         $this->extraArgs = $options['extra_args'] ?? [];
         $this->silent = !empty($options['silent']);
+        // Aggressive verify (smart-auto-enable, opt-out): see the sync
+        // GoldLapel constructor for the full rationale. Eager validation
+        // here so a misspelled value raises before spawn rather than
+        // silently at first DML inside a fiber.
+        $aggressiveVerifyRaw = $options['aggressive_verify'] ?? AggressiveVerify::MODE_AUTO;
+        if (!is_string($aggressiveVerifyRaw)) {
+            throw new \InvalidArgumentException(
+                "aggressive_verify must be a string ('auto', 'on', 'off')"
+            );
+        }
+        $aggressiveVerifyNormalized = strtolower($aggressiveVerifyRaw);
+        if (!in_array(
+            $aggressiveVerifyNormalized,
+            [AggressiveVerify::MODE_AUTO, AggressiveVerify::MODE_ON, AggressiveVerify::MODE_OFF],
+            true,
+        )) {
+            throw new \InvalidArgumentException(
+                "aggressive_verify must be one of: auto, on, off (got '{$aggressiveVerifyRaw}')"
+            );
+        }
+        $this->aggressiveVerify = $aggressiveVerifyNormalized;
         // Leave structured-config validation to SyncGoldLapel::configToArgs()
         // at spawn time — same contract as the sync wrapper pre-rollout.
         $this->scopedConn = new FiberLocal(static fn () => null);
@@ -581,7 +609,12 @@ class GoldLapel
         if (!$cache->isConnected()) {
             $cache->connectInvalidation($invalidationPort);
         }
-        return new CachedConnection($conn, $cache);
+        // Use the upstream URL as the detection cache key so all fibers
+        // wrapping the same database share a single detection result —
+        // the trigger inventory is database-scoped, not connection-
+        // scoped.
+        $cacheKey = 'upstream:' . $this->upstream;
+        return new CachedConnection($conn, $cache, $this->aggressiveVerify, $cacheKey);
     }
 
     /**

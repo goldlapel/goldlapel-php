@@ -15,15 +15,56 @@ class CachedPDO extends \PDO
     private ConnectionGucState $gucState;
     private bool $inTransaction = false;
 
+    /**
+     * User's aggressive-verify mode — `'auto'` (default), `'on'`, `'off'`.
+     * Drives whether postWriteVerify() runs after every DML statement to
+     * close the trigger-internal-SET coverage gap (see AggressiveVerify
+     * for the design rationale).
+     */
+    private string $aggressiveVerifyMode;
+
+    /**
+     * Stable identity used to key the static detection cache. Defaults
+     * to AggressiveVerify::defaultCacheKey($pdo) when the constructor's
+     * caller doesn't supply one — works correctly for the common case
+     * (one PDO per database) at the cost of re-probing if the same
+     * database is connected to via two PDO instances. Callers that hold
+     * the original DSN (the GoldLapel factory) pass a stable key so the
+     * detection runs once per (database, process).
+     */
+    private string $detectionCacheKey;
+
+    /**
+     * Lazy-resolved decision: true = run postWriteVerify after DML;
+     * false = skip; null = not yet decided. Resolved on the first
+     * statement that would benefit from a verify, so a CachedPDO that
+     * never sees a write never pays the detection probe.
+     */
+    private ?bool $aggressiveVerifyActive = null;
+
     // Extends PDO so instanceof checks and type hints work.
     // We intentionally skip parent::__construct() to avoid opening a
     // second connection — all calls delegate to the wrapped $pdo.
-    public function __construct(\PDO $pdo, NativeCache $cache)
-    {
+    //
+    // The aggressive-verify default is `'off'` on the raw constructor —
+    // calling code that builds a CachedPDO outside the GoldLapel factory
+    // is opting into the wrapper at a low level and should opt in
+    // explicitly if they want the post-DML verify pass. The factory
+    // path (GoldLapel::wrapPDO / GoldLapel::cached) defaults to `'auto'`
+    // and is the documented entry point for end-users.
+    public function __construct(
+        \PDO $pdo,
+        NativeCache $cache,
+        string $aggressiveVerifyMode = AggressiveVerify::MODE_OFF,
+        ?string $detectionCacheKey = null,
+    ) {
         // Do NOT call parent::__construct() — we delegate to $pdo instead.
         $this->pdo = $pdo;
         $this->cache = $cache;
         $this->gucState = new ConnectionGucState();
+        $this->aggressiveVerifyMode = $aggressiveVerifyMode;
+        $this->detectionCacheKey = $detectionCacheKey
+            ?? AggressiveVerify::defaultCacheKey($pdo);
     }
 
     public function getWrappedPDO(): \PDO
@@ -131,6 +172,73 @@ class CachedPDO extends \PDO
         if (!NativeCache::isTopLevelFunctionCall($sql)) {
             return;
         }
+        $this->runVerifyProbe();
+    }
+
+    /**
+     * Aggressive-verify variant: run the verify-on-checkout probe
+     * unconditionally after a DML write, closing the trigger-internal-
+     * SET coverage gap. Sync PHP has no off-thread path — verify runs
+     * inline; tax is ~1 round-trip (~1ms in-cluster) per write. Async
+     * Amp\CachedConnection schedules via `Amp\async()` instead.
+     *
+     * Only runs when aggressive verify is active for this connection.
+     * The decision is resolved lazily via AggressiveVerify::decide() —
+     * see resolveAggressiveVerifyActive() for the precedence rules
+     * (override > license payload > auto-detection).
+     *
+     * Same dirty-on-failure semantics as postCallVerify: the user's
+     * write has already been issued, so we never propagate; failure
+     * just marks dirty so the next acquire retries.
+     */
+    public function postWriteVerify(string $sql): void
+    {
+        if (!$this->resolveAggressiveVerifyActive()) {
+            return;
+        }
+        $this->runVerifyProbe();
+    }
+
+    /**
+     * Public accessor for the resolved aggressive-verify decision.
+     * Triggers detection on first call; subsequent calls return the
+     * cached result. Exposed for tests + diagnostics — production code
+     * paths reach it indirectly via postWriteVerify().
+     */
+    public function isAggressiveVerifyActive(): bool
+    {
+        return $this->resolveAggressiveVerifyActive();
+    }
+
+    /**
+     * Lazy resolver — runs once per CachedPDO. Delegates to
+     * AggressiveVerify::decide() with a PDO-backed detector. The
+     * detection probe (when needed) hits pg_trigger / pg_proc via the
+     * wrapped PDO; result is cached statically by AggressiveVerify on
+     * the supplied cache key.
+     */
+    private function resolveAggressiveVerifyActive(): bool
+    {
+        if ($this->aggressiveVerifyActive !== null) {
+            return $this->aggressiveVerifyActive;
+        }
+        $this->aggressiveVerifyActive = AggressiveVerify::decide(
+            $this->aggressiveVerifyMode,
+            $this->detectionCacheKey,
+            AggressiveVerify::pdoDetector($this->pdo),
+        );
+        return $this->aggressiveVerifyActive;
+    }
+
+    /**
+     * Shared verify body — issues the pg_settings probe, applies the
+     * result, marks dirty on failure. Used by both postCallVerify (top-
+     * level function-call shape) and postWriteVerify (aggressive mode,
+     * after every DML). Centralized so the dirty-on-failure semantics
+     * stay identical across both call sites.
+     */
+    private function runVerifyProbe(): void
+    {
         try {
             $stmt = $this->pdo->query(
                 "SELECT name, setting FROM pg_settings WHERE source='session'"
@@ -331,6 +439,17 @@ class CachedPDO extends \PDO
                 $this->inTransaction = false;
             } elseif ($finalTx === true) {
                 $this->inTransaction = true;
+            }
+            // Aggressive verify (smart-auto-enable, opt-out): close the
+            // trigger-internal-SET coverage gap by probing pg_settings
+            // after every DML. Skipped inside a tx (cache is bypassed
+            // and any non-LOCAL SET issued by the trigger will be
+            // visible at COMMIT — the next acquire's verify-on-checkout
+            // catches it). The function-call branch below stays for
+            // top-level `SELECT my_func()` shapes that detectWritesMulti
+            // doesn't classify as writes.
+            if (!$this->inTransaction && $writeTables !== NativeCache::DDL_SENTINEL) {
+                $this->postWriteVerify($sql);
             }
             $this->postCallVerify($sql);
             return new CachedPDOStatement($stmt, $this->cache, $this->gucState, $sql, null, $this->inTransaction, $this);
@@ -581,6 +700,15 @@ class CachedPDO extends \PDO
         // (`SELECT my_handler()` issued via exec). Skip inside a tx —
         // see CachedPDO::query() for the rationale.
         if (!$this->inTransaction && $result !== false) {
+            // Aggressive verify (smart-auto-enable): close the trigger-
+            // internal-SET gap by probing after every DML. Mirrors the
+            // same gating as query()'s write branch — skipped inside a
+            // tx (verify-on-checkout fires after COMMIT) and for pure
+            // DDL (we already invalidate everything; the next read does
+            // a verify-on-checkout if dirty).
+            if ($writeTables !== null && $writeTables !== NativeCache::DDL_SENTINEL) {
+                $this->postWriteVerify($sql);
+            }
             $this->postCallVerify($sql);
         } elseif ($result === false && NativeCache::isTopLevelFunctionCall($sql)) {
             $this->gucState->markDirty();
@@ -791,6 +919,15 @@ class CachedPDOStatement extends \PDOStatement
                 }
             }
             $r = $this->runRealExecuteWithRecovery($params, $preSnapshot);
+            // Aggressive verify on the prepare/execute write path: if
+            // the parent CachedPDO has aggressive verify enabled, run
+            // postWriteVerify after a successful DML. Skipped for pure
+            // DDL (parity with query()'s write branch) and when there's
+            // no parent (statement built via fromCache(), but we'd
+            // never reach this branch from a cached statement anyway).
+            if ($r && $writeTables !== NativeCache::DDL_SENTINEL && !($this->inTransaction)() && $this->parent !== null) {
+                $this->parent->postWriteVerify($this->sql);
+            }
             $this->maybePostCallVerify($r);
             return $r;
         }
