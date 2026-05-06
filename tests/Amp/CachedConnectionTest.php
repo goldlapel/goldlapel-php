@@ -318,4 +318,142 @@ final class CachedConnectionTest extends TestCase
 
         $this->assertSame(0, $this->cache->size());
     }
+
+    // ─── 2026-05-05 RLS hardening: dirty / verify on the async path ────
+
+    public function testVerifyIfDirtyOnCleanIsNoop(): void
+    {
+        // A clean connection's verifyIfDirty() returns false without
+        // touching the underlying executor.
+        $real = $this->createMock(PostgresExecutor::class);
+        $real->expects($this->never())->method('query');
+        $cached = new CachedConnection($real, $this->cache);
+        $this->assertFalse($cached->verifyIfDirty());
+    }
+
+    public function testVerifyIfDirtyRebuildsStateFromPgSettings(): void
+    {
+        // Mark dirty, call verifyIfDirty, expect the executor to receive
+        // the pg_settings query and the resulting rows to feed into
+        // ConnectionGucState.
+        $verifyResult = $this->makeResult([
+            ['name' => 'app.user_id', 'setting' => '7'],
+            ['name' => 'work_mem', 'setting' => '4MB'], // safe — filtered
+        ]);
+        $real = $this->createMock(PostgresExecutor::class);
+        $real->expects($this->once())
+            ->method('query')
+            ->with($this->stringContains('pg_settings'))
+            ->willReturn($verifyResult);
+
+        $cached = new CachedConnection($real, $this->cache);
+        $cached->markStateDirty();
+        $this->assertTrue($cached->getGucState()->isDirty());
+        $ok = $cached->verifyIfDirty();
+        $this->assertTrue($ok);
+        $this->assertFalse($cached->getGucState()->isDirty());
+        // State should match what an in-band SET would have produced.
+        $other = new \GoldLapel\ConnectionGucState();
+        $other->observeSql("SET app.user_id = '7'");
+        $this->assertSame($other->stateHash(), $cached->getGucState()->stateHash());
+    }
+
+    public function testVerifyIfDirtyKeepsDirtyOnExecutorFailure(): void
+    {
+        $real = $this->createMock(PostgresExecutor::class);
+        $real->expects($this->once())
+            ->method('query')
+            ->willThrowException(new \RuntimeException('bad'));
+
+        $cached = new CachedConnection($real, $this->cache);
+        $cached->markStateDirty();
+        $ok = $cached->verifyIfDirty();
+        $this->assertFalse($ok);
+        $this->assertTrue($cached->getGucState()->isDirty());
+    }
+
+    public function testQueryRunsVerifyIfDirtyBeforeUserQuery(): void
+    {
+        // Dirty connection: query() should fire the verify pass first,
+        // then the user's read.
+        $verifyResult = $this->makeResult([
+            ['name' => 'app.user_id', 'setting' => 'A'],
+        ]);
+        $userResult = $this->makeResult([['id' => 1]]);
+
+        $real = $this->createMock(PostgresExecutor::class);
+        $matcher = $this->exactly(2);
+        $real->expects($matcher)
+            ->method('query')
+            ->willReturnCallback(function (string $sql) use ($matcher, $verifyResult, $userResult) {
+                if ($matcher->numberOfInvocations() === 1) {
+                    $this->assertStringContainsString('pg_settings', $sql);
+                    return $verifyResult;
+                }
+                $this->assertSame('SELECT 1', $sql);
+                return $userResult;
+            });
+
+        $cached = new CachedConnection($real, $this->cache);
+        $cached->markStateDirty();
+        $cached->query('SELECT 1');
+
+        $other = new \GoldLapel\ConnectionGucState();
+        $other->observeSql("SET app.user_id = 'A'");
+        $this->assertSame($other->stateHash(), $cached->getGucState()->stateHash());
+    }
+
+    public function testDiscardAllClearsStateInAsyncPath(): void
+    {
+        // DISCARD ALL on the async wrapper clears state map AND drops
+        // the dirty flag (mirrors the sync test).
+        $real = $this->createMock(PostgresExecutor::class);
+        $real->method('query')->willReturnCallback(fn() => $this->makeCommandResult());
+
+        $cached = new CachedConnection($real, $this->cache);
+        $cached->query("SET app.user_id = '42'");
+        $this->assertNotSame('0', $cached->getGucState()->stateHash());
+
+        $cached->markStateDirty();
+        $this->assertTrue($cached->getGucState()->isDirty());
+
+        $cached->query('DISCARD ALL');
+        $this->assertSame('0', $cached->getGucState()->stateHash());
+        $this->assertFalse($cached->getGucState()->isDirty());
+    }
+
+    public function testSetConfigCallMutatesAsyncState(): void
+    {
+        $real = $this->createMock(PostgresExecutor::class);
+        $real->method('query')->willReturnCallback(fn() => $this->makeCommandResult());
+
+        $cached = new CachedConnection($real, $this->cache);
+        $cached->query("SELECT set_config('app.user_id', '99', false)");
+
+        $other = new \GoldLapel\ConnectionGucState();
+        $other->observeSql("SET app.user_id = '99'");
+        $this->assertSame($other->stateHash(), $cached->getGucState()->stateHash());
+    }
+
+    public function testSetConfigLocalDoesNotMutateAsyncState(): void
+    {
+        $real = $this->createMock(PostgresExecutor::class);
+        $real->method('query')->willReturnCallback(fn() => $this->makeCommandResult());
+
+        $cached = new CachedConnection($real, $this->cache);
+        $cached->query("SELECT set_config('app.user_id', '99', true)");
+
+        $this->assertSame('0', $cached->getGucState()->stateHash());
+    }
+
+    public function testFormattingGucMutatesAsyncState(): void
+    {
+        // 2026-05-05 classifier expansion: SET timezone now mutates state.
+        $real = $this->createMock(PostgresExecutor::class);
+        $real->method('query')->willReturnCallback(fn() => $this->makeCommandResult());
+
+        $cached = new CachedConnection($real, $this->cache);
+        $cached->query("SET timezone = 'UTC'");
+        $this->assertNotSame('0', $cached->getGucState()->stateHash());
+    }
 }

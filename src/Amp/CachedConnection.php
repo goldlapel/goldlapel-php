@@ -71,16 +71,100 @@ class CachedConnection implements PostgresExecutor
     }
 
     /**
+     * Run a server-side verify pass if (and only if) the connection is
+     * marked dirty. Async sibling of CachedPDO::verifyIfDirty() — runs
+     * inline on the current fiber; the caller is already in a fiber so
+     * the verify just yields a step in the event loop while the proxy
+     * round-trips. Idempotent and silent on failure (next acquire
+     * retries).
+     */
+    public function verifyIfDirty(): bool
+    {
+        if (!$this->gucState->isDirty()) {
+            return false;
+        }
+        try {
+            $result = $this->real->query(
+                "SELECT name, setting FROM pg_settings WHERE source='session'"
+            );
+            $rows = [];
+            foreach ($result as $row) {
+                $rows[] = $row;
+            }
+            $this->gucState->applyVerifyResult($rows);
+            return true;
+        } catch (\Throwable $e) {
+            // Connection stays dirty; next acquire retries. Never
+            // bubbles up — the user's query hasn't started yet.
+            return false;
+        }
+    }
+
+    /**
+     * Force the connection into the dirty state. Symmetrical with
+     * CachedPDO::markStateDirty() — exposed for `Amp\CachedConnection`
+     * reuse points where a frontend hands the same wrapped connection
+     * back to a new HTTP request.
+     */
+    public function markStateDirty(): void
+    {
+        $this->gucState->markDirty();
+    }
+
+    /**
+     * Schedule a post-call verify in a parallel coroutine via
+     * `Amp\async()`. The user's query response is already captured
+     * before this fires, so the verify runs without blocking the
+     * caller. On failure we mark the connection dirty so the next
+     * acquire path retries — never propagated as a user-visible error.
+     *
+     * Public so the executor's call paths AND any future statement
+     * wrapper can both invoke it.
+     */
+    public function postCallVerifyAsync(string $sql): void
+    {
+        if (!NativeCache::isTopLevelFunctionCall($sql)) {
+            return;
+        }
+        // Capture the connection + state by reference — the inner
+        // closure runs on a sibling coroutine that may outlive the
+        // calling fiber's frame. ForbidCloning on this class is
+        // enforced by the trait, so the closure can't accidentally
+        // resurrect a duplicate.
+        $real = $this->real;
+        $state = $this->gucState;
+        \Amp\async(static function () use ($real, $state, $sql) {
+            try {
+                $result = $real->query(
+                    "SELECT name, setting FROM pg_settings WHERE source='session'"
+                );
+                $rows = [];
+                foreach ($result as $row) {
+                    $rows[] = $row;
+                }
+                $state->applyVerifyResult($rows);
+            } catch (\Throwable $e) {
+                $state->markDirty();
+            }
+        });
+    }
+
+    /**
      * Handle cache semantics for a SQL statement:
+     *   - run verify-on-checkout if dirty
      *   - detect TX boundaries (bypass cache inside a tx)
      *   - detect writes (invalidate)
      *   - drain pending invalidation signals
      *   - cache SELECTs when unparameterized; return cached PostgresResult
      *     via CachedResult if hit
+     *   - schedule async post-call verify on top-level SELECT <fn>(...)
      */
     private function handle(string $sql, ?array $params, \Closure $miss): PostgresResult
     {
         $this->cache->pollSignals();
+
+        // Verify-on-checkout fallback. No-op on clean connections.
+        $this->verifyIfDirty();
 
         // Observe unsafe-GUC SET / RESET so this connection's state hash
         // reflects the post-statement state when the result is keyed
@@ -106,7 +190,12 @@ class CachedConnection implements PostgresExecutor
                     $this->cache->invalidateTable($t);
                 }
             }
-            return $miss();
+            $r = $miss();
+            // Schedule async post-call verify if this write was actually
+            // a top-level function call. Returns immediately; verify runs
+            // in a sibling coroutine.
+            $this->postCallVerifyAsync($sql);
+            return $r;
         }
 
         // Transaction tracking. Walks every segment in multi-statement
@@ -122,6 +211,8 @@ class CachedConnection implements PostgresExecutor
             return $miss();
         }
 
+        // Inside a tx: bypass cache + skip post-call verify (cache is
+        // bypassed anyway and verify won't see GUC changes until commit).
         if ($this->inTransaction) {
             return $miss();
         }
@@ -129,6 +220,8 @@ class CachedConnection implements PostgresExecutor
         $stateHash = $this->gucState->stateHash();
         $entry = $this->cache->get($sql, $params, $stateHash);
         if ($entry !== null) {
+            // Cache hit on a function call: server didn't run the
+            // function body, so no new state to verify.
             return new CachedResult($entry['rows']);
         }
 
@@ -149,6 +242,10 @@ class CachedConnection implements PostgresExecutor
         if ($colCount !== null && $colCount > 0) {
             $this->cache->put($sql, $params, $rows, $columns, $stateHash);
         }
+        // Async post-call verify. Returns immediately; the verify runs
+        // in a sibling coroutine and updates state when complete. The
+        // caller's response (via CachedResult) is already captured.
+        $this->postCallVerifyAsync($sql);
         return new CachedResult($rows);
     }
 

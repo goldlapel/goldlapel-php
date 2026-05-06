@@ -46,8 +46,121 @@ class CachedPDO extends \PDO
         return $this->gucState;
     }
 
+    /**
+     * Run a server-side verify pass if (and only if) the connection is
+     * marked dirty. Hands the result of
+     *   SELECT name, setting FROM pg_settings WHERE source='session'
+     * to ConnectionGucState::applyVerifyResult(), which rebuilds the
+     * unsafe-GUC subset and clears the dirty flag.
+     *
+     * Calling pattern: the wrapper invokes this lazily on every
+     * acquire / reuse point. Persistent PDO connections (PDO::ATTR_PERSISTENT)
+     * are the closest PHP analog to a connection pool — when the same
+     * underlying PDO handle is handed back to a new request, a previous
+     * request might have stored-function-SET an `app.user_id` we never
+     * saw. Verify-on-reuse is the universal fallback that closes that
+     * gap regardless of whether the underlying PDO is persistent.
+     *
+     * Idempotent — calling on a clean connection is free (just a flag
+     * read). On verify-query failure, the connection stays dirty so the
+     * NEXT acquire path retries; the user's query is never blocked or
+     * errored by our verify failure.
+     *
+     * Returns true if a verify ran successfully, false otherwise (clean
+     * connection, or verify query failed).
+     */
+    public function verifyIfDirty(): bool
+    {
+        if (!$this->gucState->isDirty()) {
+            return false;
+        }
+        try {
+            $stmt = $this->pdo->query(
+                "SELECT name, setting FROM pg_settings WHERE source='session'"
+            );
+            if ($stmt === false) {
+                return false;
+            }
+            $rows = $stmt->fetchAll(\PDO::FETCH_ASSOC);
+            if (!is_array($rows)) {
+                return false;
+            }
+            $this->gucState->applyVerifyResult($rows);
+            return true;
+        } catch (\Throwable $e) {
+            // Verify failure is silent — the connection stays dirty,
+            // the next acquire retries. We never propagate to the
+            // caller because the user's query hasn't even started yet.
+            return false;
+        }
+    }
+
+    /**
+     * Force the connection into the dirty state, so the next
+     * verifyIfDirty() call will run the server-side verify pass.
+     * Exposed for the persistent-PDO reuse path: a frontend that
+     * hands a wrapped persistent PDO back to a new request can
+     * call markStateDirty() to ensure the next query path
+     * re-syncs unsafe-GUC state.
+     */
+    public function markStateDirty(): void
+    {
+        $this->gucState->markDirty();
+    }
+
+    /**
+     * Post-call verify for top-level `SELECT <function>(...)` shapes.
+     * Stored functions can issue `SET app.user_id = ...` server-side,
+     * which the wire-side observeSql() never sees. After capturing the
+     * user's result, we run the verify-on-checkout query inline (sync
+     * PHP has no native off-thread path — Amp users get the async
+     * variant via Amp\CachedConnection). On verify failure we mark the
+     * connection dirty so the NEXT acquire path retries; user's data
+     * has already been captured and is unaffected.
+     *
+     * Tax: ~1 round-trip to the proxy on every recognised function-call
+     * statement. Documented in CachedPDO::query() — sync PHP can't
+     * defer this without breaking the Promise model the user expects.
+     *
+     * Visibility is `public` (rather than private) so CachedPDOStatement
+     * can invoke it after a prepare+execute path runs a top-level
+     * function call — the statement on its own has no PDO handle.
+     */
+    public function postCallVerify(string $sql): void
+    {
+        if (!NativeCache::isTopLevelFunctionCall($sql)) {
+            return;
+        }
+        try {
+            $stmt = $this->pdo->query(
+                "SELECT name, setting FROM pg_settings WHERE source='session'"
+            );
+            if ($stmt === false) {
+                $this->gucState->markDirty();
+                return;
+            }
+            $rows = $stmt->fetchAll(\PDO::FETCH_ASSOC);
+            if (!is_array($rows)) {
+                $this->gucState->markDirty();
+                return;
+            }
+            $this->gucState->applyVerifyResult($rows);
+        } catch (\Throwable $e) {
+            // Mark dirty so the NEXT acquire path retries the verify.
+            // Never propagate — the user's data is already captured.
+            $this->gucState->markDirty();
+        }
+    }
+
     public function query(string $sql, ...$args): CachedPDOStatement|false
     {
+        // Verify-on-checkout fallback: if a previous code path marked
+        // the connection dirty (e.g. persistent PDO reuse, an earlier
+        // post-call verify failure), reconstruct the unsafe-GUC state
+        // from pg_settings before the read path uses the state hash.
+        // No-op on clean connections.
+        $this->verifyIfDirty();
+
         // Observe unsafe-GUC SET / RESET before any other handling so the
         // state hash reflects the effective post-statement state when the
         // result is keyed (matters for `SET app.user_id = '7'; SELECT ...`
@@ -73,7 +186,8 @@ class CachedPDO extends \PDO
                 }
             }
             $stmt = $this->pdo->query($sql, ...$args);
-            return $stmt !== false ? new CachedPDOStatement($stmt, $this->cache, $this->gucState, $sql, null, $this->inTransaction) : false;
+            $this->postCallVerify($sql);
+            return $stmt !== false ? new CachedPDOStatement($stmt, $this->cache, $this->gucState, $sql, null, $this->inTransaction, $this) : false;
         }
 
         // Transaction tracking. Walks every segment in multi-statement
@@ -87,13 +201,19 @@ class CachedPDO extends \PDO
         if ($txState !== null) {
             $this->inTransaction = $txState;
             $stmt = $this->pdo->query($sql, ...$args);
-            return $stmt !== false ? new CachedPDOStatement($stmt, $this->cache, $this->gucState, $sql, null, $this->inTransaction) : false;
+            return $stmt !== false ? new CachedPDOStatement($stmt, $this->cache, $this->gucState, $sql, null, $this->inTransaction, $this) : false;
         }
 
-        // Inside transaction: bypass cache
+        // Inside transaction: bypass cache. Post-call verify is also
+        // skipped — server-side state mutations made inside an open
+        // transaction won't affect another connection's cache reads
+        // until the tx commits, and the wrapper's own state hash
+        // doesn't matter while inTransaction=true (cache is bypassed
+        // anyway). Verify will be triggered as needed once the tx ends
+        // and the next read runs.
         if ($this->inTransaction) {
             $stmt = $this->pdo->query($sql, ...$args);
-            return $stmt !== false ? new CachedPDOStatement($stmt, $this->cache, $this->gucState, $sql, null, true) : false;
+            return $stmt !== false ? new CachedPDOStatement($stmt, $this->cache, $this->gucState, $sql, null, true, $this) : false;
         }
 
         // Skip the cache entirely for session-state commands (SET / RESET /
@@ -105,19 +225,28 @@ class CachedPDO extends \PDO
         // already, so this only catches the direct-query path.
         if (NativeCache::isNonCacheableCommand($sql)) {
             $stmt = $this->pdo->query($sql, ...$args);
-            return $stmt !== false ? new CachedPDOStatement($stmt, $this->cache, $this->gucState, $sql, null, $this->inTransaction) : false;
+            return $stmt !== false ? new CachedPDOStatement($stmt, $this->cache, $this->gucState, $sql, null, $this->inTransaction, $this) : false;
         }
 
         // Read path: check native cache, keyed on this connection's GUC fingerprint.
         $stateHash = $this->gucState->stateHash();
         $entry = $this->cache->get($sql, null, $stateHash);
         if ($entry !== null) {
+            // Cache hit: function body did NOT execute server-side, so
+            // there's no new state to verify. Return without verify.
             return CachedPDOStatement::fromCache($entry, $this->cache, $this->gucState, $sql);
         }
 
         // Cache miss: execute for real
         $stmt = $this->pdo->query($sql, ...$args);
         if ($stmt === false) {
+            // Even on failure, a top-level function call may have
+            // partially executed before erroring out. Mark dirty so
+            // the next acquire reverifies — better than assuming the
+            // failed call was atomic.
+            if (NativeCache::isTopLevelFunctionCall($sql)) {
+                $this->gucState->markDirty();
+            }
             return false;
         }
 
@@ -125,6 +254,13 @@ class CachedPDO extends \PDO
         $rows = $stmt->fetchAll(\PDO::FETCH_ASSOC);
         $columns = !empty($rows) ? array_keys($rows[0]) : [];
         $this->cache->put($sql, null, $rows, $columns, $stateHash);
+
+        // Post-call verify for top-level SELECT <function>(...). Synchronous
+        // in PHP — no off-thread option without Amp. ~1ms tax per call;
+        // documented in postCallVerify's docblock. Result data is already
+        // captured into $rows, so verify failure only marks dirty for the
+        // next acquire — user's response is unaffected.
+        $this->postCallVerify($sql);
 
         return CachedPDOStatement::fromCache(
             ['rows' => $rows, 'columns' => $columns, 'tables' => NativeCache::extractTables($sql)],
@@ -136,12 +272,26 @@ class CachedPDO extends \PDO
 
     public function prepare(string $sql, array $options = []): CachedPDOStatement
     {
+        // Verify-on-checkout fallback runs at prepare-time so the
+        // execute() path's state hash is already trustworthy.
+        $this->verifyIfDirty();
         $realStmt = $this->pdo->prepare($sql, $options);
-        return new CachedPDOStatement($realStmt, $this->cache, $this->gucState, $sql, null, fn() => $this->inTransaction);
+        return new CachedPDOStatement(
+            $realStmt,
+            $this->cache,
+            $this->gucState,
+            $sql,
+            null,
+            fn() => $this->inTransaction,
+            $this,
+        );
     }
 
     public function exec(string $sql): int|false
     {
+        // Verify-on-checkout fallback (mirrors query()).
+        $this->verifyIfDirty();
+
         // Observe unsafe-GUC SET / RESET before write detection. Mirrors
         // query(); a `SET app.user_id = '7'` issued via exec() must
         // update this connection's state hash so subsequent reads on the
@@ -173,7 +323,16 @@ class CachedPDO extends \PDO
             $this->inTransaction = $txState;
         }
 
-        return $this->pdo->exec($sql);
+        $result = $this->pdo->exec($sql);
+        // Post-call verify if this exec was a top-level function call
+        // (`SELECT my_handler()` issued via exec). Skip inside a tx —
+        // see CachedPDO::query() for the rationale.
+        if (!$this->inTransaction && $result !== false) {
+            $this->postCallVerify($sql);
+        } elseif ($result === false && NativeCache::isTopLevelFunctionCall($sql)) {
+            $this->gucState->markDirty();
+        }
+        return $result;
     }
 
     public function beginTransaction(): bool
@@ -250,6 +409,15 @@ class CachedPDOStatement extends \PDOStatement
     private string $sql;
     private ?array $params;
     private \Closure $inTransaction;
+    /**
+     * Optional reference to the parent CachedPDO. Used by execute() to
+     * trigger postCallVerify() after a top-level `SELECT <function>(...)`
+     * via prepare+execute — the statement on its own can't issue the
+     * pg_settings query without going back through the PDO. Null when
+     * the statement was constructed from cache (fromCache(), no PDO
+     * involved).
+     */
+    private ?CachedPDO $parent;
 
     private ?array $cachedRows = null;
     private ?array $cachedColumns = null;
@@ -263,6 +431,7 @@ class CachedPDOStatement extends \PDOStatement
         string $sql,
         ?array $params = null,
         bool|\Closure $inTransaction = false,
+        ?CachedPDO $parent = null,
     ) {
         $this->realStmt = $realStmt;
         $this->cache = $cache;
@@ -275,6 +444,7 @@ class CachedPDOStatement extends \PDOStatement
             $val = $inTransaction;
             $this->inTransaction = static function () use ($val) { return $val; };
         }
+        $this->parent = $parent;
     }
 
     public static function fromCache(array $entry, NativeCache $cache, ConnectionGucState $gucState, string $sql): self
@@ -315,7 +485,9 @@ class CachedPDOStatement extends \PDOStatement
                     $this->cache->invalidateTable($t);
                 }
             }
-            return $this->realStmt->execute($params);
+            $r = $this->realStmt->execute($params);
+            $this->maybePostCallVerify($r);
+            return $r;
         }
 
         // Transaction tracking
@@ -326,7 +498,8 @@ class CachedPDOStatement extends \PDOStatement
             return $this->realStmt->execute($params);
         }
 
-        // Inside transaction: bypass cache
+        // Inside transaction: bypass cache. Post-call verify is also
+        // skipped — see CachedPDO::query() for the rationale.
         if (($this->inTransaction)()) {
             return $this->realStmt->execute($params);
         }
@@ -335,6 +508,8 @@ class CachedPDOStatement extends \PDOStatement
         $stateHash = $this->gucState->stateHash();
         $entry = $this->cache->get($this->sql, $effectiveParams, $stateHash);
         if ($entry !== null) {
+            // Cache hit on a top-level function call: the function did
+            // NOT execute server-side. No new state to verify.
             $this->cachedRows = $entry['rows'];
             $this->cachedColumns = $entry['columns'];
             $this->fetchIndex = 0;
@@ -345,6 +520,11 @@ class CachedPDOStatement extends \PDOStatement
         // Cache miss: execute for real
         $result = $this->realStmt->execute($params);
         if (!$result) {
+            // Failed top-level function call may have partially run.
+            // Mark dirty for next acquire.
+            if (NativeCache::isTopLevelFunctionCall($this->sql)) {
+                $this->gucState->markDirty();
+            }
             return false;
         }
 
@@ -366,7 +546,31 @@ class CachedPDOStatement extends \PDOStatement
             }
         }
 
+        $this->maybePostCallVerify($result);
+
         return $result;
+    }
+
+    /**
+     * Trigger post-call verify after the real statement has been
+     * executed, but only if this SQL is a top-level function call
+     * shape AND we have a parent CachedPDO to issue the verify
+     * query through. Statements built via `fromCache()` have no
+     * parent — but they also never reach this branch because the
+     * cache-hit return is taken before the real execute() runs.
+     */
+    private function maybePostCallVerify(bool $executeOk): void
+    {
+        if (!$executeOk) {
+            return;
+        }
+        if ($this->parent === null) {
+            return;
+        }
+        if (!NativeCache::isTopLevelFunctionCall($this->sql)) {
+            return;
+        }
+        $this->parent->postCallVerify($this->sql);
     }
 
     public function fetch(int $mode = \PDO::FETCH_DEFAULT, ...$args): mixed

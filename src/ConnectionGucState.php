@@ -23,6 +23,15 @@ namespace GoldLapel;
  * transaction-idle, so SET LOCAL effects never influence a cacheable
  * response. Tracking the parser shape lets tests assert on it without
  * affecting state.
+ *
+ * The dirty-flag + verify-on-checkout machinery exists for cases the
+ * wire-side parser can't reach: stored-function SETs, persistent-PDO
+ * reuse across requests, and any post-call verify we kicked off
+ * asynchronously (Amp). On reuse, callers query
+ * `SELECT name, setting FROM pg_settings WHERE source='session'`
+ * and feed the result into `applyVerifyResult()`, which rebuilds the
+ * unsafe-subset state map. See `ConnectionGucState::isDirty()` /
+ * `markDirty()` / `clearDirty()`.
  */
 class ConnectionGucState
 {
@@ -47,6 +56,29 @@ class ConnectionGucState
     private string $gucStateHash = '0';
 
     /**
+     * Connection has had a state mutation since the last verify-on-
+     * checkout pass cleared the flag. The wrapper sets this defensively
+     * after any path that *might* have mutated GUCs we can't see — most
+     * notably top-level stored-function calls (`SELECT my_handler()`),
+     * post-call verify failures, and persistent-connection reuse points.
+     *
+     * Pure SET-on-the-wire mutations DON'T mark dirty — those are
+     * observable and the state map is already authoritative. Dirty means
+     * "we may be out of sync with the server; verify before using cache
+     * keys derived from this state".
+     */
+    private bool $dirty = false;
+
+    /**
+     * Tracks whether a DISCARD ALL has been observed since the dirty
+     * flag was last set. After DISCARD ALL the server-side state is
+     * known to be empty (we've cleared our map to match), so the
+     * verify-on-checkout pass is unnecessary regardless of $dirty.
+     * This stays true until the next markDirty() resets it.
+     */
+    private bool $discardObservedSinceDirty = false;
+
+    /**
      * Read-only accessor for the current state hash. Hex-encoded
      * lowercase 64-bit value, or `"0"` for empty state.
      */
@@ -56,10 +88,142 @@ class ConnectionGucState
     }
 
     /**
-     * Observe a SQL string and apply any SET / RESET commands it contains
-     * to this connection's unsafe-GUC state. Multi-statement bodies are
-     * split on top-level `;` (string-literal-aware) so a single Q like
-     * `SET app.user_id = '42'; SELECT 1` still updates state.
+     * True if the connection's state may be out of sync with the server
+     * — i.e. a verify-on-checkout pass should run before relying on the
+     * state hash for cache keying. False after construction, after a
+     * successful applyVerifyResult(), or once a DISCARD ALL has been
+     * observed since the most recent markDirty().
+     */
+    public function isDirty(): bool
+    {
+        // DISCARD ALL is the universal "state is empty" signal, so a
+        // post-discard connection is implicitly clean even if it was
+        // dirty before — no verify needed.
+        if ($this->discardObservedSinceDirty) {
+            return false;
+        }
+        return $this->dirty;
+    }
+
+    /**
+     * Mark this connection as potentially out-of-sync with the server.
+     * Called by the wrapper after stored-function calls and on persistent-
+     * connection reuse points. Idempotent.
+     */
+    public function markDirty(): void
+    {
+        $this->dirty = true;
+        // A fresh markDirty() invalidates any prior DISCARD-clean state
+        // because something happened after the DISCARD that may have
+        // re-mutated GUCs.
+        $this->discardObservedSinceDirty = false;
+    }
+
+    /**
+     * Clear the dirty flag without otherwise touching state. Used by
+     * the verify-on-checkout path after applyVerifyResult() succeeds —
+     * the state map is now authoritative again.
+     */
+    public function clearDirty(): void
+    {
+        $this->dirty = false;
+        $this->discardObservedSinceDirty = false;
+    }
+
+    /**
+     * Replace the unsafe-GUC state map with the result of a server-side
+     * verify query. Caller is responsible for issuing
+     *   SELECT name, setting FROM pg_settings WHERE source='session'
+     * and passing the rows in. We filter to the unsafe subset (via
+     * NativeCache::isUnsafeGuc) so the state hash exactly matches what
+     * a wire-side observer would have computed.
+     *
+     * Accepts either:
+     *   - list<array{name: string, setting: string}>     (PDO FETCH_ASSOC)
+     *   - list<list{0: string, 1: string}>               (FETCH_NUM)
+     *   - list<array<string, string>> with arbitrary key casing —
+     *     name / setting are looked up case-insensitively.
+     *
+     * @param list<array<int|string, mixed>> $rows
+     */
+    public function applyVerifyResult(array $rows): void
+    {
+        $next = [];
+        foreach ($rows as $row) {
+            [$name, $value] = self::extractNameValue($row);
+            if ($name === null || $value === null) {
+                continue;
+            }
+            $lower = strtolower($name);
+            if (!NativeCache::isUnsafeGuc($lower)) {
+                continue;
+            }
+            $next[$lower] = (string) $value;
+        }
+        $this->gucState = $next;
+        $this->recomputeStateHash();
+        $this->clearDirty();
+    }
+
+    /**
+     * Pull (name, setting) out of a single pg_settings row regardless of
+     * fetch mode. Returns [null, null] for rows that don't carry both
+     * fields — those are silently skipped.
+     *
+     * @param array<int|string, mixed> $row
+     * @return array{0: ?string, 1: ?string}
+     */
+    private static function extractNameValue(array $row): array
+    {
+        // Positional (FETCH_NUM) — first two columns are name, setting in
+        // the canonical SELECT order.
+        if (array_key_exists(0, $row) && array_key_exists(1, $row)) {
+            $name = $row[0];
+            $value = $row[1];
+            if (is_string($name) && (is_string($value) || is_numeric($value))) {
+                return [$name, (string) $value];
+            }
+        }
+        // Associative (FETCH_ASSOC) — case-insensitive key lookup, since
+        // some drivers (PgSQL with a PDO wrapper that quotes identifiers)
+        // can return capitalised keys.
+        $name = self::lookupCi($row, 'name');
+        $value = self::lookupCi($row, 'setting');
+        if ($name === null) {
+            // pg_settings's column is technically `name`, but a few
+            // alternate patterns we accept defensively.
+            $name = self::lookupCi($row, 'guc')
+                ?? self::lookupCi($row, 'parameter');
+        }
+        if ($value === null) {
+            $value = self::lookupCi($row, 'value');
+        }
+        if (is_string($name) && (is_string($value) || is_numeric($value))) {
+            return [$name, (string) $value];
+        }
+        return [null, null];
+    }
+
+    /**
+     * @param array<int|string, mixed> $row
+     */
+    private static function lookupCi(array $row, string $needle): mixed
+    {
+        $needleLower = strtolower($needle);
+        foreach ($row as $k => $v) {
+            if (is_string($k) && strtolower($k) === $needleLower) {
+                return $v;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Observe a SQL string and apply any SET / RESET / DISCARD / set_config
+     * commands it contains to this connection's unsafe-GUC state.
+     * Multi-statement bodies are split on top-level `;` (string-literal-
+     * aware) so a single Q like `SET app.user_id = '42'; SELECT 1` still
+     * updates state.
      *
      * Returns true if the call mutated the state hash, false otherwise —
      * convenient for tests; the wrapper hot path doesn't need the return
@@ -138,6 +302,27 @@ class ConnectionGucState
                     $this->gucState = [];
                     $this->recomputeStateHash();
                 }
+                // DISCARD ALL is also the "server is now in default
+                // state" signal — even if we were dirty before, we're
+                // back in sync as of now. Set the flag unconditionally
+                // (independent of whether $gucState was already empty)
+                // so isDirty() returns false post-DISCARD even when our
+                // wrapper-side map was already empty but the connection
+                // had been marked dirty by an earlier code path.
+                if ($cmd['type'] === 'discard_all') {
+                    $this->discardObservedSinceDirty = true;
+                }
+                break;
+            case 'discard_plans':
+                // Plan flush — affects prepared statement caches, not
+                // GUCs. We don't maintain a wrapper-side prepared-plan
+                // cache (PDO::prepare's plan cache is server-side), so
+                // this is a state no-op. Tracked as a recognised shape
+                // for parser symmetry / parity with the proxy.
+                break;
+            case 'discard_noop':
+                // DISCARD SEQUENCES / TEMP / TEMPORARY — no effect on
+                // session-level GUCs.
                 break;
             case 'discard_plans':
                 // Plan flush — affects prepared statement caches, not

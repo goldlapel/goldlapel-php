@@ -1003,6 +1003,65 @@ class NativeCache
     }
 
     /**
+     * Heuristic: is this SQL a top-level `SELECT <ident>(...)` function
+     * call? Used to trigger the item-5 post-call verify hook — stored
+     * functions can issue `SET app.user_id = '...'` server-side, which
+     * the wire-side parser can't see. After observing one of these, the
+     * wrapper schedules a `SELECT name, setting FROM pg_settings WHERE
+     * source='session'` to reconstruct state.
+     *
+     * Recognised shape (post-trim, post-strip-trailing-`;`):
+     *   SELECT [pg_catalog.]<ident>(<args>) [optional trailing form]
+     *
+     * Filters that intentionally return false (already handled elsewhere):
+     *   * `SELECT set_config(...)` — captured inline by parseSetConfigCall
+     *   * `SELECT * FROM ...`, `SELECT col FROM ...` — non-function shape
+     *   * Multi-statement bodies — caller should split first
+     *   * Aggregate / projection forms like `SELECT count(*) FROM t` —
+     *     the FROM clause means it's a real read, not a side-effect call
+     *
+     * The point isn't to be exhaustive — false negatives just mean we
+     * miss the post-call verify for that specific call, no leak. The
+     * proxy still has its own state-hash fingerprint, and any subsequent
+     * SET observable on the wire will close the gap.
+     */
+    public static function isTopLevelFunctionCall(string $sql): bool
+    {
+        $s = trim($sql);
+        if (str_ends_with($s, ';')) {
+            $s = rtrim(substr($s, 0, -1));
+        }
+        if ($s === '') {
+            return false;
+        }
+        // SELECT [pg_catalog.]<ident>(... ) — capture the rest after `)`
+        // so we can reject `SELECT foo(1) FROM t` (FROM clause = real read).
+        // Identifier per PG: `[A-Za-z_][A-Za-z0-9_$]*`. Quoted identifiers
+        // with embedded spaces / dots are too unusual to bother with.
+        $pattern = '/^SELECT\s+(?:pg_catalog\s*\.\s*)?([A-Za-z_][A-Za-z0-9_$]*)\s*\((.*)\)\s*(.*)$/is';
+        if (!preg_match($pattern, $s, $m)) {
+            return false;
+        }
+        $ident = strtolower($m[1]);
+        // Don't redundantly trigger verify for set_config — parseSetConfigCall
+        // already mutated state inline.
+        if ($ident === 'set_config') {
+            return false;
+        }
+        // Reject obvious non-function-call shapes: anything after the
+        // closing `)` other than whitespace means there's more SQL.
+        $tail = trim($m[3]);
+        if ($tail !== '') {
+            return false;
+        }
+        // The arg-list capture is greedy by `)` — if it absorbed multiple
+        // function calls (`foo(1), bar(2)`), the regex doesn't represent
+        // a single function shape. We don't try to disambiguate; this is
+        // a heuristic, and the proxy's own state hash backs us up.
+        return true;
+    }
+
+    /**
      * Parse `SELECT set_config('name', 'value', is_local)` and the
      * pg_catalog-qualified variant. Returns the same shape as
      * `parseSetCommand` for `set` / `set_local`, except the type is
