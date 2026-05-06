@@ -94,8 +94,9 @@ class ConnectionGucState
     }
 
     /**
-     * Apply a parsed SET / RESET command to this connection's unsafe-GUC
-     * state. No-op for `set_local` (transient — cache is gated on
+     * Apply a parsed SET / RESET / DISCARD / set_config command to this
+     * connection's unsafe-GUC state. No-op for `set_local` /
+     * `set_config_local` (transient — cache is gated on
      * transaction-idle), no-op for safe GUC names. Recomputes the cached
      * state hash on mutation.
      *
@@ -105,12 +106,14 @@ class ConnectionGucState
     {
         switch ($cmd['type']) {
             case 'set':
+            case 'set_config':
                 if ($cmd['name'] !== null && NativeCache::isUnsafeGuc($cmd['name'])) {
                     $this->gucState[$cmd['name']] = (string) $cmd['value'];
                     $this->recomputeStateHash();
                 }
                 break;
             case 'set_local':
+            case 'set_config_local':
                 // Intentionally ignored. SET LOCAL only takes effect inside
                 // a transaction; the proxy's cache is gated on
                 // transaction-idle, so SET LOCAL never influences a
@@ -126,10 +129,26 @@ class ConnectionGucState
                 }
                 break;
             case 'reset_all':
+            case 'discard_all':
+                // DISCARD ALL is equivalent to RESET ALL plus a few other
+                // session-state resets we don't track (sequences / temp
+                // tables / prepared plans). For the unsafe-GUC subset, the
+                // semantics are identical: clear the whole map.
                 if (!empty($this->gucState)) {
                     $this->gucState = [];
                     $this->recomputeStateHash();
                 }
+                break;
+            case 'discard_plans':
+                // Plan flush — affects prepared statement caches, not
+                // GUCs. We don't maintain a wrapper-side prepared-plan
+                // cache (PDO::prepare's plan cache is server-side), so
+                // this is a state no-op. Tracked as a recognised shape
+                // for parser symmetry / parity with the proxy.
+                break;
+            case 'discard_noop':
+                // DISCARD SEQUENCES / TEMP / TEMPORARY — no effect on
+                // session-level GUCs.
                 break;
         }
     }

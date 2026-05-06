@@ -846,9 +846,15 @@ class NativeCache
      *   * `SET LOCAL name = value`, `SET LOCAL name TO value`
      *   * `RESET name`
      *   * `RESET ALL`
+     *   * `DISCARD ALL`                     — full session-state reset
+     *   * `DISCARD PLANS`                   — prepared-plan flush (no-op for state)
+     *   * `DISCARD SEQUENCES` / `DISCARD TEMP` / `DISCARD TEMPORARY` — no-op
+     *   * `SELECT set_config(name, value, is_local)` (and pg_catalog.set_config)
      *
      * Return shape (or null):
-     *   ['type' => 'set' | 'set_local' | 'reset' | 'reset_all',
+     *   ['type' => 'set' | 'set_local' | 'reset' | 'reset_all'
+     *           | 'discard_all' | 'discard_plans' | 'discard_noop'
+     *           | 'set_config' | 'set_config_local',
      *    'name' => string|null, 'value' => string|null]
      *
      * Anything else (including `SET TIME ZONE ...`) returns null —
@@ -868,11 +874,44 @@ class NativeCache
             return null;
         }
 
+        // SELECT set_config(...) recognition is shape-based — the input
+        // here may be either the raw multi-token form (`SELECT set_config(...)`)
+        // or just the function-call expression. Try both before falling
+        // through to the SET / RESET / DISCARD parser.
+        $setConfig = self::parseSetConfigCall($s);
+        if ($setConfig !== null) {
+            return $setConfig;
+        }
+
         $tokens = preg_split('/\s+/', $s);
         if ($tokens === false || count($tokens) === 0) {
             return null;
         }
         $head = $tokens[0];
+
+        if (strcasecmp($head, 'DISCARD') === 0) {
+            if (!isset($tokens[1])) {
+                return null;
+            }
+            $target = $tokens[1];
+            // Anything after the target is junk we don't expect.
+            if (isset($tokens[2])) {
+                return null;
+            }
+            $up = strtoupper($target);
+            switch ($up) {
+                case 'ALL':
+                    return ['type' => 'discard_all', 'name' => null, 'value' => null];
+                case 'PLANS':
+                    return ['type' => 'discard_plans', 'name' => null, 'value' => null];
+                case 'SEQUENCES':
+                case 'TEMP':
+                case 'TEMPORARY':
+                    return ['type' => 'discard_noop', 'name' => null, 'value' => null];
+                default:
+                    return null;
+            }
+        }
 
         if (strcasecmp($head, 'RESET') === 0) {
             if (!isset($tokens[1])) {
@@ -961,6 +1000,217 @@ class NativeCache
             'name' => $name,
             'value' => $value,
         ];
+    }
+
+    /**
+     * Parse `SELECT set_config('name', 'value', is_local)` and the
+     * pg_catalog-qualified variant. Returns the same shape as
+     * `parseSetCommand` for `set` / `set_local`, except the type is
+     * `set_config` / `set_config_local` so callers can tell the parsed
+     * form was the function shape (matters for testability and for
+     * mirroring the proxy / other-wrapper logic).
+     *
+     * Function shape per PG docs: `set_config(setting_name text,
+     * new_value text, is_local boolean) → text`. Supabase's canonical JWT
+     * pattern uses this from a connection-pool path that can't issue a
+     * raw SET (e.g. PgBouncer transaction mode). The wrapper has to
+     * recognise it or we miss every Supabase SET.
+     *
+     * Tolerated input: leading whitespace, optional trailing `;`, optional
+     * `pg_catalog.` schema qualifier, single- or double-quoted name and
+     * value, case-insensitive `SELECT` / `set_config` keyword and the
+     * `true` / `false` boolean. Returns null for unrecognised shapes —
+     * `set_config(my_var, my_var, false)` (column references rather than
+     * literals) can't be parsed without a real SQL parser, so we let the
+     * post-call verify path catch it (item 5).
+     *
+     * @return array{type: string, name: ?string, value: ?string}|null
+     */
+    public static function parseSetConfigCall(string $sql): ?array
+    {
+        $s = trim($sql);
+        if (str_ends_with($s, ';')) {
+            $s = rtrim(substr($s, 0, -1));
+        }
+        if ($s === '') {
+            return null;
+        }
+        // Anchored, case-insensitive. The triple-arg payload is captured
+        // raw so quoted-string-aware splitting can run on it. We deliberately
+        // accept arbitrary whitespace between tokens including between the
+        // function identifier and `(`, matching PG's tolerant parser.
+        $pattern = '/^\s*SELECT\s+(?:pg_catalog\s*\.\s*)?set_config\s*\((.*)\)\s*$/is';
+        if (!preg_match($pattern, $s, $m)) {
+            return null;
+        }
+        $argsRaw = $m[1];
+
+        // Split on top-level `,`, respecting `'...'` and `"..."` strings
+        // and PG's `''` / `""` doubled-quote escapes. set_config takes
+        // exactly three args; anything else is malformed for our purposes.
+        $args = self::splitSetConfigArgs($argsRaw);
+        if ($args === null || count($args) !== 3) {
+            return null;
+        }
+
+        $nameLit = self::extractStringLiteral($args[0]);
+        if ($nameLit === null) {
+            return null;
+        }
+        $valueLit = self::extractStringLiteral($args[1]);
+        if ($valueLit === null) {
+            return null;
+        }
+        // Boolean: accept `true` / `false` (case-insensitive), `'true'` /
+        // `'false'` text literals, and the SQL `t` / `f` shorthand. Any
+        // other shape (subquery, column reference, etc.) → null, which
+        // means the post-call verify in item 5 picks up the side effect
+        // instead.
+        $isLocal = self::parseBooleanLiteral($args[2]);
+        if ($isLocal === null) {
+            return null;
+        }
+
+        $name = self::normalizeGucName($nameLit);
+        if ($name === null) {
+            return null;
+        }
+
+        return [
+            'type' => $isLocal ? 'set_config_local' : 'set_config',
+            'name' => $name,
+            'value' => $valueLit,
+        ];
+    }
+
+    /**
+     * Split a raw set_config(...) arg list on top-level `,` while
+     * respecting PG single + double quoted strings (with `''` / `""`
+     * doubled-quote escapes) and balanced nesting `()`. Returns null on
+     * an obviously malformed input (unclosed quote / unbalanced parens).
+     *
+     * @return list<string>|null
+     */
+    private static function splitSetConfigArgs(string $body): ?array
+    {
+        $out = [];
+        $start = 0;
+        $quote = null;
+        $depth = 0;
+        $len = strlen($body);
+        $i = 0;
+        while ($i < $len) {
+            $c = $body[$i];
+            if ($quote !== null) {
+                if ($c === $quote) {
+                    if ($i + 1 < $len && $body[$i + 1] === $quote) {
+                        $i += 2;
+                        continue;
+                    }
+                    $quote = null;
+                }
+            } else {
+                if ($c === "'" || $c === '"') {
+                    $quote = $c;
+                } elseif ($c === '(') {
+                    $depth++;
+                } elseif ($c === ')') {
+                    if ($depth === 0) {
+                        return null;
+                    }
+                    $depth--;
+                } elseif ($c === ',' && $depth === 0) {
+                    $out[] = trim(substr($body, $start, $i - $start));
+                    $start = $i + 1;
+                }
+            }
+            $i++;
+        }
+        if ($quote !== null || $depth !== 0) {
+            return null;
+        }
+        $tail = trim(substr($body, $start));
+        if ($tail !== '') {
+            $out[] = $tail;
+        }
+        return $out;
+    }
+
+    /**
+     * Extract the body of a `'...'` or `"..."` string literal, decoding
+     * PG's `''` / `""` doubled-quote escape. Returns null if the input
+     * isn't a single string literal (covers numeric / boolean / column
+     * references the function-form parser doesn't try to evaluate).
+     */
+    private static function extractStringLiteral(string $token): ?string
+    {
+        $t = trim($token);
+        if (strlen($t) < 2) {
+            return null;
+        }
+        $quote = $t[0];
+        if ($quote !== "'" && $quote !== '"') {
+            return null;
+        }
+        if ($t[strlen($t) - 1] !== $quote) {
+            return null;
+        }
+        // The whole token must be one literal — a stray closing quote
+        // followed by more content (`'a' || 'b'`) means we can't reduce
+        // this to a constant.
+        $body = substr($t, 1, -1);
+        $out = '';
+        $i = 0;
+        $len = strlen($body);
+        while ($i < $len) {
+            $c = $body[$i];
+            if ($c === $quote) {
+                if ($i + 1 < $len && $body[$i + 1] === $quote) {
+                    $out .= $quote;
+                    $i += 2;
+                    continue;
+                }
+                // Bare closing quote inside the body: the original token
+                // wasn't a single literal. Reject.
+                return null;
+            }
+            $out .= $c;
+            $i++;
+        }
+        return $out;
+    }
+
+    /**
+     * Parse a boolean literal as accepted in the third arg of
+     * set_config(). Accepts `true` / `false` (case-insensitive bare
+     * keywords), `'true'` / `'false'` / `'t'` / `'f'` text literals, and
+     * the bare `t` / `f` shorthand. Returns true / false on a recognised
+     * shape, null on anything else (including numeric `0` / `1`, which
+     * PG accepts in some contexts but not as a boolean literal in
+     * set_config's third arg).
+     */
+    private static function parseBooleanLiteral(string $token): ?bool
+    {
+        $t = trim($token);
+        if ($t === '') {
+            return null;
+        }
+        // Allow optional surrounding quotes for the `'true'` / `'false'`
+        // form Supabase clients sometimes emit.
+        if (
+            (strlen($t) >= 2 && (($t[0] === "'" && $t[strlen($t) - 1] === "'")
+                || ($t[0] === '"' && $t[strlen($t) - 1] === '"')))
+        ) {
+            $t = substr($t, 1, -1);
+        }
+        $lower = strtolower($t);
+        if ($lower === 'true' || $lower === 't') {
+            return true;
+        }
+        if ($lower === 'false' || $lower === 'f') {
+            return false;
+        }
+        return null;
     }
 
     /**
