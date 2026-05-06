@@ -668,6 +668,63 @@ class NativeCache
     }
 
     /**
+     * Distinguishes ROLLBACK from COMMIT/END for the SET-actually-applied
+     * machinery. ROLLBACK reverts session GUCs set during the transaction
+     * (PG semantics — non-LOCAL SETs are tx-scoped despite the docs
+     * implying otherwise; transaction abort drops them), so the wrapper
+     * must restore the pre-BEGIN state snapshot. COMMIT keeps them.
+     *
+     * Matches a leading `ROLLBACK` token (with or without `WORK` /
+     * `TRANSACTION`). Does NOT match `ROLLBACK TO SAVEPOINT` — that's a
+     * partial revert we don't try to model. (Savepoint nesting is rare
+     * and the existing `applyTxBoundaries` machinery already treats it
+     * imperfectly; out of scope here.)
+     */
+    public static function isTxRollback(string $sql): bool
+    {
+        // Reject `ROLLBACK TO ...` — savepoint partial revert.
+        if (preg_match('/^\s*ROLLBACK\s+TO\b/i', $sql)) {
+            return false;
+        }
+        return (bool) preg_match('/^\s*ROLLBACK\b/i', $sql);
+    }
+
+    /**
+     * True if the body contains a ROLLBACK segment that ends the
+     * transaction (i.e. final tx state from `applyTxBoundaries` is
+     * out-of-tx AND at least one segment matches `isTxRollback`). Used
+     * by the wrapper's exec/query path to drive the snapshot-restore
+     * step on bodies like `BEGIN; SET app.x = 'y'; ROLLBACK`. False if
+     * the body's final tx state is in-tx, or if the only end-segment
+     * is a COMMIT.
+     */
+    public static function bodyEndsWithRollback(string $sql): bool
+    {
+        if ($sql === '') {
+            return false;
+        }
+        $tail = rtrim($sql);
+        if (str_ends_with($tail, ';')) {
+            $tail = rtrim(substr($tail, 0, -1));
+        }
+        if (!str_contains($tail, ';')) {
+            return self::isTxRollback($sql);
+        }
+        // Walk segments; record the most recent boundary type.
+        $lastBoundary = null;
+        foreach (self::splitStatements($sql) as $seg) {
+            if (self::isTxStart($seg)) {
+                $lastBoundary = 'start';
+            } elseif (self::isTxRollback($seg)) {
+                $lastBoundary = 'rollback';
+            } elseif (self::isTxEnd($seg)) {
+                $lastBoundary = 'commit';
+            }
+        }
+        return $lastBoundary === 'rollback';
+    }
+
+    /**
      * Multi-statement-aware transaction-boundary classification. A single
      * Q message like `BEGIN; LISTEN foo; COMMIT` opens AND closes a
      * transaction server-side, but a first-token check (`isTxStart($sql)`)

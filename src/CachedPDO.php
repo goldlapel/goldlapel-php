@@ -152,6 +152,107 @@ class CachedPDO extends \PDO
         }
     }
 
+    /**
+     * Snapshot of unsafe-GUC state captured at BEGIN, restored on
+     * ROLLBACK. PG semantics: non-LOCAL SETs issued inside an aborted
+     * transaction are reverted by the server, so the wrapper-side state
+     * map must follow. Null when not in a tracked transaction. Single-
+     * frame — savepoints are out of scope; a `ROLLBACK TO SAVEPOINT`
+     * doesn't trigger restore (NativeCache::isTxRollback rejects that
+     * shape).
+     *
+     * @var array<string, mixed>|null
+     */
+    private ?array $txGucSnapshot = null;
+
+    /**
+     * Run a real PDO call with deferred-mutation discipline. The caller
+     * is responsible for having snapshotted state + applied observeSql
+     * BEFORE invoking the closure (so observe-derived data like
+     * post-state hashes can be captured ahead of the real call). On
+     * failure (`PDOException` thrown OR `false` returned), the snapshot
+     * is restored and the connection is marked dirty so the next
+     * acquire's verify-on-checkout pass resyncs from `pg_settings`.
+     *
+     * The server may apply a prefix of a multi-stmt Q before erroring
+     * on a later segment; we can't tell which one failed, so restore +
+     * markDirty is the safe answer — the verify pass will recover the
+     * actual server state on next use.
+     *
+     * @template T
+     * @param array<string, mixed> $snapshot  Pre-observation snapshot.
+     * @param callable(): T $thunk  The real PDO call to execute.
+     * @return T  Whatever the thunk returned.
+     */
+    private function runWithRecovery(array $snapshot, callable $thunk): mixed
+    {
+        try {
+            $result = $thunk();
+        } catch (\PDOException $e) {
+            $this->revertObservation($snapshot);
+            throw $e;
+        }
+        // PDO returns false from query()/exec() in ERRMODE_SILENT /
+        // ERRMODE_WARNING when an error fires without an exception. Treat
+        // exactly like the throw branch — don't trust the optimistic
+        // mutation when the server reported failure.
+        if ($result === false) {
+            $this->revertObservation($snapshot);
+        }
+        return $result;
+    }
+
+    /**
+     * Revert an optimistic observation by restoring the snapshot. Marks
+     * dirty ONLY if the observation actually mutated state — a failed
+     * SELECT that observed nothing doesn't need to trigger a verify
+     * query on the next acquire (the state hash is already correct).
+     *
+     * @param array<string, mixed> $snapshot
+     */
+    private function revertObservation(array $snapshot): void
+    {
+        $observed = $snapshot['gucStateHash'] !== $this->gucState->stateHash();
+        $this->gucState->restore($snapshot);
+        if ($observed) {
+            // Server may have applied a prefix of a multi-stmt body
+            // before erroring on a later segment. We can't tell which,
+            // so markDirty so the next acquire's verify-on-checkout
+            // reconciles from pg_settings.
+            $this->gucState->markDirty();
+        }
+    }
+
+    /**
+     * Capture the tx-boundary snapshot used to revert non-LOCAL SETs on
+     * ROLLBACK. Called from beginTransaction() — captures the live
+     * state map, which is correct there because beginTransaction
+     * doesn't observeSql (the caller didn't pass SQL). The query() /
+     * exec() paths set `$txGucSnapshot = $preSnapshot` directly instead,
+     * because they observed the SQL into the live map BEFORE this could
+     * fire and need the pre-observation state. Only captures on the
+     * OUTER BEGIN — nested BEGIN is a server-side no-op.
+     */
+    private function snapshotForTxStart(): void
+    {
+        if ($this->txGucSnapshot === null) {
+            $this->txGucSnapshot = $this->gucState->snapshot();
+        }
+    }
+
+    private function dropTxSnapshot(): void
+    {
+        $this->txGucSnapshot = null;
+    }
+
+    private function restoreTxSnapshot(): void
+    {
+        if ($this->txGucSnapshot !== null) {
+            $this->gucState->restore($this->txGucSnapshot);
+            $this->txGucSnapshot = null;
+        }
+    }
+
     public function query(string $sql, ...$args): CachedPDOStatement|false
     {
         // Verify-on-checkout fallback: if a previous code path marked
@@ -161,11 +262,20 @@ class CachedPDO extends \PDO
         // No-op on clean connections.
         $this->verifyIfDirty();
 
+        // Wave 2: capture the pre-observation snapshot so we can roll
+        // the state map back if PDO reports failure. observeSql() below
+        // mutates the live map optimistically; the runWithRecovery()
+        // helper restores from `$preSnapshot` on PDOException / false
+        // return so a SET that the server didn't apply doesn't leave
+        // the wrapper diverged.
+        $preSnapshot = $this->gucState->snapshot();
+
         // Observe unsafe-GUC SET / RESET before any other handling so the
         // state hash reflects the effective post-statement state when the
         // result is keyed (matters for `SET app.user_id = '7'; SELECT ...`
         // multi-statements). State lives on this CachedPDO so concurrent
-        // connections never share gucState.
+        // connections never share gucState. The mutation is reverted on
+        // failure via $preSnapshot — see runWithRecovery().
         $this->gucState->observeSql($sql);
 
         // Multi-statement-aware write detection. Runs BEFORE transaction
@@ -185,9 +295,45 @@ class CachedPDO extends \PDO
                     $this->cache->invalidateTable($t);
                 }
             }
-            $stmt = $this->pdo->query($sql, ...$args);
+            // Multi-stmt bodies that contain a tx boundary AND writes
+            // (`BEGIN; INSERT ...; ROLLBACK`). The tx-boundary branch
+            // below isn't reached on this branch, so do snapshot /
+            // drop / restore inline. Use $preSnapshot directly (not
+            // snapshotForTxStart()) because for inline `BEGIN; SET ...;
+            // INSERT; ROLLBACK` the SET was already observed, and we
+            // want to revert to the pre-observation state.
+            $finalTx = NativeCache::applyTxBoundaries($sql);
+            $openedTx = self::bodyOpensTxBeforeClose($sql);
+            $wasInTx = $this->inTransaction;
+            if ($openedTx && !$wasInTx && $this->txGucSnapshot === null) {
+                $this->txGucSnapshot = $preSnapshot;
+            }
+            try {
+                $stmt = $this->runWithRecovery($preSnapshot, fn() => $this->pdo->query($sql, ...$args));
+            } catch (\PDOException $e) {
+                if ($openedTx && !$wasInTx) {
+                    $this->dropTxSnapshot();
+                }
+                throw $e;
+            }
+            if ($stmt === false) {
+                if ($openedTx && !$wasInTx) {
+                    $this->dropTxSnapshot();
+                }
+                return false;
+            }
+            if ($finalTx === false) {
+                if (NativeCache::bodyEndsWithRollback($sql)) {
+                    $this->restoreTxSnapshot();
+                } else {
+                    $this->dropTxSnapshot();
+                }
+                $this->inTransaction = false;
+            } elseif ($finalTx === true) {
+                $this->inTransaction = true;
+            }
             $this->postCallVerify($sql);
-            return $stmt !== false ? new CachedPDOStatement($stmt, $this->cache, $this->gucState, $sql, null, $this->inTransaction, $this) : false;
+            return new CachedPDOStatement($stmt, $this->cache, $this->gucState, $sql, null, $this->inTransaction, $this);
         }
 
         // Transaction tracking. Walks every segment in multi-statement
@@ -199,9 +345,48 @@ class CachedPDO extends \PDO
         // pair reset state. Single-statement bodies skip the splitter.
         $txState = NativeCache::applyTxBoundaries($sql);
         if ($txState !== null) {
+            $wasInTx = $this->inTransaction;
+            // Snapshot on the open boundary, restore on a ROLLBACK end,
+            // drop on a COMMIT end. Always use $preSnapshot (pre-
+            // observation) — a multi-stmt body like `BEGIN; SET app.x =
+            // 'y'; ...` has already had the SET applied to the live
+            // map, and we need to revert to BEFORE that SET on ROLLBACK.
+            if (!$wasInTx && $this->txGucSnapshot === null) {
+                $opened = ($txState === true) || ($txState === false && self::bodyOpensTxBeforeClose($sql));
+                if ($opened) {
+                    $this->txGucSnapshot = $preSnapshot;
+                }
+            }
+            try {
+                $stmt = $this->runWithRecovery($preSnapshot, fn() => $this->pdo->query($sql, ...$args));
+            } catch (\PDOException $e) {
+                // Server didn't actually transition tx state — roll
+                // wrapper-side flag back, drop the snapshot we just
+                // captured. runWithRecovery already reverted gucState.
+                if (!$wasInTx) {
+                    $this->dropTxSnapshot();
+                    $this->inTransaction = $wasInTx;
+                }
+                throw $e;
+            }
+            if ($stmt === false) {
+                // Server rejected the boundary; same recovery as the
+                // throw arm.
+                if (!$wasInTx) {
+                    $this->dropTxSnapshot();
+                    $this->inTransaction = $wasInTx;
+                }
+                return false;
+            }
             $this->inTransaction = $txState;
-            $stmt = $this->pdo->query($sql, ...$args);
-            return $stmt !== false ? new CachedPDOStatement($stmt, $this->cache, $this->gucState, $sql, null, $this->inTransaction, $this) : false;
+            if ($txState === false) {
+                if (NativeCache::bodyEndsWithRollback($sql)) {
+                    $this->restoreTxSnapshot();
+                } else {
+                    $this->dropTxSnapshot();
+                }
+            }
+            return new CachedPDOStatement($stmt, $this->cache, $this->gucState, $sql, null, $this->inTransaction, $this);
         }
 
         // Inside transaction: bypass cache. Post-call verify is also
@@ -212,7 +397,7 @@ class CachedPDO extends \PDO
         // anyway). Verify will be triggered as needed once the tx ends
         // and the next read runs.
         if ($this->inTransaction) {
-            $stmt = $this->pdo->query($sql, ...$args);
+            $stmt = $this->runWithRecovery($preSnapshot, fn() => $this->pdo->query($sql, ...$args));
             return $stmt !== false ? new CachedPDOStatement($stmt, $this->cache, $this->gucState, $sql, null, true, $this) : false;
         }
 
@@ -224,11 +409,12 @@ class CachedPDO extends \PDO
         // workloads. The prepare/execute path is gated by columnCount() > 0
         // already, so this only catches the direct-query path.
         if (NativeCache::isNonCacheableCommand($sql)) {
-            $stmt = $this->pdo->query($sql, ...$args);
+            $stmt = $this->runWithRecovery($preSnapshot, fn() => $this->pdo->query($sql, ...$args));
             return $stmt !== false ? new CachedPDOStatement($stmt, $this->cache, $this->gucState, $sql, null, $this->inTransaction, $this) : false;
         }
 
-        // Read path: check native cache, keyed on this connection's GUC fingerprint.
+        // Read path: check native cache, keyed on this connection's
+        // (post-observation) GUC fingerprint.
         $stateHash = $this->gucState->stateHash();
         $entry = $this->cache->get($sql, null, $stateHash);
         if ($entry !== null) {
@@ -237,16 +423,23 @@ class CachedPDO extends \PDO
             return CachedPDOStatement::fromCache($entry, $this->cache, $this->gucState, $sql);
         }
 
-        // Cache miss: execute for real
-        $stmt = $this->pdo->query($sql, ...$args);
-        if ($stmt === false) {
+        // Cache miss: execute for real with deferred-mutation discipline.
+        try {
+            $stmt = $this->runWithRecovery($preSnapshot, fn() => $this->pdo->query($sql, ...$args));
+        } catch (\PDOException $e) {
             // Even on failure, a top-level function call may have
-            // partially executed before erroring out. Mark dirty so
-            // the next acquire reverifies — better than assuming the
-            // failed call was atomic.
+            // partially executed before erroring out. runWithRecovery
+            // already restored + marked dirty; markDirty is idempotent
+            // so the explicit re-mark is harmless and documents intent.
             if (NativeCache::isTopLevelFunctionCall($sql)) {
                 $this->gucState->markDirty();
             }
+            throw $e;
+        }
+        if ($stmt === false) {
+            // runWithRecovery already restored + marked dirty. The
+            // function-call branch is now redundant but kept for
+            // documentation parity with the throw arm.
             return false;
         }
 
@@ -268,6 +461,32 @@ class CachedPDO extends \PDO
             $this->gucState,
             $sql
         );
+    }
+
+    /**
+     * True if a multi-statement body contains a BEGIN segment somewhere
+     * before its closing tx-boundary segment. Approximates "a transaction
+     * was opened during the body" — used for the BEGIN; ROLLBACK case
+     * inside the write-detect branch.
+     */
+    private static function bodyOpensTxBeforeClose(string $sql): bool
+    {
+        if ($sql === '') {
+            return false;
+        }
+        $tail = rtrim($sql);
+        if (str_ends_with($tail, ';')) {
+            $tail = rtrim(substr($tail, 0, -1));
+        }
+        if (!str_contains($tail, ';')) {
+            return NativeCache::isTxStart($sql);
+        }
+        foreach (NativeCache::splitStatements($sql) as $seg) {
+            if (NativeCache::isTxStart($seg)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     public function prepare(string $sql, array $options = []): CachedPDOStatement
@@ -292,10 +511,15 @@ class CachedPDO extends \PDO
         // Verify-on-checkout fallback (mirrors query()).
         $this->verifyIfDirty();
 
+        // Wave 2 deferred-mutation discipline (mirrors query()): snapshot
+        // BEFORE observing so we can revert if PDO reports failure.
+        $preSnapshot = $this->gucState->snapshot();
+
         // Observe unsafe-GUC SET / RESET before write detection. Mirrors
         // query(); a `SET app.user_id = '7'` issued via exec() must
         // update this connection's state hash so subsequent reads on the
-        // same CachedPDO key correctly.
+        // same CachedPDO key correctly. Reverted on failure via
+        // $preSnapshot.
         $this->gucState->observeSql($sql);
 
         // Multi-statement-aware write detection. `exec()` doesn't return a
@@ -319,11 +543,40 @@ class CachedPDO extends \PDO
         // inTransaction=false — matching the server. Single-statement
         // bodies skip the splitter.
         $txState = NativeCache::applyTxBoundaries($sql);
+        $wasInTx = $this->inTransaction;
         if ($txState !== null) {
             $this->inTransaction = $txState;
         }
-
-        $result = $this->pdo->exec($sql);
+        // Snapshot the pre-tx state for ROLLBACK revert. Always use
+        // $preSnapshot (the pre-observation state), not the live map —
+        // a multi-statement Q like `BEGIN; SET app.x = 'y'; ...` has
+        // already had the SET applied to the live map by observeSql,
+        // and we want to revert to BEFORE that SET on ROLLBACK.
+        if (!$wasInTx && $this->txGucSnapshot === null) {
+            $opened = ($txState === true) || ($txState === false && self::bodyOpensTxBeforeClose($sql));
+            if ($opened) {
+                $this->txGucSnapshot = $preSnapshot;
+            }
+        }
+        try {
+            $result = $this->runWithRecovery($preSnapshot, fn() => $this->pdo->exec($sql));
+        } catch (\PDOException $e) {
+            // If we'd just opened a tx (or opened-and-closed one in a
+            // single batch), drop the snapshot — the BEGIN didn't
+            // survive the failed batch (server aborted), and
+            // runWithRecovery already restored the GUC map from
+            // $preSnapshot. Roll the tx flag back to its pre-call value.
+            if (!$wasInTx && $this->txGucSnapshot !== null) {
+                $this->dropTxSnapshot();
+                $this->inTransaction = $wasInTx;
+            }
+            throw $e;
+        }
+        // Same recovery on the false-return path.
+        if ($result === false && !$wasInTx && $this->txGucSnapshot !== null && $txState !== null) {
+            $this->dropTxSnapshot();
+            $this->inTransaction = $wasInTx;
+        }
         // Post-call verify if this exec was a top-level function call
         // (`SELECT my_handler()` issued via exec). Skip inside a tx —
         // see CachedPDO::query() for the rationale.
@@ -332,24 +585,71 @@ class CachedPDO extends \PDO
         } elseif ($result === false && NativeCache::isTopLevelFunctionCall($sql)) {
             $this->gucState->markDirty();
         }
+        // Resolve tx-snapshot lifecycle for end-of-tx bodies.
+        // applyTxBoundaries returns false iff the body's last boundary
+        // is COMMIT or ROLLBACK; bodyEndsWithRollback distinguishes them.
+        if ($txState === false) {
+            if (NativeCache::bodyEndsWithRollback($sql)) {
+                $this->restoreTxSnapshot();
+            } else {
+                $this->dropTxSnapshot();
+            }
+        }
         return $result;
     }
 
     public function beginTransaction(): bool
     {
+        // Snapshot BEFORE the server-side BEGIN actually fires so a
+        // ROLLBACK can revert any non-LOCAL `SET app.x` issued during
+        // the tx. Only the outer BEGIN takes a snapshot; nested BEGINs
+        // are server-side warnings (no-op).
+        $wasInTx = $this->inTransaction;
         $this->inTransaction = true;
-        return $this->pdo->beginTransaction();
+        if (!$wasInTx) {
+            $this->snapshotForTxStart();
+        }
+        try {
+            $ok = $this->pdo->beginTransaction();
+        } catch (\Throwable $e) {
+            // Server-side BEGIN failed — drop the snapshot we just took
+            // and roll the tx flag back. State map is unchanged so
+            // there's nothing to restore.
+            if (!$wasInTx) {
+                $this->dropTxSnapshot();
+                $this->inTransaction = false;
+            }
+            throw $e;
+        }
+        if (!$ok && !$wasInTx) {
+            // Same recovery for the false-return path.
+            $this->dropTxSnapshot();
+            $this->inTransaction = false;
+        }
+        return $ok;
     }
 
     public function commit(): bool
     {
         $this->inTransaction = false;
+        // COMMIT keeps any non-LOCAL SETs issued during the tx, so we
+        // simply drop the snapshot.
+        $this->dropTxSnapshot();
         return $this->pdo->commit();
     }
 
     public function rollBack(): bool
     {
         $this->inTransaction = false;
+        // ROLLBACK reverts non-LOCAL SETs issued during the tx server-
+        // side, so the wrapper-side state must be reverted to the
+        // pre-BEGIN snapshot to stay in sync. Restoration runs BEFORE
+        // the real call so a `rollBack()` failure still leaves a
+        // consistent wrapper state — the connection is in an indeterminate
+        // server state at that point anyway, and the next acquire will
+        // hit verify-on-checkout if any path marked dirty during the tx
+        // (e.g. a stored-function call that ran inside the tx).
+        $this->restoreTxSnapshot();
         return $this->pdo->rollBack();
     }
 
@@ -465,6 +765,11 @@ class CachedPDOStatement extends \PDOStatement
         $this->fetchIndex = 0;
         $this->fromCache = false;
 
+        // Wave 2 deferred-mutation discipline (mirrors CachedPDO::query):
+        // snapshot BEFORE observe so we can roll the state map back if
+        // the prepared statement's execute() reports failure.
+        $preSnapshot = $this->gucState->snapshot();
+
         // Observe unsafe-GUC SET / RESET. Prepared `SET app.user_id = $1`
         // is unusual but legal; observeSql() captures the placeholder
         // string `$1` as the recorded value, which won't match the
@@ -485,23 +790,23 @@ class CachedPDOStatement extends \PDOStatement
                     $this->cache->invalidateTable($t);
                 }
             }
-            $r = $this->realStmt->execute($params);
+            $r = $this->runRealExecuteWithRecovery($params, $preSnapshot);
             $this->maybePostCallVerify($r);
             return $r;
         }
 
         // Transaction tracking
         if (NativeCache::isTxStart($this->sql)) {
-            return $this->realStmt->execute($params);
+            return $this->runRealExecuteWithRecovery($params, $preSnapshot);
         }
         if (NativeCache::isTxEnd($this->sql)) {
-            return $this->realStmt->execute($params);
+            return $this->runRealExecuteWithRecovery($params, $preSnapshot);
         }
 
         // Inside transaction: bypass cache. Post-call verify is also
         // skipped — see CachedPDO::query() for the rationale.
         if (($this->inTransaction)()) {
-            return $this->realStmt->execute($params);
+            return $this->runRealExecuteWithRecovery($params, $preSnapshot);
         }
 
         // Read path: check native cache, keyed on this connection's GUC fingerprint.
@@ -517,11 +822,12 @@ class CachedPDOStatement extends \PDOStatement
             return true;
         }
 
-        // Cache miss: execute for real
-        $result = $this->realStmt->execute($params);
+        // Cache miss: execute for real with deferred-mutation discipline.
+        $result = $this->runRealExecuteWithRecovery($params, $preSnapshot);
         if (!$result) {
             // Failed top-level function call may have partially run.
-            // Mark dirty for next acquire.
+            // Mark dirty for next acquire (markDirty already called
+            // inside runRealExecuteWithRecovery on a false return).
             if (NativeCache::isTopLevelFunctionCall($this->sql)) {
                 $this->gucState->markDirty();
             }
@@ -549,6 +855,43 @@ class CachedPDOStatement extends \PDOStatement
         $this->maybePostCallVerify($result);
 
         return $result;
+    }
+
+    /**
+     * Wave 2 deferred-mutation helper for the prepare/execute path.
+     * Mirrors CachedPDO::runWithRecovery() but is local to the
+     * statement so we don't need a back-reference.
+     *
+     * @param ?array<int|string, mixed> $params
+     * @param array<string, mixed> $snapshot
+     */
+    private function runRealExecuteWithRecovery(?array $params, array $snapshot): bool
+    {
+        try {
+            $r = $this->realStmt->execute($params);
+        } catch (\PDOException $e) {
+            $this->revertObservation($snapshot);
+            throw $e;
+        }
+        if ($r === false) {
+            $this->revertObservation($snapshot);
+        }
+        return $r;
+    }
+
+    /**
+     * Mirror of CachedPDO::revertObservation — restore + conditionally
+     * markDirty (only if observeSql actually mutated state).
+     *
+     * @param array<string, mixed> $snapshot
+     */
+    private function revertObservation(array $snapshot): void
+    {
+        $observed = $snapshot['gucStateHash'] !== $this->gucState->stateHash();
+        $this->gucState->restore($snapshot);
+        if ($observed) {
+            $this->gucState->markDirty();
+        }
     }
 
     /**

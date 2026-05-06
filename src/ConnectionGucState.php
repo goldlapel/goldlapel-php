@@ -131,6 +131,61 @@ class ConnectionGucState
     }
 
     /**
+     * Capture an opaque snapshot of the full tracker state — unsafe-GUC
+     * map + cached hash + dirty flag + DISCARD-since-dirty flag. Used by
+     * the SET-actually-applied machinery to defer mutation until PDO
+     * reports success: snapshot before observe, restore on PDOException.
+     * Also reused by the BEGIN/ROLLBACK path so a non-LOCAL `SET app.x`
+     * issued inside an aborted transaction is reverted on the wrapper
+     * side, matching the server's transaction-scoped revert.
+     *
+     * The returned shape is intentionally opaque — callers MUST pass it
+     * back to `restore()` unmodified. We return a plain associative array
+     * (rather than a typed value object) to keep the snapshot allocation
+     * cheap; PHP's copy-on-write on arrays makes the per-call overhead
+     * negligible for the common SET-free path.
+     *
+     * @return array{
+     *   gucState: array<string, string>,
+     *   gucStateHash: string,
+     *   dirty: bool,
+     *   discardObservedSinceDirty: bool,
+     * }
+     */
+    public function snapshot(): array
+    {
+        return [
+            'gucState' => $this->gucState,
+            'gucStateHash' => $this->gucStateHash,
+            'dirty' => $this->dirty,
+            'discardObservedSinceDirty' => $this->discardObservedSinceDirty,
+        ];
+    }
+
+    /**
+     * Restore a previously captured snapshot. Counterpart of `snapshot()`.
+     * Used by:
+     *   - Wave 2 SET-actually-applied: revert observed mutations when
+     *     PDO reports failure (server didn't apply the SET).
+     *   - BEGIN/ROLLBACK: revert session GUCs set inside an aborted
+     *     transaction to match PG's tx-scoped revert of non-LOCAL SETs.
+     *
+     * @param array{
+     *   gucState: array<string, string>,
+     *   gucStateHash: string,
+     *   dirty: bool,
+     *   discardObservedSinceDirty: bool,
+     * } $snapshot
+     */
+    public function restore(array $snapshot): void
+    {
+        $this->gucState = $snapshot['gucState'];
+        $this->gucStateHash = $snapshot['gucStateHash'];
+        $this->dirty = $snapshot['dirty'];
+        $this->discardObservedSinceDirty = $snapshot['discardObservedSinceDirty'];
+    }
+
+    /**
      * Replace the unsafe-GUC state map with the result of a server-side
      * verify query. Caller is responsible for issuing
      *   SELECT name, setting FROM pg_settings WHERE source='session'
@@ -312,17 +367,6 @@ class ConnectionGucState
                 if ($cmd['type'] === 'discard_all') {
                     $this->discardObservedSinceDirty = true;
                 }
-                break;
-            case 'discard_plans':
-                // Plan flush — affects prepared statement caches, not
-                // GUCs. We don't maintain a wrapper-side prepared-plan
-                // cache (PDO::prepare's plan cache is server-side), so
-                // this is a state no-op. Tracked as a recognised shape
-                // for parser symmetry / parity with the proxy.
-                break;
-            case 'discard_noop':
-                // DISCARD SEQUENCES / TEMP / TEMPORARY — no effect on
-                // session-level GUCs.
                 break;
             case 'discard_plans':
                 // Plan flush — affects prepared statement caches, not

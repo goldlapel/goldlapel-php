@@ -43,6 +43,15 @@ class CachedConnection implements PostgresExecutor
      */
     private ConnectionGucState $gucState;
 
+    /**
+     * Snapshot of unsafe-GUC state captured at BEGIN, restored on
+     * ROLLBACK. Mirrors CachedPDO::$txGucSnapshot — see that field for
+     * the PG-tx-scoped-revert rationale.
+     *
+     * @var array<string, mixed>|null
+     */
+    private ?array $txGucSnapshot = null;
+
     public function __construct(
         private PostgresExecutor $real,
         private NativeCache $cache,
@@ -166,12 +175,38 @@ class CachedConnection implements PostgresExecutor
         // Verify-on-checkout fallback. No-op on clean connections.
         $this->verifyIfDirty();
 
+        // Wave 2 deferred-mutation discipline: snapshot BEFORE observe so
+        // a thrown exception from the real `$miss()` call rolls the
+        // wrapper-side state map back. Mirrors CachedPDO::$preSnapshot.
+        $preSnapshot = $this->gucState->snapshot();
+
         // Observe unsafe-GUC SET / RESET so this connection's state hash
         // reflects the post-statement state when the result is keyed
         // (mirrors the sync CachedPDO path). State is per-connection —
         // shared use of a single NativeCache across many fibers is
         // expected, but each CachedConnection has its own gucState.
         $this->gucState->observeSql($sql);
+
+        $runMiss = function () use ($miss, $preSnapshot) {
+            try {
+                return $miss();
+            } catch (\Throwable $e) {
+                // Server didn't apply the SET (or aborted partway through
+                // a multi-stmt body). Revert the optimistic mutation;
+                // mark dirty IF observation actually mutated state, so
+                // a failed SELECT that observed nothing doesn't trigger
+                // an unnecessary verify query on the next acquire.
+                // amphp/postgres throws SqlQueryError / SqlException —
+                // the catch-all is appropriate since any exception means
+                // the result is unusable anyway.
+                $observed = $preSnapshot['gucStateHash'] !== $this->gucState->stateHash();
+                $this->gucState->restore($preSnapshot);
+                if ($observed) {
+                    $this->gucState->markDirty();
+                }
+                throw $e;
+            }
+        };
 
         // Multi-statement-aware write detection. Runs BEFORE transaction
         // tracking so a single Q message like `BEGIN; INSERT INTO orders
@@ -190,7 +225,28 @@ class CachedConnection implements PostgresExecutor
                     $this->cache->invalidateTable($t);
                 }
             }
-            $r = $miss();
+            $finalTx = NativeCache::applyTxBoundaries($sql);
+            $opensTx = self::bodyOpensTxBeforeClose($sql);
+            $wasInTx = $this->inTransaction;
+            $capturedTx = false;
+            if ($opensTx && !$wasInTx && $this->txGucSnapshot === null) {
+                $this->txGucSnapshot = $preSnapshot;
+                $capturedTx = true;
+            }
+            try {
+                $r = $runMiss();
+            } catch (\Throwable $e) {
+                if ($capturedTx) {
+                    $this->txGucSnapshot = null;
+                }
+                throw $e;
+            }
+            if ($finalTx === false) {
+                $this->settleTxBoundary($sql);
+                $this->inTransaction = false;
+            } elseif ($finalTx === true) {
+                $this->inTransaction = true;
+            }
             // Schedule async post-call verify if this write was actually
             // a top-level function call. Returns immediately; verify runs
             // in a sibling coroutine.
@@ -207,14 +263,34 @@ class CachedConnection implements PostgresExecutor
         // bodies skip the splitter.
         $txState = NativeCache::applyTxBoundaries($sql);
         if ($txState !== null) {
+            $wasInTx = $this->inTransaction;
+            $capturedTx = false;
+            if (!$wasInTx && $this->txGucSnapshot === null) {
+                $opened = ($txState === true) || ($txState === false && self::bodyOpensTxBeforeClose($sql));
+                if ($opened) {
+                    $this->txGucSnapshot = $preSnapshot;
+                    $capturedTx = true;
+                }
+            }
+            try {
+                $r = $runMiss();
+            } catch (\Throwable $e) {
+                if ($capturedTx) {
+                    $this->txGucSnapshot = null;
+                }
+                throw $e;
+            }
             $this->inTransaction = $txState;
-            return $miss();
+            if ($txState === false) {
+                $this->settleTxBoundary($sql);
+            }
+            return $r;
         }
 
         // Inside a tx: bypass cache + skip post-call verify (cache is
         // bypassed anyway and verify won't see GUC changes until commit).
         if ($this->inTransaction) {
-            return $miss();
+            return $runMiss();
         }
 
         $stateHash = $this->gucState->stateHash();
@@ -225,7 +301,7 @@ class CachedConnection implements PostgresExecutor
             return new CachedResult($entry['rows']);
         }
 
-        $result = $miss();
+        $result = $runMiss();
         // Drain the result regardless — PostgresResult is iterable-once,
         // so consumers downstream still need a buffered replay (CachedResult).
         // But only put the slot in the cache when the result actually has a
@@ -247,6 +323,52 @@ class CachedConnection implements PostgresExecutor
         // caller's response (via CachedResult) is already captured.
         $this->postCallVerifyAsync($sql);
         return new CachedResult($rows);
+    }
+
+    /**
+     * Resolve the tx-snapshot lifecycle at a closing tx boundary.
+     * COMMIT drops the snapshot; ROLLBACK restores it (reverts non-LOCAL
+     * SETs issued during the tx). Mirrors CachedPDO's lifecycle helpers.
+     */
+    private function settleTxBoundary(string $sql): void
+    {
+        if (NativeCache::bodyEndsWithRollback($sql)) {
+            if ($this->txGucSnapshot !== null) {
+                $this->gucState->restore($this->txGucSnapshot);
+                $this->txGucSnapshot = null;
+            }
+            // Note: we don't markDirty() here. The post-restore state
+            // matches the server (both reverted to pre-BEGIN), and any
+            // stored-function side effects inside the tx were also
+            // reverted by PG. If a stored function called during the tx
+            // marked dirty via its own path, that flag is already set.
+        } else {
+            $this->txGucSnapshot = null;
+        }
+    }
+
+    /**
+     * Mirror of CachedPDO::bodyOpensTxBeforeClose — true if the body
+     * contains a BEGIN segment somewhere before its closing tx boundary.
+     */
+    private static function bodyOpensTxBeforeClose(string $sql): bool
+    {
+        if ($sql === '') {
+            return false;
+        }
+        $tail = rtrim($sql);
+        if (str_ends_with($tail, ';')) {
+            $tail = rtrim(substr($tail, 0, -1));
+        }
+        if (!str_contains($tail, ';')) {
+            return NativeCache::isTxStart($sql);
+        }
+        foreach (NativeCache::splitStatements($sql) as $seg) {
+            if (NativeCache::isTxStart($seg)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     // ---- PostgresExecutor / SqlExecutor interface ----
