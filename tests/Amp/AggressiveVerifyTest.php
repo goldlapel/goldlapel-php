@@ -12,16 +12,13 @@ use PHPUnit\Framework\TestCase;
 
 /**
  * Async-side aggressive-verify tests. Mirrors tests/AggressiveVerifyTest.php
- * for the sync path — covers detection-on-first-write, override
- * precedence, and the async post-DML verify scheduling via Amp\async().
+ * for the sync path — covers the post-DML dml_seq bump on the Amp
+ * executor + mode resolution + off-mode warning.
  *
- * Async verify uses Amp\async(), which schedules the probe in a sibling
- * coroutine. From an event-loop-less unit test we drive the loop by
- * calling \Amp\Future\await on a synthetic future or by running inside
- * an explicit \Revolt\EventLoop::run() context. The simpler model here
- * is to assert that postWriteVerifyAsync() is wired AT ALL — the event
- * loop integration tests in IntegrationTest.php exercise the actual
- * fiber scheduling.
+ * Wave 5 removed the smart-auto-enable detection probe and the
+ * `Amp\async()`-scheduled pg_settings reconcile. The post-DML bump is
+ * now zero-RT (a counter mix into the state hash) and synchronous in
+ * the wrapper, so there's no event-loop interaction to validate here.
  */
 #[AllowMockObjectsWithoutExpectations]
 final class AggressiveVerifyTest extends TestCase
@@ -32,7 +29,6 @@ final class AggressiveVerifyTest extends TestCase
     {
         NativeCache::reset();
         AggressiveVerify::clearCache();
-        putenv('GOLDLAPEL_AGGRESSIVE_VERIFY_ACTIVE');
         $this->cache = new NativeCache();
         $this->cache->setConnected(true);
     }
@@ -41,7 +37,6 @@ final class AggressiveVerifyTest extends TestCase
     {
         NativeCache::reset();
         AggressiveVerify::clearCache();
-        putenv('GOLDLAPEL_AGGRESSIVE_VERIFY_ACTIVE');
     }
 
     private function makeResult(array $rows, ?int $colCount = null): PostgresResult
@@ -49,12 +44,12 @@ final class AggressiveVerifyTest extends TestCase
         return new FakePostgresResult($rows, $colCount);
     }
 
-    public function testCachedConnectionRawConstructorDefaultsToOff(): void
+    public function testCachedConnectionRawConstructorDefaultsToAuto(): void
     {
-        // Mirror of the sync raw-constructor default — opt-in semantics.
+        // Mirror of the sync raw-constructor default — always-on bump.
         $real = $this->createMock(PostgresExecutor::class);
         $cached = new CachedConnection($real, $this->cache);
-        $this->assertFalse($cached->isAggressiveVerifyActive());
+        $this->assertTrue($cached->isAggressiveVerifyActive());
     }
 
     public function testCachedConnectionExplicitOnIsActive(): void
@@ -68,20 +63,21 @@ final class AggressiveVerifyTest extends TestCase
     {
         $real = $this->createMock(PostgresExecutor::class);
         $cached = new CachedConnection($real, $this->cache, AggressiveVerify::MODE_OFF);
-        $this->assertFalse($cached->isAggressiveVerifyActive());
+        // Off mode emits a one-shot warning when resolved — suppress
+        // for this assertion.
+        $this->assertFalse(@$cached->isAggressiveVerifyActive());
     }
 
-    public function testCachedConnectionAutoTriggersDetection(): void
+    public function testCachedConnectionAutoBumpsAfterWrite(): void
     {
-        // Auto mode + a detector that returns true → resolves to active.
-        // We supply a fake-detection result by mocking the executor's
-        // query() with the detection-SQL match.
-        $detectionResult = $this->makeResult([['present' => true]]);
+        // Auto mode: a DML write bumps the connection's dml_seq counter
+        // with zero round-trips. No pg_trigger / pg_settings probe.
+        $writeResult = $this->makeResult([], 0);
         $real = $this->createMock(PostgresExecutor::class);
         $real->expects($this->once())
             ->method('query')
-            ->with($this->stringContains('pg_trigger'))
-            ->willReturn($detectionResult);
+            ->with($this->stringContains('INSERT'))
+            ->willReturn($writeResult);
 
         $cached = new CachedConnection(
             $real,
@@ -89,50 +85,21 @@ final class AggressiveVerifyTest extends TestCase
             AggressiveVerify::MODE_AUTO,
             'amp-test-' . __METHOD__,
         );
-        $this->assertTrue($cached->isAggressiveVerifyActive());
-    }
+        $beforeSeq = $cached->getGucState()->dmlSeq();
+        $beforeHash = $cached->getGucState()->stateHash();
+        $cached->query("INSERT INTO orders VALUES (1)");
 
-    public function testCachedConnectionAutoFalseDetection(): void
-    {
-        $detectionResult = $this->makeResult([['present' => false]]);
-        $real = $this->createMock(PostgresExecutor::class);
-        $real->expects($this->once())
-            ->method('query')
-            ->with($this->stringContains('pg_trigger'))
-            ->willReturn($detectionResult);
-
-        $cached = new CachedConnection(
-            $real,
-            $this->cache,
-            AggressiveVerify::MODE_AUTO,
-            'amp-test-' . __METHOD__,
-        );
-        $this->assertFalse($cached->isAggressiveVerifyActive());
-    }
-
-    public function testCachedConnectionLicensePayloadOverridesDetection(): void
-    {
-        putenv('GOLDLAPEL_AGGRESSIVE_VERIFY_ACTIVE=true');
-        $real = $this->createMock(PostgresExecutor::class);
-        // No query() call — license payload bypasses detection.
-        $real->expects($this->never())->method('query');
-        $cached = new CachedConnection(
-            $real,
-            $this->cache,
-            AggressiveVerify::MODE_AUTO,
-            'amp-test-' . __METHOD__,
-        );
-        $this->assertTrue($cached->isAggressiveVerifyActive());
+        $this->assertSame($beforeSeq + 1, $cached->getGucState()->dmlSeq());
+        $this->assertNotSame($beforeHash, $cached->getGucState()->stateHash());
     }
 
     public function testPostWriteVerifyAsyncIsNoopWhenInactive(): void
     {
-        // Off mode → postWriteVerifyAsync is an early return, never
-        // schedules an async probe. We assert by checking that no extra
-        // query() calls fire on the executor.
+        // Off mode → postWriteVerifyAsync is an early return; the
+        // dml_seq counter stays at 0.
         $real = $this->createMock(PostgresExecutor::class);
-        $real->expects($this->never())->method('query');
         $cached = new CachedConnection($real, $this->cache, AggressiveVerify::MODE_OFF);
-        $cached->postWriteVerifyAsync('INSERT INTO orders VALUES (1)');
+        @$cached->postWriteVerifyAsync('INSERT INTO orders VALUES (1)');
+        $this->assertSame(0, $cached->getGucState()->dmlSeq());
     }
 }

@@ -16,29 +16,28 @@ class CachedPDO extends \PDO
     private bool $inTransaction = false;
 
     /**
-     * User's aggressive-verify mode — `'auto'` (default), `'on'`, `'off'`.
-     * Drives whether postWriteVerify() runs after every DML statement to
-     * close the trigger-internal-SET coverage gap (see AggressiveVerify
-     * for the design rationale).
+     * User's aggressive-verify mode — `'auto'` (default, always bump),
+     * `'on'` (alias for 'auto'), or `'off'` (opt-out). Drives whether
+     * postWriteVerify() bumps the per-connection dml_seq counter after
+     * every DML — see AggressiveVerify for the precedence rules and
+     * ConnectionGucState::bumpDmlSeq for the cache-key isolation model.
      */
     private string $aggressiveVerifyMode;
 
     /**
-     * Stable identity used to key the static detection cache. Defaults
-     * to AggressiveVerify::defaultCacheKey($pdo) when the constructor's
-     * caller doesn't supply one — works correctly for the common case
-     * (one PDO per database) at the cost of re-probing if the same
-     * database is connected to via two PDO instances. Callers that hold
-     * the original DSN (the GoldLapel factory) pass a stable key so the
-     * detection runs once per (database, process).
+     * Stable connection identity used to deduplicate the off-mode
+     * warning across CachedPDO instances against the same database.
+     * Falls back to spl_object_hash($pdo) for callers that don't supply
+     * one — fine because the warning is a one-shot per (process, key)
+     * regardless of how many connections exist.
      */
-    private string $detectionCacheKey;
+    private string $aggressiveVerifyIdentity;
 
     /**
-     * Lazy-resolved decision: true = run postWriteVerify after DML;
-     * false = skip; null = not yet decided. Resolved on the first
-     * statement that would benefit from a verify, so a CachedPDO that
-     * never sees a write never pays the detection probe.
+     * Lazy-resolved decision: true = bump dml_seq after DML; false =
+     * skip; null = not yet decided. Resolved on the first statement
+     * that would benefit from a bump (cost: a string-compare + one
+     * trigger_error in the off path).
      */
     private ?bool $aggressiveVerifyActive = null;
 
@@ -46,25 +45,23 @@ class CachedPDO extends \PDO
     // We intentionally skip parent::__construct() to avoid opening a
     // second connection — all calls delegate to the wrapped $pdo.
     //
-    // The aggressive-verify default is `'off'` on the raw constructor —
-    // calling code that builds a CachedPDO outside the GoldLapel factory
-    // is opting into the wrapper at a low level and should opt in
-    // explicitly if they want the post-DML verify pass. The factory
-    // path (GoldLapel::wrapPDO / GoldLapel::cached) defaults to `'auto'`
-    // and is the documented entry point for end-users.
+    // Aggressive verify defaults to 'auto' across the board — the bump
+    // is zero-cost (no round-trip) so there's no upside to defaulting
+    // off. Callers that opted into the wrapper at a low level get the
+    // same correctness envelope as the documented factory path.
     public function __construct(
         \PDO $pdo,
         NativeCache $cache,
-        string $aggressiveVerifyMode = AggressiveVerify::MODE_OFF,
-        ?string $detectionCacheKey = null,
+        string $aggressiveVerifyMode = AggressiveVerify::MODE_AUTO,
+        ?string $aggressiveVerifyIdentity = null,
     ) {
         // Do NOT call parent::__construct() — we delegate to $pdo instead.
         $this->pdo = $pdo;
         $this->cache = $cache;
         $this->gucState = new ConnectionGucState();
         $this->aggressiveVerifyMode = $aggressiveVerifyMode;
-        $this->detectionCacheKey = $detectionCacheKey
-            ?? AggressiveVerify::defaultCacheKey($pdo);
+        $this->aggressiveVerifyIdentity = $aggressiveVerifyIdentity
+            ?? ('pdo:' . spl_object_hash($pdo));
     }
 
     public function getWrappedPDO(): \PDO
@@ -88,61 +85,21 @@ class CachedPDO extends \PDO
     }
 
     /**
-     * Run a server-side verify pass if (and only if) the connection is
-     * marked dirty. Hands the result of
-     *   SELECT name, setting FROM pg_settings WHERE source='session'
-     * to ConnectionGucState::applyVerifyResult(), which rebuilds the
-     * unsafe-GUC subset and clears the dirty flag.
+     * Force the connection into the dirty state. While dirty, the L1
+     * cache is bypassed for this connection — both reads and the
+     * current query route to the proxy directly, so a server-side
+     * state mutation we couldn't observe (persistent-PDO reuse,
+     * partial-failure recovery) can never serve a stale cached
+     * response.
      *
-     * Calling pattern: the wrapper invokes this lazily on every
-     * acquire / reuse point. Persistent PDO connections (PDO::ATTR_PERSISTENT)
-     * are the closest PHP analog to a connection pool — when the same
-     * underlying PDO handle is handed back to a new request, a previous
-     * request might have stored-function-SET an `app.user_id` we never
-     * saw. Verify-on-reuse is the universal fallback that closes that
-     * gap regardless of whether the underlying PDO is persistent.
+     * The dirty flag is cleared on the next DISCARD ALL (the universal
+     * "server is in default state" signal) or explicitly via the
+     * downstream observer's clearDirty() — see ConnectionGucState.
      *
-     * Idempotent — calling on a clean connection is free (just a flag
-     * read). On verify-query failure, the connection stays dirty so the
-     * NEXT acquire path retries; the user's query is never blocked or
-     * errored by our verify failure.
-     *
-     * Returns true if a verify ran successfully, false otherwise (clean
-     * connection, or verify query failed).
-     */
-    public function verifyIfDirty(): bool
-    {
-        if (!$this->gucState->isDirty()) {
-            return false;
-        }
-        try {
-            $stmt = $this->pdo->query(
-                "SELECT name, setting FROM pg_settings WHERE source='session'"
-            );
-            if ($stmt === false) {
-                return false;
-            }
-            $rows = $stmt->fetchAll(\PDO::FETCH_ASSOC);
-            if (!is_array($rows)) {
-                return false;
-            }
-            $this->gucState->applyVerifyResult($rows);
-            return true;
-        } catch (\Throwable $e) {
-            // Verify failure is silent — the connection stays dirty,
-            // the next acquire retries. We never propagate to the
-            // caller because the user's query hasn't even started yet.
-            return false;
-        }
-    }
-
-    /**
-     * Force the connection into the dirty state, so the next
-     * verifyIfDirty() call will run the server-side verify pass.
-     * Exposed for the persistent-PDO reuse path: a frontend that
-     * hands a wrapped persistent PDO back to a new request can
-     * call markStateDirty() to ensure the next query path
-     * re-syncs unsafe-GUC state.
+     * Exposed for the persistent-PDO reuse path: a frontend that hands
+     * a wrapped persistent PDO back to a new request should call
+     * markStateDirty() to opt subsequent reads out of L1 until the
+     * connection is recycled / DISCARDed.
      */
     public function markStateDirty(): void
     {
@@ -150,60 +107,70 @@ class CachedPDO extends \PDO
     }
 
     /**
-     * Post-call verify for top-level `SELECT <function>(...)` shapes.
-     * Stored functions can issue `SET app.user_id = ...` server-side,
-     * which the wire-side observeSql() never sees. After capturing the
-     * user's result, we run the verify-on-checkout query inline (sync
-     * PHP has no native off-thread path — Amp users get the async
-     * variant via Amp\CachedConnection). On verify failure we mark the
-     * connection dirty so the NEXT acquire path retries; user's data
-     * has already been captured and is unaffected.
+     * Post-call dml_seq bump for top-level `SELECT <function>(...)`
+     * shapes. Stored functions can issue `SET app.user_id = ...`
+     * server-side, which the wire-side observeSql() never sees. We
+     * bump the per-connection dml_seq counter so any subsequent
+     * cacheable read on this connection cannot share a cache slot with
+     * a pre-call read — closing the same correctness gap as the post-
+     * DML bump path, with zero round-trips.
      *
-     * Tax: ~1 round-trip to the proxy on every recognised function-call
-     * statement. Documented in CachedPDO::query() — sync PHP can't
-     * defer this without breaking the Promise model the user expects.
+     * Pre-Wave-5 this ran an inline pg_settings probe. The probe is
+     * replaced by the counter bump (parity with the proxy's
+     * `ConnectionGucState::mark_post_dml`) for zero-RT correctness.
      *
      * Visibility is `public` (rather than private) so CachedPDOStatement
      * can invoke it after a prepare+execute path runs a top-level
-     * function call — the statement on its own has no PDO handle.
+     * function call.
      */
     public function postCallVerify(string $sql): void
     {
         if (!NativeCache::isTopLevelFunctionCall($sql)) {
             return;
         }
-        $this->runVerifyProbe();
+        // The function-call gap is functionally identical to the post-
+        // DML trigger-internal-SET gap (server-side state mutations not
+        // visible to the wire-side observer). The bump closes both. If
+        // the user opted out via 'off' we honour that decision here
+        // too — they signed up for the correctness envelope shrink.
+        if (!$this->resolveAggressiveVerifyActive()) {
+            return;
+        }
+        $this->gucState->bumpDmlSeq();
     }
 
     /**
-     * Aggressive-verify variant: run the verify-on-checkout probe
-     * unconditionally after a DML write, closing the trigger-internal-
-     * SET coverage gap. Sync PHP has no off-thread path — verify runs
-     * inline; tax is ~1 round-trip (~1ms in-cluster) per write. Async
-     * Amp\CachedConnection schedules via `Amp\async()` instead.
+     * Aggressive-verify variant: bump the per-connection dml_seq
+     * counter after a DML write, closing the trigger-internal-SET
+     * coverage gap by making any subsequent cacheable read on this
+     * connection unable to share a cache slot with a pre-DML read from
+     * the same connection. Zero round-trips — just a counter bump +
+     * hash recompute.
      *
-     * Only runs when aggressive verify is active for this connection.
-     * The decision is resolved lazily via AggressiveVerify::decide() —
-     * see resolveAggressiveVerifyActive() for the precedence rules
-     * (override > license payload > auto-detection).
+     * Runs only when aggressive verify is active ('auto' / 'on' — the
+     * default). When the user has explicitly opted out via 'off' this
+     * is a no-op; AggressiveVerify::decide() emitted a one-shot warning
+     * on the first call surfacing the correctness envelope shrink.
      *
-     * Same dirty-on-failure semantics as postCallVerify: the user's
-     * write has already been issued, so we never propagate; failure
-     * just marks dirty so the next acquire retries.
+     * Pre-Wave-5 this ran an inline `SELECT name, setting FROM
+     * pg_settings WHERE source='session'` probe and applied the result
+     * via ConnectionGucState::applyVerifyResult(). That cost ~1ms per
+     * write on a fast cluster; Wave 5 replaced it with the dml_seq
+     * bump (mirroring `ConnectionGucState::mark_post_dml()` on the
+     * proxy) for zero-RT correctness.
      */
     public function postWriteVerify(string $sql): void
     {
         if (!$this->resolveAggressiveVerifyActive()) {
             return;
         }
-        $this->runVerifyProbe();
+        $this->gucState->bumpDmlSeq();
     }
 
     /**
      * Public accessor for the resolved aggressive-verify decision.
-     * Triggers detection on first call; subsequent calls return the
-     * cached result. Exposed for tests + diagnostics — production code
-     * paths reach it indirectly via postWriteVerify().
+     * Exposed for tests + diagnostics — production code paths reach it
+     * indirectly via postWriteVerify().
      */
     public function isAggressiveVerifyActive(): bool
     {
@@ -212,10 +179,8 @@ class CachedPDO extends \PDO
 
     /**
      * Lazy resolver — runs once per CachedPDO. Delegates to
-     * AggressiveVerify::decide() with a PDO-backed detector. The
-     * detection probe (when needed) hits pg_trigger / pg_proc via the
-     * wrapped PDO; result is cached statically by AggressiveVerify on
-     * the supplied cache key.
+     * AggressiveVerify::decide(). The off-mode warning fires here on
+     * first call (deduped per connection identity by AggressiveVerify).
      */
     private function resolveAggressiveVerifyActive(): bool
     {
@@ -224,40 +189,9 @@ class CachedPDO extends \PDO
         }
         $this->aggressiveVerifyActive = AggressiveVerify::decide(
             $this->aggressiveVerifyMode,
-            $this->detectionCacheKey,
-            AggressiveVerify::pdoDetector($this->pdo),
+            $this->aggressiveVerifyIdentity,
         );
         return $this->aggressiveVerifyActive;
-    }
-
-    /**
-     * Shared verify body — issues the pg_settings probe, applies the
-     * result, marks dirty on failure. Used by both postCallVerify (top-
-     * level function-call shape) and postWriteVerify (aggressive mode,
-     * after every DML). Centralized so the dirty-on-failure semantics
-     * stay identical across both call sites.
-     */
-    private function runVerifyProbe(): void
-    {
-        try {
-            $stmt = $this->pdo->query(
-                "SELECT name, setting FROM pg_settings WHERE source='session'"
-            );
-            if ($stmt === false) {
-                $this->gucState->markDirty();
-                return;
-            }
-            $rows = $stmt->fetchAll(\PDO::FETCH_ASSOC);
-            if (!is_array($rows)) {
-                $this->gucState->markDirty();
-                return;
-            }
-            $this->gucState->applyVerifyResult($rows);
-        } catch (\Throwable $e) {
-            // Mark dirty so the NEXT acquire path retries the verify.
-            // Never propagate — the user's data is already captured.
-            $this->gucState->markDirty();
-        }
     }
 
     /**
@@ -279,8 +213,9 @@ class CachedPDO extends \PDO
      * BEFORE invoking the closure (so observe-derived data like
      * post-state hashes can be captured ahead of the real call). On
      * failure (`PDOException` thrown OR `false` returned), the snapshot
-     * is restored and the connection is marked dirty so the next
-     * acquire's verify-on-checkout pass resyncs from `pg_settings`.
+     * is restored and the connection is marked dirty so subsequent
+     * cache reads bypass L1 (route straight to the proxy) until the
+     * connection is recycled via DISCARD ALL or explicit clearDirty().
      *
      * The server may apply a prefix of a multi-stmt Q before erroring
      * on a later segment; we can't tell which one failed, so restore +
@@ -325,8 +260,8 @@ class CachedPDO extends \PDO
         if ($observed) {
             // Server may have applied a prefix of a multi-stmt body
             // before erroring on a later segment. We can't tell which,
-            // so markDirty so the next acquire's verify-on-checkout
-            // reconciles from pg_settings.
+            // so markDirty — subsequent reads bypass L1 until the
+            // connection is recycled.
             $this->gucState->markDirty();
         }
     }
@@ -363,13 +298,6 @@ class CachedPDO extends \PDO
 
     public function query(string $sql, ...$args): CachedPDOStatement|false
     {
-        // Verify-on-checkout fallback: if a previous code path marked
-        // the connection dirty (e.g. persistent PDO reuse, an earlier
-        // post-call verify failure), reconstruct the unsafe-GUC state
-        // from pg_settings before the read path uses the state hash.
-        // No-op on clean connections.
-        $this->verifyIfDirty();
-
         // Wave 2: capture the pre-observation snapshot so we can roll
         // the state map back if PDO reports failure. observeSql() below
         // mutates the live map optimistically; the runWithRecovery()
@@ -440,14 +368,14 @@ class CachedPDO extends \PDO
             } elseif ($finalTx === true) {
                 $this->inTransaction = true;
             }
-            // Aggressive verify (smart-auto-enable, opt-out): close the
-            // trigger-internal-SET coverage gap by probing pg_settings
-            // after every DML. Skipped inside a tx (cache is bypassed
-            // and any non-LOCAL SET issued by the trigger will be
-            // visible at COMMIT — the next acquire's verify-on-checkout
-            // catches it). The function-call branch below stays for
-            // top-level `SELECT my_func()` shapes that detectWritesMulti
-            // doesn't classify as writes.
+            // Aggressive verify (always-on bump, opt-out via 'off'):
+            // close the trigger-internal-SET coverage gap by bumping
+            // dml_seq after every DML so subsequent cacheable reads on
+            // this connection route to a fresh cache slot. Skipped
+            // inside a tx (cache is bypassed and any non-LOCAL SET
+            // issued by the trigger surfaces at COMMIT). The function-
+            // call branch below stays for top-level `SELECT my_func()`
+            // shapes that detectWritesMulti doesn't classify as writes.
             if (!$this->inTransaction && $writeTables !== NativeCache::DDL_SENTINEL) {
                 $this->postWriteVerify($sql);
             }
@@ -532,17 +460,29 @@ class CachedPDO extends \PDO
             return $stmt !== false ? new CachedPDOStatement($stmt, $this->cache, $this->gucState, $sql, null, $this->inTransaction, $this) : false;
         }
 
+        // Dirty-flag bypass: when the connection is marked dirty
+        // (persistent-PDO reuse, partial-failure recovery, etc.) the
+        // server-side state may be out of sync with our wrapper-side
+        // map. Route both reads and the current query straight to the
+        // proxy rather than risk serving a cached response keyed on
+        // stale state. The flag clears on the next DISCARD ALL or
+        // explicit clearDirty().
+        $dirtyBypass = $this->gucState->isDirty();
+
         // Read path: check native cache, keyed on this connection's
-        // (post-observation) GUC fingerprint.
+        // (post-observation) GUC fingerprint. Skipped when dirty.
         $stateHash = $this->gucState->stateHash();
-        $entry = $this->cache->get($sql, null, $stateHash);
-        if ($entry !== null) {
-            // Cache hit: function body did NOT execute server-side, so
-            // there's no new state to verify. Return without verify.
-            return CachedPDOStatement::fromCache($entry, $this->cache, $this->gucState, $sql);
+        if (!$dirtyBypass) {
+            $entry = $this->cache->get($sql, null, $stateHash);
+            if ($entry !== null) {
+                // Cache hit: function body did NOT execute server-side, so
+                // there's no new state to verify. Return without verify.
+                return CachedPDOStatement::fromCache($entry, $this->cache, $this->gucState, $sql);
+            }
         }
 
-        // Cache miss: execute for real with deferred-mutation discipline.
+        // Cache miss (or dirty bypass): execute for real with deferred-
+        // mutation discipline.
         try {
             $stmt = $this->runWithRecovery($preSnapshot, fn() => $this->pdo->query($sql, ...$args));
         } catch (\PDOException $e) {
@@ -562,16 +502,19 @@ class CachedPDO extends \PDO
             return false;
         }
 
-        // Cache the result under this connection's state hash.
+        // Cache the result under this connection's state hash. Skipped
+        // when dirty — we don't know what state the server is actually
+        // in, so we mustn't seed cache slots with maybe-wrong data.
         $rows = $stmt->fetchAll(\PDO::FETCH_ASSOC);
         $columns = !empty($rows) ? array_keys($rows[0]) : [];
-        $this->cache->put($sql, null, $rows, $columns, $stateHash);
+        if (!$dirtyBypass) {
+            $this->cache->put($sql, null, $rows, $columns, $stateHash);
+        }
 
-        // Post-call verify for top-level SELECT <function>(...). Synchronous
-        // in PHP — no off-thread option without Amp. ~1ms tax per call;
-        // documented in postCallVerify's docblock. Result data is already
-        // captured into $rows, so verify failure only marks dirty for the
-        // next acquire — user's response is unaffected.
+        // Post-call bump for top-level SELECT <function>(...). Stored
+        // functions may have SET-mutated session GUCs server-side; the
+        // bump isolates this connection's subsequent reads from any
+        // cached pre-call slots.
         $this->postCallVerify($sql);
 
         return CachedPDOStatement::fromCache(
@@ -610,9 +553,6 @@ class CachedPDO extends \PDO
 
     public function prepare(string $sql, array $options = []): CachedPDOStatement
     {
-        // Verify-on-checkout fallback runs at prepare-time so the
-        // execute() path's state hash is already trustworthy.
-        $this->verifyIfDirty();
         $realStmt = $this->pdo->prepare($sql, $options);
         return new CachedPDOStatement(
             $realStmt,
@@ -627,9 +567,6 @@ class CachedPDO extends \PDO
 
     public function exec(string $sql): int|false
     {
-        // Verify-on-checkout fallback (mirrors query()).
-        $this->verifyIfDirty();
-
         // Wave 2 deferred-mutation discipline (mirrors query()): snapshot
         // BEFORE observing so we can revert if PDO reports failure.
         $preSnapshot = $this->gucState->snapshot();
@@ -700,12 +637,13 @@ class CachedPDO extends \PDO
         // (`SELECT my_handler()` issued via exec). Skip inside a tx —
         // see CachedPDO::query() for the rationale.
         if (!$this->inTransaction && $result !== false) {
-            // Aggressive verify (smart-auto-enable): close the trigger-
-            // internal-SET gap by probing after every DML. Mirrors the
-            // same gating as query()'s write branch — skipped inside a
-            // tx (verify-on-checkout fires after COMMIT) and for pure
-            // DDL (we already invalidate everything; the next read does
-            // a verify-on-checkout if dirty).
+            // Aggressive verify (always-on bump, opt-out via 'off'):
+            // close the trigger-internal-SET gap by bumping dml_seq
+            // after every DML. Mirrors the same gating as query()'s
+            // write branch — skipped inside a tx (cache is bypassed
+            // and the bump surfaces at COMMIT via the next read) and
+            // for pure DDL (we already invalidate everything; the
+            // next read bypasses L1 if the connection is dirty).
             if ($writeTables !== null && $writeTables !== NativeCache::DDL_SENTINEL) {
                 $this->postWriteVerify($sql);
             }
@@ -774,9 +712,9 @@ class CachedPDO extends \PDO
         // pre-BEGIN snapshot to stay in sync. Restoration runs BEFORE
         // the real call so a `rollBack()` failure still leaves a
         // consistent wrapper state — the connection is in an indeterminate
-        // server state at that point anyway, and the next acquire will
-        // hit verify-on-checkout if any path marked dirty during the tx
-        // (e.g. a stored-function call that ran inside the tx).
+        // server state at that point anyway, and any dirty flag set
+        // during the tx (e.g. a stored-function call) keeps subsequent
+        // reads off L1 until the connection is recycled.
         $this->restoreTxSnapshot();
         return $this->pdo->rollBack();
     }
@@ -946,20 +884,31 @@ class CachedPDOStatement extends \PDOStatement
             return $this->runRealExecuteWithRecovery($params, $preSnapshot);
         }
 
+        // Dirty-flag bypass: when the connection is marked dirty (e.g.
+        // persistent-PDO reuse, partial-failure recovery on a prior
+        // statement) the wrapper-side state map may be out of sync
+        // with the server, so we route reads + the current execute
+        // straight through and don't seed cache slots with maybe-wrong
+        // results.
+        $dirtyBypass = $this->gucState->isDirty();
+
         // Read path: check native cache, keyed on this connection's GUC fingerprint.
         $stateHash = $this->gucState->stateHash();
-        $entry = $this->cache->get($this->sql, $effectiveParams, $stateHash);
-        if ($entry !== null) {
-            // Cache hit on a top-level function call: the function did
-            // NOT execute server-side. No new state to verify.
-            $this->cachedRows = $entry['rows'];
-            $this->cachedColumns = $entry['columns'];
-            $this->fetchIndex = 0;
-            $this->fromCache = true;
-            return true;
+        if (!$dirtyBypass) {
+            $entry = $this->cache->get($this->sql, $effectiveParams, $stateHash);
+            if ($entry !== null) {
+                // Cache hit on a top-level function call: the function did
+                // NOT execute server-side. No new state to verify.
+                $this->cachedRows = $entry['rows'];
+                $this->cachedColumns = $entry['columns'];
+                $this->fetchIndex = 0;
+                $this->fromCache = true;
+                return true;
+            }
         }
 
-        // Cache miss: execute for real with deferred-mutation discipline.
+        // Cache miss (or dirty bypass): execute for real with deferred-
+        // mutation discipline.
         $result = $this->runRealExecuteWithRecovery($params, $preSnapshot);
         if (!$result) {
             // Failed top-level function call may have partially run.
@@ -974,12 +923,15 @@ class CachedPDOStatement extends \PDOStatement
         // Try to cache the result. The columnCount() > 0 guard doubles as
         // a SET / RESET / LISTEN filter — those return zero columns, so
         // we never put their empty-row replies in the cache (parity with
-        // the JS NON_CACHEABLE_COMMANDS skip).
+        // the JS NON_CACHEABLE_COMMANDS skip). Skipped when dirty (don't
+        // seed slots with potentially stale-state results).
         if ($this->realStmt->columnCount() > 0) {
             try {
                 $rows = $this->realStmt->fetchAll(\PDO::FETCH_ASSOC);
                 $columns = !empty($rows) ? array_keys($rows[0]) : [];
-                $this->cache->put($this->sql, $effectiveParams, $rows, $columns, $stateHash);
+                if (!$dirtyBypass) {
+                    $this->cache->put($this->sql, $effectiveParams, $rows, $columns, $stateHash);
+                }
                 $this->cachedRows = $rows;
                 $this->cachedColumns = $columns;
                 $this->fetchIndex = 0;

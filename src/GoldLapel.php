@@ -91,10 +91,10 @@ class GoldLapel
     private bool $disableSqloptimize;
     private bool $disableAutoIndexes;
     /**
-     * Aggressive-verify mode. One of `'auto'` (default — smart-auto-
-     * enable based on a pg_trigger probe), `'on'` (always run post-DML
-     * verify), or `'off'` (never run it). See AggressiveVerify for the
-     * full decision precedence (override > license payload > auto).
+     * Aggressive-verify mode. One of `'auto'` (default — always bump
+     * dml_seq after DML / function calls), `'on'` (alias for 'auto'),
+     * or `'off'` (skip the bump and emit a one-shot warning). See
+     * AggressiveVerify for the mode-resolution details.
      */
     private string $aggressiveVerify;
     private array $config;
@@ -232,11 +232,12 @@ class GoldLapel
         // and surfaces on the native-cache telemetry snapshot as
         // `disabled: true`.
         $this->disableNativeCache = !empty($options['disable_native_cache']);
-        // Aggressive verify (post-DML verify pass for trigger-internal
-        // SET coverage). 'auto' is the default — runs a one-time
-        // pg_trigger probe on first wrap and enables only if a trigger
-        // body is found that contains a SET on a namespaced GUC (the
-        // RLS-typical shape). 'on' / 'off' are explicit overrides.
+        // Aggressive verify (post-DML dml_seq bump for trigger-internal
+        // SET coverage). 'auto' is the default — bumps the per-
+        // connection counter after every observed DML / function call
+        // so any subsequent cacheable read on this connection can't
+        // share an L1 slot with a pre-DML read. 'on' is identical to
+        // 'auto'; 'off' is the opt-out (with a one-shot warning).
         // Validate eagerly so a misspelled value raises before spawn,
         // not silently at first DML.
         $aggressiveVerifyRaw = $options['aggressive_verify'] ?? AggressiveVerify::MODE_AUTO;
@@ -293,7 +294,7 @@ class GoldLapel
      *   - 'disable_matviews' (bool): emit `--disable-matviews`. Skip materialized-view rewrites.
      *   - 'disable_sqloptimize' (bool): emit `--disable-sqloptimize`. Master kill-switch for query rewriting + coalescing.
      *   - 'disable_auto_indexes' (bool): emit `--disable-auto-indexes`. Master kill-switch for automatic index creation.
-     *   - 'aggressive_verify' (string): one of 'auto' (default), 'on', 'off'. Controls whether the wrapper runs a post-DML verify pass to close the trigger-internal-SET coverage gap. 'auto' enables it only when a one-time pg_trigger probe finds a trigger body that mutates session state (the RLS-typical shape). 'on' forces it on (~1ms tax per write); 'off' disables both detection and the probe. The proxy may also override this via the license payload (`GOLDLAPEL_AGGRESSIVE_VERIFY_ACTIVE` env var) — explicit 'on'/'off' here wins over the payload.
+     *   - 'aggressive_verify' (string): one of 'auto' (default), 'on', 'off'. Controls whether the wrapper bumps a per-connection dml_seq counter after every observed DML / function-call to close the trigger-internal-SET coverage gap. 'auto' / 'on' both enable the bump (zero round-trips — just a counter mix into the L1 cache-key state hash, so post-DML reads can't share a cache slot with pre-DML reads on the same connection). 'off' disables it and emits a one-shot warning surfacing the correctness envelope shrink.
      *
      * Promoted top-level concepts (proxy_port, dashboard_port, etc.) are NOT
      * valid keys inside `config` — passing them there raises at construction

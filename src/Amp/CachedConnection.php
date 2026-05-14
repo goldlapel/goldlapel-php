@@ -58,23 +58,23 @@ class CachedConnection implements PostgresExecutor
      * for the design; mirrors the sync CachedPDO fields exactly.
      */
     private string $aggressiveVerifyMode;
-    private string $detectionCacheKey;
+    private string $aggressiveVerifyIdentity;
     private ?bool $aggressiveVerifyActive = null;
 
     /**
-     * Aggressive-verify default mirrors the sync CachedPDO: raw
-     * constructor defaults to `'off'`; the factory path (GoldLapel\Amp\
-     * GoldLapel::wrapCached) supplies `'auto'`.
+     * Aggressive verify defaults to 'auto' across the board — the
+     * bump is zero-cost (no round-trip) so there's no upside to
+     * defaulting off.
      */
     public function __construct(
         private PostgresExecutor $real,
         private NativeCache $cache,
-        string $aggressiveVerifyMode = AggressiveVerify::MODE_OFF,
-        ?string $detectionCacheKey = null,
+        string $aggressiveVerifyMode = AggressiveVerify::MODE_AUTO,
+        ?string $aggressiveVerifyIdentity = null,
     ) {
         $this->gucState = new ConnectionGucState();
         $this->aggressiveVerifyMode = $aggressiveVerifyMode;
-        $this->detectionCacheKey = $detectionCacheKey
+        $this->aggressiveVerifyIdentity = $aggressiveVerifyIdentity
             ?? 'amp:' . spl_object_hash($real);
     }
 
@@ -99,40 +99,12 @@ class CachedConnection implements PostgresExecutor
     }
 
     /**
-     * Run a server-side verify pass if (and only if) the connection is
-     * marked dirty. Async sibling of CachedPDO::verifyIfDirty() — runs
-     * inline on the current fiber; the caller is already in a fiber so
-     * the verify just yields a step in the event loop while the proxy
-     * round-trips. Idempotent and silent on failure (next acquire
-     * retries).
-     */
-    public function verifyIfDirty(): bool
-    {
-        if (!$this->gucState->isDirty()) {
-            return false;
-        }
-        try {
-            $result = $this->real->query(
-                "SELECT name, setting FROM pg_settings WHERE source='session'"
-            );
-            $rows = [];
-            foreach ($result as $row) {
-                $rows[] = $row;
-            }
-            $this->gucState->applyVerifyResult($rows);
-            return true;
-        } catch (\Throwable $e) {
-            // Connection stays dirty; next acquire retries. Never
-            // bubbles up — the user's query hasn't started yet.
-            return false;
-        }
-    }
-
-    /**
-     * Force the connection into the dirty state. Symmetrical with
-     * CachedPDO::markStateDirty() — exposed for `Amp\CachedConnection`
-     * reuse points where a frontend hands the same wrapped connection
-     * back to a new HTTP request.
+     * Force the connection into the dirty state. While dirty, the L1
+     * cache is bypassed for this connection — both reads and the
+     * current query route to the proxy directly. Symmetrical with
+     * CachedPDO::markStateDirty(); exposed for connection-reuse points
+     * where a frontend hands the same wrapped CachedConnection back to
+     * a new HTTP request.
      */
     public function markStateDirty(): void
     {
@@ -140,47 +112,47 @@ class CachedConnection implements PostgresExecutor
     }
 
     /**
-     * Schedule a post-call verify in a parallel coroutine via
-     * `Amp\async()`. The user's query response is already captured
-     * before this fires, so the verify runs without blocking the
-     * caller. On failure we mark the connection dirty so the next
-     * acquire path retries — never propagated as a user-visible error.
-     *
-     * Public so the executor's call paths AND any future statement
-     * wrapper can both invoke it.
+     * Post-call dml_seq bump for top-level `SELECT <function>(...)`
+     * shapes. Async sibling of CachedPDO::postCallVerify — the same
+     * cache-key isolation strategy works without an event-loop trip
+     * since the bump is pure-PHP. The "Async" suffix is retained for
+     * API stability across the wrapper's earlier waves.
      */
     public function postCallVerifyAsync(string $sql): void
     {
         if (!NativeCache::isTopLevelFunctionCall($sql)) {
             return;
         }
-        $this->scheduleVerifyProbe();
+        if (!$this->resolveAggressiveVerifyActive()) {
+            return;
+        }
+        $this->gucState->bumpDmlSeq();
     }
 
     /**
-     * Async sibling of CachedPDO::postWriteVerify — schedules an
-     * aggressive-verify probe in a sibling coroutine after a DML write,
-     * closing the trigger-internal-SET coverage gap. Returns immediately;
-     * the verify yields a step in the event loop while the proxy round-
-     * trips. On failure marks dirty; never propagates to the user's
-     * response (already captured before this fires).
+     * Async sibling of CachedPDO::postWriteVerify — bumps the per-
+     * connection dml_seq counter after a DML write, closing the
+     * trigger-internal-SET coverage gap. Zero round-trips — just a
+     * counter bump + hash recompute, no Amp\async() scheduling
+     * needed. The "Async" suffix is retained for API stability.
      *
-     * Only fires when aggressive verify is active for this connection.
-     * See AggressiveVerify for the decision precedence.
+     * In Amp's fiber model the wrapper is already running in a
+     * coroutine; the single-coroutine semantics + the synchronous
+     * counter bump together guarantee any in-flight verify on this
+     * connection holds back subsequent reads on the same coroutine
+     * (PHP is single-threaded; Amp coroutines are co-operative).
      */
     public function postWriteVerifyAsync(string $sql): void
     {
         if (!$this->resolveAggressiveVerifyActive()) {
             return;
         }
-        $this->scheduleVerifyProbe();
+        $this->gucState->bumpDmlSeq();
     }
 
     /**
      * Public accessor for the resolved aggressive-verify decision.
-     * Mirrors CachedPDO::isAggressiveVerifyActive(); detection runs
-     * lazily on first call (sync probe inside the calling fiber, since
-     * the decision is needed before scheduling further async work).
+     * Mirrors CachedPDO::isAggressiveVerifyActive().
      */
     public function isAggressiveVerifyActive(): bool
     {
@@ -188,88 +160,35 @@ class CachedConnection implements PostgresExecutor
     }
 
     /**
-     * Lazy resolver — runs once per CachedConnection. Detection probe
-     * (when needed) runs synchronously in the calling fiber via the
-     * Amp\Postgres executor; cached statically by AggressiveVerify on
-     * the supplied cache key.
+     * Lazy resolver — runs once per CachedConnection. Delegates to
+     * AggressiveVerify::decide(); the off-mode warning fires here on
+     * first call (deduped by AggressiveVerify per connection identity).
      */
     private function resolveAggressiveVerifyActive(): bool
     {
         if ($this->aggressiveVerifyActive !== null) {
             return $this->aggressiveVerifyActive;
         }
-        $real = $this->real;
-        $detector = static function () use ($real): bool {
-            $result = $real->query(AggressiveVerify::DETECTION_SQL);
-            foreach ($result as $row) {
-                $val = $row['present'] ?? null;
-                if (is_bool($val)) {
-                    return $val;
-                }
-                if (is_int($val)) {
-                    return $val !== 0;
-                }
-                if (is_string($val)) {
-                    $lower = strtolower($val);
-                    return in_array($lower, ['t', 'true', '1', 'yes', 'on'], true);
-                }
-                return false;
-            }
-            return false;
-        };
         $this->aggressiveVerifyActive = AggressiveVerify::decide(
             $this->aggressiveVerifyMode,
-            $this->detectionCacheKey,
-            $detector,
+            $this->aggressiveVerifyIdentity,
         );
         return $this->aggressiveVerifyActive;
     }
 
     /**
-     * Shared async-verify body — fires the pg_settings probe in a
-     * sibling coroutine via Amp\async(). Used by both
-     * postCallVerifyAsync (top-level function-call shape) and
-     * postWriteVerifyAsync (aggressive mode, after every DML). The
-     * coroutine captures $real / $state by value — ForbidCloning on the
-     * trait means the closure can't accidentally resurrect a duplicate
-     * connection.
-     */
-    private function scheduleVerifyProbe(): void
-    {
-        $real = $this->real;
-        $state = $this->gucState;
-        \Amp\async(static function () use ($real, $state) {
-            try {
-                $result = $real->query(
-                    "SELECT name, setting FROM pg_settings WHERE source='session'"
-                );
-                $rows = [];
-                foreach ($result as $row) {
-                    $rows[] = $row;
-                }
-                $state->applyVerifyResult($rows);
-            } catch (\Throwable $e) {
-                $state->markDirty();
-            }
-        });
-    }
-
-    /**
      * Handle cache semantics for a SQL statement:
-     *   - run verify-on-checkout if dirty
      *   - detect TX boundaries (bypass cache inside a tx)
      *   - detect writes (invalidate)
      *   - drain pending invalidation signals
+     *   - bypass L1 if the connection is dirty (route straight through)
      *   - cache SELECTs when unparameterized; return cached PostgresResult
      *     via CachedResult if hit
-     *   - schedule async post-call verify on top-level SELECT <fn>(...)
+     *   - bump dml_seq on top-level SELECT <fn>(...) for cache-key isolation
      */
     private function handle(string $sql, ?array $params, \Closure $miss): PostgresResult
     {
         $this->cache->pollSignals();
-
-        // Verify-on-checkout fallback. No-op on clean connections.
-        $this->verifyIfDirty();
 
         // Wave 2 deferred-mutation discipline: snapshot BEFORE observe so
         // a thrown exception from the real `$miss()` call rolls the
@@ -290,8 +209,8 @@ class CachedConnection implements PostgresExecutor
                 // Server didn't apply the SET (or aborted partway through
                 // a multi-stmt body). Revert the optimistic mutation;
                 // mark dirty IF observation actually mutated state, so
-                // a failed SELECT that observed nothing doesn't trigger
-                // an unnecessary verify query on the next acquire.
+                // a failed SELECT that observed nothing doesn't force
+                // an unnecessary L1 bypass on the next acquire.
                 // amphp/postgres throws SqlQueryError / SqlException —
                 // the catch-all is appropriate since any exception means
                 // the result is unusable anyway.
@@ -343,18 +262,19 @@ class CachedConnection implements PostgresExecutor
             } elseif ($finalTx === true) {
                 $this->inTransaction = true;
             }
-            // Aggressive verify (smart-auto-enable, opt-out): close the
-            // trigger-internal-SET coverage gap. Skipped inside a tx
-            // (verify-on-checkout fires after COMMIT) and for pure DDL
-            // (we already invalidate everything; the next read does a
-            // verify-on-checkout if dirty). Returns immediately —
-            // verify runs in a sibling coroutine.
+            // Aggressive verify (always-on bump, opt-out via 'off'):
+            // close the trigger-internal-SET coverage gap by bumping
+            // dml_seq after every DML so subsequent cacheable reads on
+            // this connection route to a fresh cache slot. Skipped
+            // inside a tx (cache is bypassed and the bump surfaces at
+            // COMMIT via the next read) and for pure DDL (we already
+            // invalidate everything; the next read bypasses L1 if the
+            // connection is dirty).
             if (!$this->inTransaction && $writeTables !== NativeCache::DDL_SENTINEL) {
                 $this->postWriteVerifyAsync($sql);
             }
-            // Schedule async post-call verify if this write was actually
-            // a top-level function call. Returns immediately; verify runs
-            // in a sibling coroutine.
+            // Post-call dml_seq bump if this write was actually a top-
+            // level function call. Synchronous in the wrapper now.
             $this->postCallVerifyAsync($sql);
             return $r;
         }
@@ -398,12 +318,21 @@ class CachedConnection implements PostgresExecutor
             return $runMiss();
         }
 
+        // Dirty-flag bypass: when the connection is marked dirty (e.g.
+        // connection-reuse points, partial-failure recovery) we route
+        // reads + the current execute straight through and don't seed
+        // cache slots with results keyed on a state map that may not
+        // match the server.
+        $dirtyBypass = $this->gucState->isDirty();
+
         $stateHash = $this->gucState->stateHash();
-        $entry = $this->cache->get($sql, $params, $stateHash);
-        if ($entry !== null) {
-            // Cache hit on a function call: server didn't run the
-            // function body, so no new state to verify.
-            return new CachedResult($entry['rows']);
+        if (!$dirtyBypass) {
+            $entry = $this->cache->get($sql, $params, $stateHash);
+            if ($entry !== null) {
+                // Cache hit on a function call: server didn't run the
+                // function body, so no new state to verify.
+                return new CachedResult($entry['rows']);
+            }
         }
 
         $result = $runMiss();
@@ -413,19 +342,19 @@ class CachedConnection implements PostgresExecutor
         // column shape: SET / RESET / LISTEN / etc return PostgresCommandResult
         // whose getColumnCount() is null, and we don't want to bloat the cache
         // with empty-row entries that never serve real data. Mirrors the JS
-        // NON_CACHEABLE_COMMANDS skip.
+        // NON_CACHEABLE_COMMANDS skip. Skipped when dirty.
         $rows = [];
         foreach ($result as $row) {
             $rows[] = $row;
         }
         $columns = !empty($rows) ? array_keys($rows[0]) : [];
         $colCount = $result->getColumnCount();
-        if ($colCount !== null && $colCount > 0) {
+        if ($colCount !== null && $colCount > 0 && !$dirtyBypass) {
             $this->cache->put($sql, $params, $rows, $columns, $stateHash);
         }
-        // Async post-call verify. Returns immediately; the verify runs
-        // in a sibling coroutine and updates state when complete. The
-        // caller's response (via CachedResult) is already captured.
+        // Post-call dml_seq bump for top-level `SELECT <function>(...)`.
+        // Synchronous in the wrapper now — closes the cache-key isolation
+        // gap without an Amp\async() trip.
         $this->postCallVerifyAsync($sql);
         return new CachedResult($rows);
     }

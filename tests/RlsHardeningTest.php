@@ -402,57 +402,55 @@ class RlsHardeningTest extends TestCase
         $this->assertSame($other->stateHash(), $state->stateHash());
     }
 
-    public function testCachedPdoVerifyIfDirtyOnCleanIsNoop(): void
+    public function testCachedPdoDirtyFlagBypassesCacheRead(): void
     {
-        // verifyIfDirty on a clean connection returns false without
-        // touching the underlying PDO. We assert that with a PDO mock
-        // that would throw if called.
+        // Wave 5: when dirty, the wrapper bypasses the L1 cache rather
+        // than running a pg_settings reconcile query. Reads route
+        // straight through; nothing is seeded into the cache.
+        $userStmt = $this->createStub(\PDOStatement::class);
+        $userStmt->method('fetchAll')->willReturn([['n' => 1]]);
+
         $pdo = $this->createMock(\PDO::class);
-        $pdo->expects($this->never())->method('query');
+        // Only the user's real query — no pg_settings probe.
+        $pdo->expects($this->once())
+            ->method('query')
+            ->with('SELECT 1')
+            ->willReturn($userStmt);
+
         $cache = new NativeCache();
+        $cache->setConnected(true);
         $wrapper = new CachedPDO($pdo, $cache);
-        $this->assertFalse($wrapper->verifyIfDirty());
+        $wrapper->markStateDirty();
+        $wrapper->query('SELECT 1');
+
+        // Connection stays dirty (no implicit clear on read); cache
+        // remained untouched.
+        $this->assertTrue($wrapper->getGucState()->isDirty());
+        $this->assertSame(0, $cache->size());
     }
 
-    public function testCachedPdoVerifyIfDirtyRunsAndClearsDirty(): void
+    public function testCachedPdoDirtyFlagClearsOnDiscardAll(): void
     {
-        // Stub a PDOStatement with one verify row.
-        $stmt = $this->createStub(\PDOStatement::class);
-        $stmt->method('fetchAll')->willReturn([
-            ['name' => 'app.user_id', 'setting' => '42'],
-        ]);
+        // The dirty flag is cleared on DISCARD ALL — the universal
+        // "server is in default state" signal. Subsequent reads
+        // participate in L1 again.
+        $discardStmt = $this->createStub(\PDOStatement::class);
+        $discardStmt->method('fetchAll')->willReturn([]);
+        $discardStmt->method('columnCount')->willReturn(0);
+
         $pdo = $this->createMock(\PDO::class);
         $pdo->expects($this->once())
             ->method('query')
-            ->with($this->stringContains('pg_settings'))
-            ->willReturn($stmt);
+            ->with('DISCARD ALL')
+            ->willReturn($discardStmt);
 
         $cache = new NativeCache();
         $wrapper = new CachedPDO($pdo, $cache);
         $wrapper->markStateDirty();
         $this->assertTrue($wrapper->getGucState()->isDirty());
 
-        $ok = $wrapper->verifyIfDirty();
-        $this->assertTrue($ok);
+        $wrapper->query('DISCARD ALL');
         $this->assertFalse($wrapper->getGucState()->isDirty());
-        $this->assertNotSame('0', $wrapper->getGucState()->stateHash());
-    }
-
-    public function testCachedPdoVerifyIfDirtyKeepsDirtyOnFailure(): void
-    {
-        $pdo = $this->createMock(\PDO::class);
-        $pdo->expects($this->once())
-            ->method('query')
-            ->willThrowException(new \PDOException('boom'));
-
-        $cache = new NativeCache();
-        $wrapper = new CachedPDO($pdo, $cache);
-        $wrapper->markStateDirty();
-
-        $ok = $wrapper->verifyIfDirty();
-        $this->assertFalse($ok);
-        // Connection stays dirty for next acquire.
-        $this->assertTrue($wrapper->getGucState()->isDirty());
     }
 
     // ─── 5. Post-call verify on top-level SELECT <function>(...) ────────
@@ -497,42 +495,31 @@ class RlsHardeningTest extends TestCase
 
     public function testCachedPdoPostCallVerifyOnFunctionCall(): void
     {
-        // After SELECT my_handler(), the wrapper issues the verify query
-        // and applies its result. We stub the PDO so the function call
-        // returns one row, AND the follow-up pg_settings query returns
-        // a server-state row that the wrapper folds into state.
+        // Wave 5: SELECT my_handler() bumps the connection's dml_seq
+        // counter (zero round-trips). Any subsequent cacheable read
+        // routes to a different cache slot because the state hash
+        // rolled forward, closing the function-internal-SET gap.
         $funcStmt = $this->createStub(\PDOStatement::class);
         $funcStmt->method('fetchAll')->willReturn([['my_handler' => null]]);
 
-        $verifyStmt = $this->createStub(\PDOStatement::class);
-        $verifyStmt->method('fetchAll')->willReturn([
-            ['name' => 'app.user_id', 'setting' => '99'],
-        ]);
-
         $pdo = $this->createMock(\PDO::class);
-        $matcher = $this->exactly(2);
-        $pdo->expects($matcher)
+        // ONLY the function call — no pg_settings follow-up probe.
+        $pdo->expects($this->once())
             ->method('query')
-            ->willReturnCallback(function (string $sql) use ($matcher, $funcStmt, $verifyStmt) {
-                if ($matcher->numberOfInvocations() === 1) {
-                    $this->assertSame('SELECT my_handler()', $sql);
-                    return $funcStmt;
-                }
-                $this->assertStringContainsString('pg_settings', $sql);
-                return $verifyStmt;
-            });
+            ->with('SELECT my_handler()')
+            ->willReturn($funcStmt);
 
         $cache = new NativeCache();
         $wrapper = new CachedPDO($pdo, $cache);
 
+        $beforeSeq = $wrapper->getGucState()->dmlSeq();
+        $beforeHash = $wrapper->getGucState()->stateHash();
         $stmt = $wrapper->query('SELECT my_handler()');
         $this->assertNotFalse($stmt);
 
-        // After the function call + verify, state reflects the
-        // server-side mutation we never observed on the wire.
-        $other = new ConnectionGucState();
-        $other->observeSql("SET app.user_id = '99'");
-        $this->assertSame($other->stateHash(), $wrapper->getGucState()->stateHash());
+        // dml_seq bumped; state hash rolled forward.
+        $this->assertSame($beforeSeq + 1, $wrapper->getGucState()->dmlSeq());
+        $this->assertNotSame($beforeHash, $wrapper->getGucState()->stateHash());
     }
 
     public function testCachedPdoPostCallVerifySkippedOnPlainSelect(): void
@@ -571,31 +558,25 @@ class RlsHardeningTest extends TestCase
         $wrapper->query('SELECT my_handler()');
     }
 
-    public function testCachedPdoPostCallVerifyMarksDirtyOnFailure(): void
+    public function testCachedPdoPostCallVerifyHonoursOffMode(): void
     {
-        // Function executes OK but pg_settings query throws — wrapper
-        // marks the connection dirty for next acquire instead of
-        // bubbling the error to the user.
+        // Mode 'off' opts out of the dml_seq bump on function calls
+        // too — the user accepted the correctness envelope shrink for
+        // every path the wrapper would otherwise close.
         $funcStmt = $this->createStub(\PDOStatement::class);
         $funcStmt->method('fetchAll')->willReturn([['my_handler' => null]]);
 
         $pdo = $this->createMock(\PDO::class);
-        $matcher = $this->exactly(2);
-        $pdo->expects($matcher)
+        $pdo->expects($this->once())
             ->method('query')
-            ->willReturnCallback(function (string $sql) use ($matcher, $funcStmt) {
-                if ($matcher->numberOfInvocations() === 1) {
-                    return $funcStmt;
-                }
-                throw new \PDOException('proxy ate it');
-            });
+            ->willReturn($funcStmt);
 
         $cache = new NativeCache();
-        $wrapper = new CachedPDO($pdo, $cache);
-        $stmt = $wrapper->query('SELECT my_handler()');
+        $wrapper = new CachedPDO($pdo, $cache, \GoldLapel\AggressiveVerify::MODE_OFF);
+        @$wrapper->query('SELECT my_handler()');
 
-        $this->assertNotFalse($stmt);
-        $this->assertTrue($wrapper->getGucState()->isDirty());
+        $this->assertSame(0, $wrapper->getGucState()->dmlSeq());
+        $this->assertSame('0', $wrapper->getGucState()->stateHash());
     }
 
     public function testCachedPdoPostCallVerifyOnCacheHitSkipped(): void
@@ -620,29 +601,21 @@ class RlsHardeningTest extends TestCase
 
     public function testCachedPdoExecPathPostCallVerify(): void
     {
-        // exec() path also triggers post-call verify on top-level fn call.
-        $verifyStmt = $this->createStub(\PDOStatement::class);
-        $verifyStmt->method('fetchAll')->willReturn([
-            ['name' => 'app.tenant', 'setting' => 'acme'],
-        ]);
-
+        // exec() path also bumps dml_seq on a top-level fn call.
         $pdo = $this->createMock(\PDO::class);
         $pdo->expects($this->once())
             ->method('exec')
             ->with('SELECT my_handler()')
             ->willReturn(0);
-        $pdo->expects($this->once())
-            ->method('query')
-            ->with($this->stringContains('pg_settings'))
-            ->willReturn($verifyStmt);
+        // No pg_settings probe — Wave 5 replaced it with the bump.
+        $pdo->expects($this->never())->method('query');
 
         $cache = new NativeCache();
         $wrapper = new CachedPDO($pdo, $cache);
         $wrapper->exec('SELECT my_handler()');
 
-        $other = new ConnectionGucState();
-        $other->observeSql("SET app.tenant = 'acme'");
-        $this->assertSame($other->stateHash(), $wrapper->getGucState()->stateHash());
+        $this->assertSame(1, $wrapper->getGucState()->dmlSeq());
+        $this->assertNotSame('0', $wrapper->getGucState()->stateHash());
     }
 
     public function testCachedPdoExecPostCallVerifyMarksDirtyOnExecFailure(): void
@@ -659,117 +632,62 @@ class RlsHardeningTest extends TestCase
         $this->assertTrue($wrapper->getGucState()->isDirty());
     }
 
-    public function testVerifyDoesNotRefireAfterSuccessfulVerify(): void
+    public function testDirtyBypassDoesNotSeedCache(): void
     {
-        // After a successful verifyIfDirty(), subsequent query() calls
-        // must NOT re-issue the pg_settings query (the connection is
-        // clean again).
-        $verifyStmt = $this->createStub(\PDOStatement::class);
-        $verifyStmt->method('fetchAll')->willReturn([
-            ['name' => 'app.user_id', 'setting' => '7'],
-        ]);
+        // Each query() under a dirty connection routes through to the
+        // real PDO. We never seed the cache while dirty (would be
+        // unsafe: state map may not match server), so the next read
+        // also misses.
         $userStmt = $this->createStub(\PDOStatement::class);
         $userStmt->method('fetchAll')->willReturn([['n' => 1]]);
 
         $pdo = $this->createMock(\PDO::class);
-        // Expect: 1 verify + 2 user queries = 3 total.
-        $matcher = $this->exactly(3);
-        $pdo->expects($matcher)
+        $pdo->expects($this->exactly(2))
             ->method('query')
-            ->willReturnCallback(function (string $sql) use ($matcher, $verifyStmt, $userStmt) {
-                if ($matcher->numberOfInvocations() === 1) {
-                    $this->assertStringContainsString('pg_settings', $sql);
-                    return $verifyStmt;
-                }
-                $this->assertSame('SELECT 1', $sql);
-                return $userStmt;
-            });
-
-        $cache = new NativeCache();
-        $wrapper = new CachedPDO($pdo, $cache);
-        $wrapper->markStateDirty();
-        $wrapper->query('SELECT 1');
-        // No new dirty mark — second query goes straight to user SQL.
-        $wrapper->query('SELECT 1');
-    }
-
-    public function testQueryRunsVerifyIfDirtyBeforeSetObservation(): void
-    {
-        // Acquire-on-reuse: connection is dirty when query() is called,
-        // verify query fires first, then the user's read runs against
-        // the now-trustworthy state hash.
-        $verifyStmt = $this->createStub(\PDOStatement::class);
-        $verifyStmt->method('fetchAll')->willReturn([
-            ['name' => 'app.user_id', 'setting' => '7'],
-        ]);
-        $userStmt = $this->createStub(\PDOStatement::class);
-        $userStmt->method('fetchAll')->willReturn([['n' => 1]]);
-
-        $pdo = $this->createMock(\PDO::class);
-        $matcher = $this->exactly(2);
-        $pdo->expects($matcher)
-            ->method('query')
-            ->willReturnCallback(function (string $sql) use ($matcher, $verifyStmt, $userStmt) {
-                if ($matcher->numberOfInvocations() === 1) {
-                    $this->assertStringContainsString('pg_settings', $sql);
-                    return $verifyStmt;
-                }
-                $this->assertSame('SELECT 1', $sql);
-                return $userStmt;
-            });
-
-        $cache = new NativeCache();
-        $wrapper = new CachedPDO($pdo, $cache);
-        $wrapper->markStateDirty();
-        $wrapper->query('SELECT 1');
-
-        // Reconstructed state from the verify query is reflected in
-        // the connection's hash now.
-        $other = new ConnectionGucState();
-        $other->observeSql("SET app.user_id = '7'");
-        $this->assertSame($other->stateHash(), $wrapper->getGucState()->stateHash());
-    }
-
-    // ─── End-to-end: SET interleaved with verify-on-reuse ───────────────
-
-    public function testReuseAfterDirtyDoesNotLeakStaleHash(): void
-    {
-        // Scenario: persistent PDO is reused. Previous request mutated
-        // app.user_id to 'A' via a stored function (we never saw it).
-        // Frontend calls markStateDirty before handing off. Next
-        // request's first query() runs the verify, picks up app.user_id='A',
-        // then reads safely under that fingerprint.
-        $verifyStmt = $this->createStub(\PDOStatement::class);
-        $verifyStmt->method('fetchAll')->willReturn([
-            ['name' => 'app.user_id', 'setting' => 'A'],
-        ]);
-        $readStmt = $this->createStub(\PDOStatement::class);
-        $readStmt->method('fetchAll')->willReturn([['id' => 1]]);
-
-        $pdo = $this->createMock(\PDO::class);
-        $matcher = $this->exactly(2);
-        $pdo->expects($matcher)
-            ->method('query')
-            ->willReturnCallback(function (string $sql) use ($matcher, $verifyStmt, $readStmt) {
-                if ($matcher->numberOfInvocations() === 1) {
-                    $this->assertStringContainsString('pg_settings', $sql);
-                    return $verifyStmt;
-                }
-                $this->assertSame('SELECT * FROM accounts', $sql);
-                return $readStmt;
-            });
+            ->with('SELECT 1')
+            ->willReturn($userStmt);
 
         $cache = new NativeCache();
         $cache->setConnected(true);
         $wrapper = new CachedPDO($pdo, $cache);
         $wrapper->markStateDirty();
-        $wrapper->query('SELECT * FROM accounts');
+        $wrapper->query('SELECT 1');
+        // Still dirty (markStateDirty isn't cleared by reads).
+        $wrapper->query('SELECT 1');
+    }
 
-        // The cached row is keyed under user-A's reconstructed state.
-        $other = new ConnectionGucState();
-        $other->observeSql("SET app.user_id = 'A'");
-        $hit = $cache->get('SELECT * FROM accounts', null, $other->stateHash());
-        $this->assertNotNull($hit);
-        $this->assertSame([['id' => 1]], $hit['rows']);
+    // ─── End-to-end: persistent-PDO reuse safety ────────────────────────
+
+    public function testReuseAfterDirtyDoesNotServeStaleCacheHit(): void
+    {
+        // Scenario: persistent PDO is reused. Previous request mutated
+        // app.user_id to 'A' via a stored function (we never saw it).
+        // Frontend calls markStateDirty before handing off. Next
+        // request's first query() bypasses the cache because dirty —
+        // a pre-existing cached row under the wrong state hash CANNOT
+        // be served. The real PDO is called.
+        $readStmt = $this->createStub(\PDOStatement::class);
+        $readStmt->method('fetchAll')->willReturn([['id' => 1]]);
+
+        $pdo = $this->createMock(\PDO::class);
+        $pdo->expects($this->once())
+            ->method('query')
+            ->with('SELECT * FROM accounts')
+            ->willReturn($readStmt);
+
+        $cache = new NativeCache();
+        $cache->setConnected(true);
+        // Pre-seed a hostile cache slot under the empty state hash,
+        // mimicking a previous request that left behind a populated
+        // cache before app.user_id was server-side SET to 'A'.
+        $cache->put('SELECT * FROM accounts', null, [['id' => 999]], ['id'], '0');
+
+        $wrapper = new CachedPDO($pdo, $cache);
+        $wrapper->markStateDirty();
+        $stmt = $wrapper->query('SELECT * FROM accounts');
+        $rows = $stmt->fetchAll(\PDO::FETCH_ASSOC);
+        // The dirty-bypass routed to the real PDO; the stale-state
+        // cached row (id=999) was NOT served.
+        $this->assertSame([['id' => 1]], $rows);
     }
 }

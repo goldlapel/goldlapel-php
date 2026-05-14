@@ -162,10 +162,10 @@ class GoldLapel
         $this->config = $options['config'] ?? [];
         $this->extraArgs = $options['extra_args'] ?? [];
         $this->silent = !empty($options['silent']);
-        // Aggressive verify (smart-auto-enable, opt-out): see the sync
-        // GoldLapel constructor for the full rationale. Eager validation
-        // here so a misspelled value raises before spawn rather than
-        // silently at first DML inside a fiber.
+        // Aggressive verify (always-on dml_seq bump, opt-out via 'off'):
+        // see the sync GoldLapel constructor for the full rationale.
+        // Eager validation here so a misspelled value raises before
+        // spawn rather than silently at first DML inside a fiber.
         $aggressiveVerifyRaw = $options['aggressive_verify'] ?? AggressiveVerify::MODE_AUTO;
         if (!is_string($aggressiveVerifyRaw)) {
             throw new \InvalidArgumentException(
