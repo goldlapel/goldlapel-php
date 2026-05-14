@@ -24,14 +24,21 @@ namespace GoldLapel;
  * response. Tracking the parser shape lets tests assert on it without
  * affecting state.
  *
- * The dirty-flag + verify-on-checkout machinery exists for cases the
- * wire-side parser can't reach: stored-function SETs, persistent-PDO
- * reuse across requests, and any post-call verify we kicked off
- * asynchronously (Amp). On reuse, callers query
+ * The dirty flag exists for cases the wire-side parser can't reach
+ * with confidence: persistent-PDO reuse across requests, partial-
+ * failure recovery, and explicit caller-supplied "this connection's
+ * state may be out of sync" signals. While dirty, the L1 cache is
+ * bypassed for this connection — reads route straight to the proxy
+ * rather than risk serving a cached response keyed on stale state.
+ * The dirty flag clears on DISCARD ALL (the universal "server is in
+ * default state" signal) or explicit `clearDirty()`. See
+ * `ConnectionGucState::isDirty()` / `markDirty()` / `clearDirty()`.
+ *
+ * The optional `applyVerifyResult()` method lets callers feed a
  * `SELECT name, setting FROM pg_settings WHERE source='session'`
- * and feed the result into `applyVerifyResult()`, which rebuilds the
- * unsafe-subset state map. See `ConnectionGucState::isDirty()` /
- * `markDirty()` / `clearDirty()`.
+ * back into the tracker — useful for explicit-reconcile patterns
+ * (e.g. a long-lived connection pool that wants to occasionally re-
+ * sync rather than bypass forever). It's not on any hot path.
  */
 class ConnectionGucState
 {
@@ -46,14 +53,33 @@ class ConnectionGucState
     private array $gucState = [];
 
     /**
-     * Cached hex hash of $gucState, recomputed on every mutation. The
-     * string `"0"` is used for the empty (default) state — matches the
-     * proxy's u64 zero formatted as `{:x}`. Including this in the cache
-     * key means a fresh connection's slot is shared with peer connections
-     * that also haven't set any unsafe GUCs (the `SET app.user_id`-free
-     * majority), which is exactly what we want.
+     * Cached hex hash of $gucState mixed with $dmlSeq, recomputed on
+     * every mutation. The string `"0"` is used for the empty (default)
+     * state — matches the proxy's u64 zero formatted as `{:x}`.
+     * Including this in the cache key means a fresh connection's slot
+     * is shared with peer connections that also haven't set any unsafe
+     * GUCs AND have not yet issued a DML (the canonical fresh-
+     * connection state).
      */
     private string $gucStateHash = '0';
+
+    /**
+     * Monotonic counter bumped by `bumpDmlSeq()`. Mixed into the state
+     * hash so each post-DML lookup gets a unique cache slot, preventing
+     * a cached pre-DML response from being served to this connection
+     * after a server-side trigger may have SET-mutated session state
+     * (the trigger-internal-SET correctness gap in
+     * `docs/todos/guc-rls-cache-safety.md`). Reset to 0 whenever the
+     * unsafe-GUC map is wiped (RESET ALL / DISCARD ALL) so a recycled
+     * connection re-converges to a peer-shareable baseline.
+     *
+     * Mirrors the proxy's `ConnectionGucState::dml_seq` (u64); we use
+     * PHP int (signed 64-bit on LP64) and wrap with `% PHP_INT_MAX`
+     * arithmetic — overflow is purely theoretical (a connection would
+     * need ~9.2 quintillion DMLs before wrapping) but the safety net
+     * costs nothing.
+     */
+    private int $dmlSeq = 0;
 
     /**
      * Connection has had a state mutation since the last verify-on-
@@ -89,10 +115,11 @@ class ConnectionGucState
 
     /**
      * True if the connection's state may be out of sync with the server
-     * — i.e. a verify-on-checkout pass should run before relying on the
-     * state hash for cache keying. False after construction, after a
-     * successful applyVerifyResult(), or once a DISCARD ALL has been
-     * observed since the most recent markDirty().
+     * — i.e. callers MUST bypass the L1 cache (route reads straight to
+     * the proxy) and avoid seeding new slots while dirty. False after
+     * construction, after a successful applyVerifyResult(), after
+     * `clearDirty()`, or once a DISCARD ALL has been observed since the
+     * most recent markDirty().
      */
     public function isDirty(): bool
     {
@@ -131,6 +158,51 @@ class ConnectionGucState
     }
 
     /**
+     * Bump the post-DML sequence counter so the next cache-key
+     * computation on this connection produces a fresh slot. Called from
+     * the CachedPDO / Amp\CachedConnection write paths after every
+     * observed INSERT / UPDATE / DELETE / MERGE (when aggressive verify
+     * is active — see AggressiveVerify::decide()).
+     *
+     * The bump means any subsequent cacheable read on this connection
+     * cannot share a cache slot with a pre-DML read from the same
+     * connection — closing the trigger-internal-SET correctness gap.
+     * A server-side trigger that did `SET app.user_id = ...` would
+     * otherwise be invisible to the wire-side state observer; the bump
+     * sidesteps that by making the pre-DML cache slot unreachable.
+     *
+     * This is the v1 mitigation: cache-key isolation, not actual
+     * observation of the new GUC values. PG itself always knows its
+     * own session state (and produces correct results); we just
+     * guarantee the L1 cache can't hand back a stale response keyed on
+     * pre-trigger state.
+     *
+     * Costs: one int increment, one hash recompute. Zero round-trips.
+     * Idempotent in the worst-case overflow sense: PHP int arithmetic
+     * silently wraps on overflow (we explicitly mask to keep behaviour
+     * defined under both 32-bit and 64-bit PHP builds).
+     */
+    public function bumpDmlSeq(): void
+    {
+        // Mask to keep behaviour identical across 32-bit and 64-bit
+        // PHP builds. PHP_INT_MAX is the largest signed-int representable
+        // on the host; arithmetic above it silently casts to float on
+        // 32-bit. Wrapping with `& PHP_INT_MAX` keeps us inside int range
+        // on every platform without ever throwing.
+        $this->dmlSeq = ($this->dmlSeq + 1) & PHP_INT_MAX;
+        $this->recomputeStateHash();
+    }
+
+    /**
+     * Read-only accessor for the post-DML sequence counter. Exposed
+     * for tests + telemetry — production code never needs to read this.
+     */
+    public function dmlSeq(): int
+    {
+        return $this->dmlSeq;
+    }
+
+    /**
      * Capture an opaque snapshot of the full tracker state — unsafe-GUC
      * map + cached hash + dirty flag + DISCARD-since-dirty flag. Used by
      * the SET-actually-applied machinery to defer mutation until PDO
@@ -148,6 +220,7 @@ class ConnectionGucState
      * @return array{
      *   gucState: array<string, string>,
      *   gucStateHash: string,
+     *   dmlSeq: int,
      *   dirty: bool,
      *   discardObservedSinceDirty: bool,
      * }
@@ -157,6 +230,7 @@ class ConnectionGucState
         return [
             'gucState' => $this->gucState,
             'gucStateHash' => $this->gucStateHash,
+            'dmlSeq' => $this->dmlSeq,
             'dirty' => $this->dirty,
             'discardObservedSinceDirty' => $this->discardObservedSinceDirty,
         ];
@@ -173,6 +247,7 @@ class ConnectionGucState
      * @param array{
      *   gucState: array<string, string>,
      *   gucStateHash: string,
+     *   dmlSeq?: int,
      *   dirty: bool,
      *   discardObservedSinceDirty: bool,
      * } $snapshot
@@ -181,6 +256,10 @@ class ConnectionGucState
     {
         $this->gucState = $snapshot['gucState'];
         $this->gucStateHash = $snapshot['gucStateHash'];
+        // dmlSeq key tolerates older snapshots from callers that
+        // captured before Wave 5 (defaults to current value, leaving
+        // it untouched).
+        $this->dmlSeq = $snapshot['dmlSeq'] ?? $this->dmlSeq;
         $this->dirty = $snapshot['dirty'];
         $this->discardObservedSinceDirty = $snapshot['discardObservedSinceDirty'];
     }
@@ -352,9 +431,16 @@ class ConnectionGucState
                 // DISCARD ALL is equivalent to RESET ALL plus a few other
                 // session-state resets we don't track (sequences / temp
                 // tables / prepared plans). For the unsafe-GUC subset, the
-                // semantics are identical: clear the whole map.
-                if (!empty($this->gucState)) {
+                // semantics are identical: clear the whole map AND reset
+                // the post-DML sequence — a recycled connection returns
+                // to the peer-shareable baseline so its cache entries
+                // can be hit by any other connection (parity with the
+                // proxy's `ConnectionGucState::apply(SetCommand::ResetAll)`
+                // in `src/guc_state.rs`).
+                $hadState = !empty($this->gucState) || $this->dmlSeq !== 0;
+                if ($hadState) {
                     $this->gucState = [];
+                    $this->dmlSeq = 0;
                     $this->recomputeStateHash();
                 }
                 // DISCARD ALL is also the "server is now in default
@@ -383,18 +469,27 @@ class ConnectionGucState
     }
 
     /**
-     * Recompute the hash from $gucState. Sorted-key serialization gives
-     * us insertion-order independence (proxy uses BTreeMap, same
-     * guarantee — and goldlapel-ruby / goldlapel-python / goldlapel-js
-     * mirror this with sorted-iteration). xxh64 picked for speed and
-     * 64-bit width matching the proxy's u64; output is lowercase hex
-     * (16 chars) for populated state, with the bare `"0"` sentinel for
-     * empty state — by-construction non-collision since the lengths
-     * differ.
+     * Recompute the hash from $gucState mixed with $dmlSeq. Sorted-key
+     * serialization gives us insertion-order independence (proxy uses
+     * BTreeMap, same guarantee — and goldlapel-ruby / goldlapel-python
+     * / goldlapel-js mirror this with sorted-iteration). xxh64 picked
+     * for speed and 64-bit width matching the proxy's u64; output is
+     * lowercase hex (16 chars) for populated state, with the bare
+     * `"0"` sentinel for the canonical "fresh connection" state
+     * (no unsafe GUCs set AND no DMLs yet).
+     *
+     * The dml_seq mix lives at a fixed terminator past the GUC body
+     * so a connection with no SETs but a non-zero dml_seq still gets
+     * a unique hash. Parity with the proxy's `recompute_hash` in
+     * `src/guc_state.rs`.
      */
     private function recomputeStateHash(): void
     {
-        if (empty($this->gucState)) {
+        // Empty values + zero dmlSeq is the canonical "fresh
+        // connection" state — keep the hash exactly "0" so cache-slot-
+        // sharing semantics are preserved for the common case (no
+        // unsafe SETs, no DMLs yet).
+        if (empty($this->gucState) && $this->dmlSeq === 0) {
             $this->gucStateHash = '0';
             return;
         }
@@ -408,6 +503,11 @@ class ConnectionGucState
         foreach ($sorted as $k => $v) {
             $serialized .= $k . "\0" . $v . "\0";
         }
+        // Terminator + dml_seq. The "\1" separator distinguishes the
+        // GUC body from the dml_seq mix so a hypothetical GUC value
+        // containing literal nulls can't collide with a dml_seq-only
+        // permutation.
+        $serialized .= "\1" . $this->dmlSeq;
         $this->gucStateHash = hash('xxh64', $serialized);
     }
 }

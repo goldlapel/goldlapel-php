@@ -534,4 +534,154 @@ class NativeCacheStateHashTest extends TestCase
         $this->assertSame([['id' => 'A-row']], $cache->get($sql, null, $stateA->stateHash())['rows']);
         $this->assertSame([['id' => 'B-row']], $cache->get($sql, null, $stateB->stateHash())['rows']);
     }
+
+    // ─── bumpDmlSeq (Wave 5 — trigger-internal SET safety) ───────────────
+
+    public function testBumpDmlSeqRollsHashForward(): void
+    {
+        // Fresh connection starts at the canonical "0" hash. A bump
+        // rolls it forward — the post-DML read can't share a cache
+        // slot with the pre-DML read on the same connection.
+        $state = $this->makeState();
+        $this->assertSame(0, $state->dmlSeq());
+        $this->assertSame('0', $state->stateHash());
+
+        $state->bumpDmlSeq();
+        $this->assertSame(1, $state->dmlSeq());
+        $this->assertNotSame('0', $state->stateHash());
+    }
+
+    public function testBumpDmlSeqSequentialBumpsAreDistinct(): void
+    {
+        // Each bump produces a fresh hash — a pre-DML cache slot
+        // cannot leak forward across any number of writes.
+        $state = $this->makeState();
+        $hashes = [$state->stateHash()];
+        for ($i = 0; $i < 5; $i++) {
+            $state->bumpDmlSeq();
+            $hashes[] = $state->stateHash();
+        }
+        $this->assertSame(count($hashes), count(array_unique($hashes)));
+    }
+
+    public function testBumpDmlSeqCombinesWithUnsafeSet(): void
+    {
+        // The bump mixes with the unsafe-GUC body — a connection with
+        // an active SET AND a bump produces a distinct hash from a
+        // peer with the same SET but no bump.
+        $a = $this->makeState();
+        $b = $this->makeState();
+        $a->observeSql("SET app.user_id = '42'");
+        $b->observeSql("SET app.user_id = '42'");
+        $this->assertSame($a->stateHash(), $b->stateHash());
+
+        $a->bumpDmlSeq();
+        $this->assertNotSame($a->stateHash(), $b->stateHash());
+
+        $b->bumpDmlSeq();
+        $this->assertSame($a->stateHash(), $b->stateHash());
+    }
+
+    public function testBumpDmlSeqIsolatesFromPeerWithSameUnsafeGuc(): void
+    {
+        // Two connections with identical unsafe-GUC state — peer-
+        // shareable cache slot. After one bumps, the bumped
+        // connection drops out of the shared slot.
+        $a = $this->makeState();
+        $b = $this->makeState();
+        $a->observeSql("SET app.user_id = '42'");
+        $b->observeSql("SET app.user_id = '42'");
+        $shared = $a->stateHash();
+
+        $a->bumpDmlSeq();
+        $this->assertNotSame($shared, $a->stateHash());
+        $this->assertSame($shared, $b->stateHash());
+    }
+
+    public function testDiscardAllResetsDmlSeq(): void
+    {
+        // DISCARD ALL is the universal "server is in default state"
+        // signal — clears dml_seq + state map so the connection
+        // converges back to the peer-shareable baseline.
+        $state = $this->makeState();
+        $state->observeSql("SET app.user_id = '42'");
+        $state->bumpDmlSeq();
+        $state->bumpDmlSeq();
+        $state->bumpDmlSeq();
+        $this->assertSame(3, $state->dmlSeq());
+        $this->assertNotSame('0', $state->stateHash());
+
+        $state->observeSql('DISCARD ALL');
+        $this->assertSame(0, $state->dmlSeq());
+        $this->assertSame('0', $state->stateHash());
+    }
+
+    public function testResetAllResetsDmlSeq(): void
+    {
+        // RESET ALL is functionally identical to DISCARD ALL for the
+        // unsafe-GUC subset — same dml_seq reset behaviour.
+        $state = $this->makeState();
+        $state->observeSql("SET app.user_id = '42'");
+        $state->bumpDmlSeq();
+        $state->observeSql('RESET ALL');
+        $this->assertSame(0, $state->dmlSeq());
+        $this->assertSame('0', $state->stateHash());
+    }
+
+    public function testResetNamedDoesNotClearDmlSeq(): void
+    {
+        // RESET <single GUC> only clears that one GUC — dml_seq
+        // survives because the connection hasn't returned to default.
+        $state = $this->makeState();
+        $state->observeSql("SET app.user_id = '42'");
+        $state->bumpDmlSeq();
+        $state->observeSql('RESET app.user_id');
+        $this->assertSame(1, $state->dmlSeq());
+        $this->assertNotSame('0', $state->stateHash());
+    }
+
+    public function testBumpDmlSeqSurvivesSnapshotRoundTrip(): void
+    {
+        // Snapshot / restore preserves dml_seq. Critical for the
+        // ROLLBACK + failed-SET recovery paths — a tx that bumped
+        // dml_seq via an INSERT then rolled back keeps the bump (the
+        // INSERT did execute, even if the tx aborted; we don't want
+        // to share cache slots with a hypothetical clean state).
+        $state = $this->makeState();
+        $state->observeSql("SET app.user_id = '42'");
+        $state->bumpDmlSeq();
+        $state->bumpDmlSeq();
+        $snap = $state->snapshot();
+
+        $state->bumpDmlSeq();
+        $this->assertSame(3, $state->dmlSeq());
+
+        $state->restore($snap);
+        $this->assertSame(2, $state->dmlSeq());
+    }
+
+    public function testDmlBumpForcesCacheMissAfterPreDmlHit(): void
+    {
+        // End-to-end: same SQL keyed under the pre-DML state hash hits;
+        // the post-DML state hash misses (because the bump rolled the
+        // hash forward). Closes the trigger-internal-SET gap at the
+        // cache layer.
+        $cache = $this->makeCache();
+        $state = $this->makeState();
+        $sql = 'SELECT * FROM accounts';
+
+        // Pre-DML read populates a cache slot.
+        $cache->put($sql, null, [['id' => 'pre']], ['id'], $state->stateHash());
+        $this->assertSame(
+            [['id' => 'pre']],
+            $cache->get($sql, null, $state->stateHash())['rows'],
+        );
+
+        // Bump simulates the post-DML hash roll-forward.
+        $state->bumpDmlSeq();
+
+        // Same SQL under the new state hash MISSES — the pre-DML row
+        // cannot leak across the trigger-internal-SET boundary.
+        $this->assertNull($cache->get($sql, null, $state->stateHash()));
+    }
 }
