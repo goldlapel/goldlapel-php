@@ -6,273 +6,118 @@ use GoldLapel\AggressiveVerify;
 use PHPUnit\Framework\TestCase;
 
 /**
- * Unit tests for the standalone AggressiveVerify decision module.
+ * Unit tests for the simplified AggressiveVerify mode-resolution module.
  *
- * Three layers exercised:
- *   1. Decision precedence: explicit override > license payload > auto.
- *   2. Detection caching: probe runs at most once per cache key.
- *   3. PDO-backed detector: maps the EXISTS-predicate row to a bool
- *      tolerantly across pdo_pgsql's two return shapes.
+ * Wave 5 collapsed the previous smart-auto-enable machinery (pg_trigger
+ * probe + per-(database, process) detection cache + license-payload
+ * bit) into a flat three-mode decision: 'auto' / 'on' → bump,
+ * 'off' → no bump (with a one-shot warning). The actual cache-key
+ * isolation work is done by ConnectionGucState::bumpDmlSeq(); this
+ * module just resolves the mode string and emits the opt-out warning.
  *
- * Post-DML wiring on CachedPDO and Amp\CachedConnection lives in
- * tests/AggressiveVerifyWiringTest.php (sync) and
- * tests/Amp/AggressiveVerifyTest.php (async) — those depend on the
- * module being already in place, so they're tested separately.
- *
- * The license-payload path is exercised via the
- * GOLDLAPEL_AGGRESSIVE_VERIFY_ACTIVE env var, which is the proxy's
- * forward-compatible hook — set / unset around each assertion.
+ * Wiring tests (does CachedPDO + Amp\CachedConnection actually call
+ * bumpDmlSeq after a DML?) live in tests/AggressiveVerifyWiringTest.php
+ * and tests/Amp/AggressiveVerifyTest.php.
  */
 class AggressiveVerifyTest extends TestCase
 {
     protected function setUp(): void
     {
         AggressiveVerify::clearCache();
-        // Ensure no leftover env var from previous tests poisons the
-        // license-payload precedence assertions.
-        putenv('GOLDLAPEL_AGGRESSIVE_VERIFY_ACTIVE');
     }
 
     protected function tearDown(): void
     {
         AggressiveVerify::clearCache();
-        putenv('GOLDLAPEL_AGGRESSIVE_VERIFY_ACTIVE');
     }
 
-    // ─── Decision precedence ───────────────────────────────────────────
-
-    public function testExplicitOnAlwaysWins(): void
+    public function testAutoModeBumps(): void
     {
-        $detector = function (): bool {
-            $this->fail('detector should not run when mode is "on"');
-        };
-        $this->assertTrue(AggressiveVerify::decide('on', 'k', $detector));
+        // 'auto' is the documented default — always bump.
+        $this->assertTrue(AggressiveVerify::decide('auto', 'k'));
     }
 
-    public function testExplicitOffAlwaysWins(): void
+    public function testOnModeBumps(): void
     {
-        $detector = function (): bool {
-            $this->fail('detector should not run when mode is "off"');
-        };
-        $this->assertFalse(AggressiveVerify::decide('off', 'k', $detector));
+        // 'on' is the explicit opt-in. Same effective behaviour as
+        // 'auto'; kept as a distinct mode so a future smart-detect
+        // pass can flip 'auto' off without breaking explicit 'on'.
+        $this->assertTrue(AggressiveVerify::decide('on', 'k'));
     }
 
-    public function testExplicitOverrideBeatsLicensePayload(): void
+    public function testOffModeDoesNotBump(): void
     {
-        // Even if the proxy says "active=true" via the license payload,
-        // an explicit "off" from the user wins.
-        putenv('GOLDLAPEL_AGGRESSIVE_VERIFY_ACTIVE=true');
-        $this->assertFalse(AggressiveVerify::decide('off', 'k', fn() => true));
-
-        // And vice-versa — explicit "on" beats payload "false".
-        putenv('GOLDLAPEL_AGGRESSIVE_VERIFY_ACTIVE=false');
-        $this->assertTrue(AggressiveVerify::decide('on', 'k', fn() => false));
+        $this->assertFalse(@AggressiveVerify::decide('off', 'k'));
     }
 
-    public function testLicensePayloadTrueEnablesInAutoMode(): void
+    public function testOffModeEmitsWarningOnce(): void
     {
-        putenv('GOLDLAPEL_AGGRESSIVE_VERIFY_ACTIVE=true');
-        $detector = function (): bool {
-            $this->fail('detector should not run when license payload says true');
-        };
-        $this->assertTrue(AggressiveVerify::decide('auto', 'k', $detector));
-    }
+        // Capture trigger_error output. Tested with the @-suppress
+        // pattern: a deprecation/warning emitted under @ is swallowed
+        // entirely (PHP doesn't enter the error handler) — we want the
+        // warning to fire here, so use set_error_handler instead.
+        $caught = [];
+        set_error_handler(function ($errno, $msg) use (&$caught) {
+            $caught[] = [$errno, $msg];
+            return true;
+        }, E_USER_WARNING);
+        try {
+            AggressiveVerify::decide('off', 'connection-1');
+            $this->assertCount(1, $caught, 'off-mode should emit a warning');
+            $this->assertSame(E_USER_WARNING, $caught[0][0]);
+            $this->assertStringContainsString('aggressive_verify', $caught[0][1]);
+            $this->assertStringContainsString('off', $caught[0][1]);
 
-    public function testLicensePayloadFalseDisablesInAutoMode(): void
-    {
-        putenv('GOLDLAPEL_AGGRESSIVE_VERIFY_ACTIVE=false');
-        $detector = function (): bool {
-            $this->fail('detector should not run when license payload says false');
-        };
-        $this->assertFalse(AggressiveVerify::decide('auto', 'k', $detector));
-    }
+            // Second call with same cache key — warning is deduped.
+            AggressiveVerify::decide('off', 'connection-1');
+            $this->assertCount(1, $caught, 'duplicate off-mode call must not re-warn');
 
-    public function testLicensePayloadAcceptsCommonTruthyForms(): void
-    {
-        foreach (['true', 'TRUE', '1', 'yes', 'on', 'On'] as $value) {
-            putenv("GOLDLAPEL_AGGRESSIVE_VERIFY_ACTIVE={$value}");
-            $this->assertTrue(
-                AggressiveVerify::decide('auto', "k-{$value}", fn() => false),
-                "value '{$value}' should be coerced to true",
-            );
+            // Different cache key → fires again. Distinct connections
+            // each surface the warning once.
+            AggressiveVerify::decide('off', 'connection-2');
+            $this->assertCount(2, $caught, 'distinct connection identity should re-warn');
+        } finally {
+            restore_error_handler();
         }
     }
 
-    public function testLicensePayloadAcceptsCommonFalsyForms(): void
+    public function testClearCacheResetsWarningTracker(): void
     {
-        foreach (['false', 'FALSE', '0', 'no', 'off', 'Off'] as $value) {
-            putenv("GOLDLAPEL_AGGRESSIVE_VERIFY_ACTIVE={$value}");
-            $this->assertFalse(
-                AggressiveVerify::decide('auto', "k-{$value}", fn() => true),
-                "value '{$value}' should be coerced to false",
-            );
+        $caught = 0;
+        set_error_handler(function () use (&$caught) {
+            $caught++;
+            return true;
+        }, E_USER_WARNING);
+        try {
+            AggressiveVerify::decide('off', 'k');
+            $this->assertSame(1, $caught);
+            // Dedup on the same key.
+            AggressiveVerify::decide('off', 'k');
+            $this->assertSame(1, $caught);
+            // After clearCache(), the warning re-fires.
+            AggressiveVerify::clearCache();
+            AggressiveVerify::decide('off', 'k');
+            $this->assertSame(2, $caught);
+        } finally {
+            restore_error_handler();
         }
-    }
-
-    public function testLicensePayloadUnrecognisedValueFallsThroughToAuto(): void
-    {
-        // A bogus payload value (e.g. a future schema we don't know) is
-        // treated as "no override" — fall through to the detector. This
-        // is forward-compat: the proxy can ship new sentinel values
-        // without breaking older wrappers.
-        putenv('GOLDLAPEL_AGGRESSIVE_VERIFY_ACTIVE=maybe');
-        $this->assertTrue(AggressiveVerify::decide('auto', 'k', fn() => true));
-        $this->assertFalse(AggressiveVerify::decide('auto', 'k2', fn() => false));
-    }
-
-    public function testEmptyLicensePayloadFallsThroughToAuto(): void
-    {
-        // putenv with no value does NOT clear; setting to empty string
-        // is treated as "unset".
-        putenv('GOLDLAPEL_AGGRESSIVE_VERIFY_ACTIVE=');
-        $this->assertTrue(AggressiveVerify::decide('auto', 'k', fn() => true));
-    }
-
-    public function testAutoModeUsesDetector(): void
-    {
-        $this->assertTrue(AggressiveVerify::decide('auto', 'k1', fn() => true));
-        $this->assertFalse(AggressiveVerify::decide('auto', 'k2', fn() => false));
     }
 
     public function testUnrecognisedModeIsTreatedAsAuto(): void
     {
-        // Lenient parsing — anything other than 'on' / 'off' falls
-        // through to auto. Avoids surprising users who type 'true' or
-        // mis-spell.
-        $this->assertTrue(AggressiveVerify::decide('garbage', 'k', fn() => true));
-        $this->assertFalse(AggressiveVerify::decide('garbage', 'k2', fn() => false));
+        // Lenient parsing — anything other than 'off' falls through to
+        // bump. Avoids surprising users who type 'true' / 'maybe' /
+        // mis-spell; correctness-first default.
+        $this->assertTrue(AggressiveVerify::decide('garbage', 'k'));
+        $this->assertTrue(AggressiveVerify::decide('', 'k'));
     }
 
     public function testModeIsCaseInsensitive(): void
     {
-        $this->assertTrue(AggressiveVerify::decide('ON', 'k', fn() => false));
-        $this->assertTrue(AggressiveVerify::decide('On', 'k2', fn() => false));
-        $this->assertFalse(AggressiveVerify::decide('OFF', 'k3', fn() => true));
-    }
-
-    // ─── Detection caching ─────────────────────────────────────────────
-
-    public function testDetectorRunsOnceAndCaches(): void
-    {
-        $calls = 0;
-        $detector = function () use (&$calls): bool {
-            $calls++;
-            return true;
-        };
-        // First call: runs detector.
-        AggressiveVerify::decide('auto', 'cache-key-1', $detector);
-        $this->assertSame(1, $calls);
-
-        // Second call (same key): cache hit, detector NOT called.
-        AggressiveVerify::decide('auto', 'cache-key-1', $detector);
-        $this->assertSame(1, $calls);
-
-        // Different key: detector runs again.
-        AggressiveVerify::decide('auto', 'cache-key-2', $detector);
-        $this->assertSame(2, $calls);
-    }
-
-    public function testCachedReturnsNullBeforeFirstDecision(): void
-    {
-        $this->assertNull(AggressiveVerify::cached('never-asked'));
-    }
-
-    public function testCachedReturnsResultAfterDecision(): void
-    {
-        AggressiveVerify::decide('auto', 'k-true', fn() => true);
-        AggressiveVerify::decide('auto', 'k-false', fn() => false);
-        $this->assertTrue(AggressiveVerify::cached('k-true'));
-        $this->assertFalse(AggressiveVerify::cached('k-false'));
-    }
-
-    public function testClearCacheResetsState(): void
-    {
-        AggressiveVerify::decide('auto', 'k', fn() => true);
-        $this->assertTrue(AggressiveVerify::cached('k'));
-        AggressiveVerify::clearCache();
-        $this->assertNull(AggressiveVerify::cached('k'));
-    }
-
-    public function testDetectorThrowFallsBackToOff(): void
-    {
-        // Fail-safe: a probe error (permissions, network, etc.) caches
-        // FALSE rather than retrying forever or crashing the wrapper.
-        // Aggressive verify is paranoia mode; failing closed preserves
-        // the no-tax default.
-        $detector = function (): bool {
-            throw new \RuntimeException('network down');
-        };
-        $this->assertFalse(AggressiveVerify::decide('auto', 'k', $detector));
-        // Cached as false, so subsequent calls don't re-run.
-        $this->assertFalse(AggressiveVerify::cached('k'));
-    }
-
-    public function testExplicitOnIsNotCached(): void
-    {
-        // Explicit overrides bypass the detection cache entirely — they
-        // never populate it. This matters if a user flips 'on' → 'off'
-        // mid-session: the next decide() with 'auto' would still see a
-        // fresh detector, not a stale "true" entry.
-        AggressiveVerify::decide('on', 'k', fn() => false);
-        $this->assertNull(AggressiveVerify::cached('k'));
-    }
-
-    // ─── PDO detector probe ────────────────────────────────────────────
-
-    public function testPdoDetectorReturnsTrueOnPresentRow(): void
-    {
-        $stmt = $this->createStub(\PDOStatement::class);
-        $stmt->method('fetch')->willReturn(['present' => true]);
-        $pdo = $this->createMock(\PDO::class);
-        $pdo->expects($this->once())
-            ->method('query')
-            ->with($this->stringContains('pg_trigger'))
-            ->willReturn($stmt);
-        $detector = AggressiveVerify::pdoDetector($pdo);
-        $this->assertTrue($detector());
-    }
-
-    public function testPdoDetectorReturnsFalseOnAbsentRow(): void
-    {
-        $stmt = $this->createStub(\PDOStatement::class);
-        $stmt->method('fetch')->willReturn(['present' => false]);
-        $pdo = $this->createStub(\PDO::class);
-        $pdo->method('query')->willReturn($stmt);
-        $detector = AggressiveVerify::pdoDetector($pdo);
-        $this->assertFalse($detector());
-    }
-
-    public function testPdoDetectorAcceptsStringTrue(): void
-    {
-        // Postgres' EXISTS predicate returns 't'/'f' over the wire by
-        // default; pdo_pgsql sometimes hands those through as strings.
-        $stmt = $this->createStub(\PDOStatement::class);
-        $stmt->method('fetch')->willReturn(['present' => 't']);
-        $pdo = $this->createStub(\PDO::class);
-        $pdo->method('query')->willReturn($stmt);
-        $detector = AggressiveVerify::pdoDetector($pdo);
-        $this->assertTrue($detector());
-    }
-
-    public function testPdoDetectorReturnsFalseOnQueryFailure(): void
-    {
-        $pdo = $this->createStub(\PDO::class);
-        $pdo->method('query')->willReturn(false);
-        $detector = AggressiveVerify::pdoDetector($pdo);
-        $this->assertFalse($detector());
-    }
-
-    public function testDefaultCacheKeyIsStablePerPdo(): void
-    {
-        $pdo1 = $this->createStub(\PDO::class);
-        $pdo2 = $this->createStub(\PDO::class);
-        $this->assertSame(
-            AggressiveVerify::defaultCacheKey($pdo1),
-            AggressiveVerify::defaultCacheKey($pdo1),
-        );
-        $this->assertNotSame(
-            AggressiveVerify::defaultCacheKey($pdo1),
-            AggressiveVerify::defaultCacheKey($pdo2),
-        );
+        $this->assertTrue(AggressiveVerify::decide('ON', 'k'));
+        $this->assertTrue(AggressiveVerify::decide('On', 'k2'));
+        $this->assertTrue(AggressiveVerify::decide('AUTO', 'k3'));
+        $this->assertFalse(@AggressiveVerify::decide('OFF', 'k4'));
+        $this->assertFalse(@AggressiveVerify::decide('Off', 'k5'));
     }
 }
