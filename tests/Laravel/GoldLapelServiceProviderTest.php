@@ -6,12 +6,40 @@ use GoldLapel\GoldLapel;
 use GoldLapel\Laravel\GoldLapelServiceProvider;
 use Orchestra\Testbench\TestCase;
 
+/**
+ * The provider against the real core (allocation, reuse, option checks),
+ * with FakeProxy standing in for the binary.
+ */
 class GoldLapelServiceProviderTest extends TestCase
 {
     protected function setUp(): void
     {
-        GoldLapel::reset();
+        if (PHP_OS_FAMILY === 'Windows' || trim((string) shell_exec('command -v python3 2>/dev/null')) === '') {
+            $this->markTestSkipped('The fake proxy needs python3 and a POSIX shell.');
+        }
+        FakeProxy::install();
         parent::setUp();
+    }
+
+    protected function tearDown(): void
+    {
+        parent::tearDown();
+        GoldLapel::cleanupAll();
+        FakeProxy::uninstall();
+        unset($_SERVER['LARAVEL_OCTANE']);
+    }
+
+    /** @return list<list<string>> */
+    private function spawns(): array
+    {
+        return FakeProxy::spawns();
+    }
+
+    /** @return array<string, GoldLapel> */
+    private function glConnections(GoldLapelServiceProvider $provider): array
+    {
+        $ref = new \ReflectionProperty(GoldLapelServiceProvider::class, 'glConnections');
+        return $ref->getValue($provider);
     }
 
     private function bootProvider(array $connections): GoldLapelServiceProvider
@@ -38,13 +66,11 @@ class GoldLapelServiceProviderTest extends TestCase
             ],
         ]);
 
-        $this->assertCount(1, GoldLapel::$calls);
-        $call = GoldLapel::$calls[0];
-        $this->assertSame('postgresql://admin:secret@db.example.com:5432/mydb', $call['upstream']);
-        // No proxy_port configured → none forwarded; the core picks one.
-        $this->assertNull($call['port']);
-        $this->assertSame([], $call['config']);
-        $this->assertSame([], $call['extraArgs']);
+        $this->assertCount(1, $this->spawns());
+        $args = $this->spawns()[0];
+        $this->assertSame('postgresql://admin:secret@db.example.com:5432/mydb', FakeProxy::option($args, '--upstream'));
+        // No proxy_port configured → the core allocates the first free pair.
+        $this->assertSame((string) GoldLapel::DEFAULT_PROXY_PORT, FakeProxy::option($args, '--proxy-port'));
 
         $this->assertSame('127.0.0.1', config('database.connections.pgsql.host'));
         $this->assertSame(GoldLapel::DEFAULT_PROXY_PORT, config('database.connections.pgsql.port'));
@@ -57,7 +83,7 @@ class GoldLapelServiceProviderTest extends TestCase
             'sqlite' => ['driver' => 'sqlite', 'database' => ':memory:'],
         ]);
 
-        $this->assertCount(0, GoldLapel::$calls);
+        $this->assertCount(0, $this->spawns());
     }
 
     public function testSkipsWhenDisabled(): void
@@ -74,7 +100,7 @@ class GoldLapelServiceProviderTest extends TestCase
             ],
         ]);
 
-        $this->assertCount(0, GoldLapel::$calls);
+        $this->assertCount(0, $this->spawns());
     }
 
     public function testCustomPortAndExtraArgs(): void
@@ -94,10 +120,10 @@ class GoldLapelServiceProviderTest extends TestCase
             ],
         ]);
 
-        $this->assertCount(1, GoldLapel::$calls);
-        $call = GoldLapel::$calls[0];
-        $this->assertSame(9000, $call['port']);
-        $this->assertSame(['--threshold-duration-ms', '200'], $call['extraArgs']);
+        $this->assertCount(1, $this->spawns());
+        $args = $this->spawns()[0];
+        $this->assertSame('9000', FakeProxy::option($args, '--proxy-port'));
+        $this->assertSame('200', FakeProxy::option($args, '--threshold-duration-ms'));
 
         $this->assertSame('127.0.0.1', config('database.connections.pgsql.host'));
         $this->assertSame(9000, config('database.connections.pgsql.port'));
@@ -122,10 +148,10 @@ class GoldLapelServiceProviderTest extends TestCase
             ],
         ]);
 
-        $this->assertCount(1, GoldLapel::$calls);
-        $call = GoldLapel::$calls[0];
-        $this->assertSame(['pool_mode' => 'transaction', 'pool_size' => 30], $call['config']);
-        $this->assertSame([], $call['extraArgs']);
+        $this->assertCount(1, $this->spawns());
+        $args = $this->spawns()[0];
+        $this->assertSame('transaction', FakeProxy::option($args, '--pool-mode'));
+        $this->assertSame('30', FakeProxy::option($args, '--pool-size'));
     }
 
     public function testConfigWithPortAndExtraArgs(): void
@@ -149,12 +175,12 @@ class GoldLapelServiceProviderTest extends TestCase
             ],
         ]);
 
-        $this->assertCount(1, GoldLapel::$calls);
-        $call = GoldLapel::$calls[0];
-        $this->assertSame(9000, $call['port']);
-        $this->assertSame('waiter', $call['mode']);
-        $this->assertSame(['disable_pool' => true], $call['config']);
-        $this->assertSame(['--threshold-duration-ms', '200'], $call['extraArgs']);
+        $this->assertCount(1, $this->spawns());
+        $args = $this->spawns()[0];
+        $this->assertSame('9000', FakeProxy::option($args, '--proxy-port'));
+        $this->assertSame('waiter', FakeProxy::option($args, '--mode'));
+        $this->assertContains('--disable-pool', $args);
+        $this->assertSame('200', FakeProxy::option($args, '--threshold-duration-ms'));
 
         $this->assertSame(9000, config('database.connections.pgsql.port'));
     }
@@ -165,10 +191,7 @@ class GoldLapelServiceProviderTest extends TestCase
         // block was silently dropped by boot() — the provider read it into
         // a local but never passed it to startProxyOnly(). The result: a
         // `log_level: debug` setting in config/database.php had zero
-        // effect on the spawned subprocess's -v/-vv/-vvv verbosity. The
-        // real translation (string -> -v count) is covered by
-        // FactoryApiTest::testParseOptionsLogLevel*; this test pins the
-        // provider-level forwarding.
+        // effect on the spawned subprocess's -v/-vv/-vvv verbosity.
         $this->bootProvider([
             'pgsql' => [
                 'driver' => 'pgsql',
@@ -183,8 +206,8 @@ class GoldLapelServiceProviderTest extends TestCase
             ],
         ]);
 
-        $this->assertCount(1, GoldLapel::$calls);
-        $this->assertSame('debug', GoldLapel::$calls[0]['logLevel']);
+        $this->assertCount(1, $this->spawns());
+        $this->assertContains('-vv', $this->spawns()[0]);
     }
 
     public function testLogLevelOmittedWhenNotConfigured(): void
@@ -203,8 +226,8 @@ class GoldLapelServiceProviderTest extends TestCase
             ],
         ]);
 
-        $this->assertCount(1, GoldLapel::$calls);
-        $this->assertNull(GoldLapel::$calls[0]['logLevel']);
+        $this->assertCount(1, $this->spawns());
+        $this->assertSame([], array_intersect(['-v', '-vv', '-vvv'], $this->spawns()[0]));
     }
 
     public function testLogLevelForwardedAlongsideOtherOptions(): void
@@ -228,13 +251,12 @@ class GoldLapelServiceProviderTest extends TestCase
             ],
         ]);
 
-        $this->assertCount(1, GoldLapel::$calls);
-        $call = GoldLapel::$calls[0];
-        $this->assertSame(9001, $call['port']);
-        $this->assertSame('trace', $call['logLevel']);
-        $this->assertSame('waiter', $call['mode']);
-        $this->assertSame([], $call['config']);
-        $this->assertSame(['--flag'], $call['extraArgs']);
+        $this->assertCount(1, $this->spawns());
+        $args = $this->spawns()[0];
+        $this->assertSame('9001', FakeProxy::option($args, '--proxy-port'));
+        $this->assertContains('-vvv', $args);
+        $this->assertSame('waiter', FakeProxy::option($args, '--mode'));
+        $this->assertSame('--flag', end($args));
     }
 
     public function testEmptyConfigArray(): void
@@ -253,9 +275,8 @@ class GoldLapelServiceProviderTest extends TestCase
             ],
         ]);
 
-        $this->assertCount(1, GoldLapel::$calls);
-        $call = GoldLapel::$calls[0];
-        $this->assertSame([], $call['config']);
+        $this->assertCount(1, $this->spawns());
+        $this->assertSame('127.0.0.1', config('database.connections.pgsql.host'));
     }
 
     public function testMultiplePgsqlConnections(): void
@@ -284,9 +305,7 @@ class GoldLapelServiceProviderTest extends TestCase
             ],
         ]);
 
-        $this->assertCount(2, GoldLapel::$calls);
-        $this->assertNull(GoldLapel::$calls[0]['port']);
-        $this->assertNull(GoldLapel::$calls[1]['port']);
+        $this->assertCount(2, $this->spawns());
 
         $this->assertSame('127.0.0.1', config('database.connections.primary.host'));
         $this->assertSame('127.0.0.1', config('database.connections.analytics.host'));
@@ -304,15 +323,68 @@ class GoldLapelServiceProviderTest extends TestCase
             'username' => 'u',
             'password' => 'p',
         ];
-        $this->bootProvider(['primary' => $db, 'reporting' => $db]);
+        $provider = $this->bootProvider(['primary' => $db, 'reporting' => $db]);
 
-        $this->assertCount(1, GoldLapel::$calls, 'Same upstream must reuse the running proxy.');
+        $this->assertCount(1, $this->spawns(), 'Same upstream must reuse the running proxy.');
         $this->assertSame(7932, config('database.connections.primary.port'));
         $this->assertSame(7932, config('database.connections.reporting.port'));
 
-        $gl = array_values(GoldLapel::$liveInstances)[0];
+        $gl = $this->glConnections($provider)['primary'];
+        $this->assertSame($gl, $this->glConnections($provider)['reporting']);
         $this->app->terminate();
-        $this->assertSame(1, $gl->stopCalls, 'A shared proxy is stopped once.');
+        $this->assertFalse($gl->isRunning(), 'Both connections release the shared proxy, which then stops.');
+    }
+
+    public function testExplicitPortAnotherConnectionsProxyHoldsIsRejected(): void
+    {
+        $this->bootProvider([
+            'primary' => [
+                'driver' => 'pgsql', 'host' => 'db1.example.com', 'port' => '5432',
+                'database' => 'app', 'username' => 'u', 'password' => 'p',
+            ],
+            'analytics' => [
+                'driver' => 'pgsql', 'host' => 'db2.example.com', 'port' => '5432',
+                'database' => 'analytics', 'username' => 'u', 'password' => 'p',
+                // primary's dashboard port
+                'goldlapel' => ['proxy_port' => 7933],
+            ],
+        ]);
+
+        $this->assertCount(1, $this->spawns(), 'The colliding proxy must not be spawned.');
+        $this->assertSame(7932, config('database.connections.primary.port'));
+        // Left pointing at its own database, not at primary's proxy.
+        $this->assertSame('db2.example.com', config('database.connections.analytics.host'));
+        $this->assertSame('5432', config('database.connections.analytics.port'));
+    }
+
+    public function testBadOptionValueIsLoggedNotFatal(): void
+    {
+        // configToArgs() raises \TypeError for a mistyped value; the
+        // provider must log it like any other start failure.
+        $this->bootProvider([
+            'pgsql' => [
+                'driver' => 'pgsql', 'host' => 'h', 'port' => '5432',
+                'database' => 'db', 'username' => 'u', 'password' => 'p',
+                'goldlapel' => ['config' => ['disable_pool' => 'yes']],
+            ],
+        ]);
+
+        $this->assertCount(0, $this->spawns());
+        $this->assertSame('h', config('database.connections.pgsql.host'));
+    }
+
+    public function testUnknownOptionIsLoggedNotFatal(): void
+    {
+        $this->bootProvider([
+            'pgsql' => [
+                'driver' => 'pgsql', 'host' => 'h', 'port' => '5432',
+                'database' => 'db', 'username' => 'u', 'password' => 'p',
+                'goldlapel' => ['invalidation_port' => 7934],
+            ],
+        ]);
+
+        $this->assertCount(0, $this->spawns());
+        $this->assertSame('h', config('database.connections.pgsql.host'));
     }
 
     public function testForwardsCoreOptions(): void
@@ -343,8 +415,17 @@ class GoldLapelServiceProviderTest extends TestCase
             ],
         ]);
 
-        $this->assertCount(1, GoldLapel::$calls);
-        $this->assertSame($options, GoldLapel::$calls[0]['options']);
+        $this->assertCount(1, $this->spawns());
+        $args = $this->spawns()[0];
+        $this->assertSame('9000', FakeProxy::option($args, '--proxy-port'));
+        $this->assertSame('0', FakeProxy::option($args, '--dashboard-port'));
+        $this->assertSame('/etc/gl.license', FakeProxy::option($args, '--license'));
+        $this->assertSame('/etc/gl.toml', FakeProxy::option($args, '--config'));
+        $this->assertSame('prod-east', FakeProxy::option($args, '--mesh-tag'));
+        $this->assertSame('my-app', FakeProxy::option($args, '--client'));
+        foreach (['--mesh', '--disable-proxy-cache', '--disable-sqloptimize', '--disable-auto-indexes'] as $flag) {
+            $this->assertContains($flag, $args);
+        }
     }
 
     public function testClientDefaultsToLaravel(): void
@@ -360,7 +441,7 @@ class GoldLapelServiceProviderTest extends TestCase
             ],
         ]);
 
-        $this->assertSame(['client' => 'laravel'], GoldLapel::$calls[0]['options']);
+        $this->assertSame('laravel', FakeProxy::option($this->spawns()[0], '--client'));
     }
 
     public function testDefaultsWhenNoGoldlapelConfig(): void
@@ -376,12 +457,8 @@ class GoldLapelServiceProviderTest extends TestCase
             ],
         ]);
 
-        $this->assertCount(1, GoldLapel::$calls);
-        $call = GoldLapel::$calls[0];
-        $this->assertNull($call['port']);
+        $this->assertCount(1, $this->spawns());
         $this->assertSame(GoldLapel::DEFAULT_PROXY_PORT, config('database.connections.pgsql.port'));
-        $this->assertSame([], $call['config']);
-        $this->assertSame([], $call['extraArgs']);
     }
 
     public function testUrlKeyUsedForUpstream(): void
@@ -398,8 +475,8 @@ class GoldLapelServiceProviderTest extends TestCase
             ],
         ]);
 
-        $this->assertCount(1, GoldLapel::$calls);
-        $this->assertSame('postgresql://urluser:urlpass@urlhost:5433/urldb', GoldLapel::$calls[0]['upstream']);
+        $this->assertCount(1, $this->spawns());
+        $this->assertSame('postgresql://urluser:urlpass@urlhost:5433/urldb', FakeProxy::option($this->spawns()[0], '--upstream'));
     }
 
     public function testUrlKeyClearedAfterRewrite(): void
@@ -480,157 +557,100 @@ class GoldLapelServiceProviderTest extends TestCase
             ],
         ]);
 
-        $this->assertCount(1, GoldLapel::$calls);
-        $this->assertSame('postgresql://u:p@remote:5432/db', GoldLapel::$calls[0]['upstream']);
+        $this->assertCount(1, $this->spawns());
+        $this->assertSame('postgresql://u:p@remote:5432/db', FakeProxy::option($this->spawns()[0], '--upstream'));
         $this->assertNull(config('database.connections.pgsql.url'));
         $this->assertSame('prefer', config('database.connections.pgsql.sslmode'));
         $this->assertSame('127.0.0.1', config('database.connections.pgsql.host'));
     }
 
     // ------------------------------------------------------------------
-    // Octane / Swoole / RoadRunner worker lifecycle.
+    // Lifecycle.
     //
-    // Long-lived workers keep the PHP process alive across many requests;
-    // relying on __destruct or the shutdown hook to terminate the proxy
-    // subprocess leaks one process per worker-boot until the worker itself
-    // exits. The provider registers an $app->terminating(...) callback
-    // that stops each stashed GoldLapel instance; Octane invokes
-    // $app->terminate() between requests, so this triggers deterministic
-    // cleanup.
+    // One request (PHP-FPM) or one console command boots the app once and
+    // terminates it once: the provider stops its proxies on terminate.
+    //
+    // Octane boots the app once per worker and then runs the terminating
+    // callbacks after every request (on a per-request clone of the app), so
+    // there the proxies must outlive terminate and stop with the worker.
     // ------------------------------------------------------------------
 
-    public function testTerminatingCallbackStopsStashedInstances(): void
+    private function twoDatabases(): array
     {
-        $this->bootProvider([
+        return [
             'primary' => [
-                'driver' => 'pgsql',
-                'host' => 'db1.example.com',
-                'port' => '5432',
-                'database' => 'app',
-                'username' => 'u',
-                'password' => 'p',
-                'goldlapel' => ['proxy_port' => 7940],
+                'driver' => 'pgsql', 'host' => 'db1.example.com', 'port' => '5432',
+                'database' => 'app', 'username' => 'u', 'password' => 'p',
             ],
             'analytics' => [
-                'driver' => 'pgsql',
-                'host' => 'db2.example.com',
-                'port' => '5432',
-                'database' => 'analytics',
-                'username' => 'u',
-                'password' => 'p',
-                'goldlapel' => ['proxy_port' => 7941],
+                'driver' => 'pgsql', 'host' => 'db2.example.com', 'port' => '5432',
+                'database' => 'analytics', 'username' => 'u', 'password' => 'p',
             ],
-        ]);
+        ];
+    }
 
-        // Both instances should be alive before the worker-shutdown hook
-        // fires.
-        $this->assertCount(2, GoldLapel::$liveInstances, 'Both proxies should be tracked after boot.');
-        foreach (GoldLapel::$liveInstances as $instance) {
-            $this->assertSame(0, $instance->stopCalls);
+    public function testTerminateStopsTheProxies(): void
+    {
+        $provider = $this->bootProvider($this->twoDatabases());
+        $instances = $this->glConnections($provider);
+        $this->assertCount(2, $instances);
+        foreach ($instances as $instance) {
+            $this->assertTrue($instance->isRunning());
         }
 
-        // Simulate Octane's between-requests call. Laravel's Application
-        // invokes every registered terminating callback when terminate()
-        // runs, so this is the exact path Octane triggers.
         $this->app->terminate();
 
-        // Every stashed instance must have had ->stop() called exactly once
-        // and then been removed from the live-instances tracker.
-        $this->assertCount(
-            0,
-            GoldLapel::$liveInstances,
-            'All proxy instances must be stopped + released by the terminating callback.'
-        );
+        foreach ($instances as $instance) {
+            $this->assertFalse($instance->isRunning());
+        }
+        $this->assertSame([], $this->glConnections($provider));
     }
 
-    public function testTerminatingCallbackIsIdempotent(): void
+    public function testRepeatedTerminateIsHarmless(): void
     {
-        $this->bootProvider([
-            'pgsql' => [
-                'driver' => 'pgsql',
-                'host' => 'h',
-                'port' => '5432',
-                'database' => 'db',
-                'username' => 'u',
-                'password' => 'p',
-            ],
-        ]);
-
-        $instances = array_values(GoldLapel::$liveInstances);
-        $this->assertCount(1, $instances);
-        $gl = $instances[0];
-
-        // Two terminate() invocations should not double-stop the instance.
-        // Laravel processes queued callbacks on each terminate(), and we
-        // rely on the provider clearing $glConnections to short-circuit.
+        $provider = $this->bootProvider($this->twoDatabases());
         $this->app->terminate();
         $this->app->terminate();
-
-        $this->assertSame(
-            1,
-            $gl->stopCalls,
-            'stop() must be called exactly once even across repeated terminate() calls.'
-        );
+        $this->assertSame([], $this->glConnections($provider));
     }
 
-    public function testTerminatingCallbackSurvivesStopException(): void
+    public function testTerminateSurvivesAStopException(): void
     {
-        // If one instance's stop() throws, the terminating callback must
-        // still try to stop the remaining instances — worker shutdown
-        // should never leak a proxy because a sibling failed.
-        $provider = $this->bootProvider([
-            'primary' => [
-                'driver' => 'pgsql',
-                'host' => 'db1.example.com',
-                'port' => '5432',
-                'database' => 'app',
-                'username' => 'u',
-                'password' => 'p',
-                'goldlapel' => ['proxy_port' => 7942],
-            ],
-            'analytics' => [
-                'driver' => 'pgsql',
-                'host' => 'db2.example.com',
-                'port' => '5432',
-                'database' => 'analytics',
-                'username' => 'u',
-                'password' => 'p',
-                'goldlapel' => ['proxy_port' => 7943],
-            ],
-        ]);
+        // If one instance's stop() throws, the rest must still be stopped.
+        $provider = $this->bootProvider($this->twoDatabases());
 
-        $this->assertCount(2, GoldLapel::$liveInstances);
-
-        // Swap the first connection's instance for one whose stop() throws,
-        // then invoke the terminating callback and confirm the surviving
-        // sibling is still stopped. We mutate $glConnections via reflection
-        // since it's private provider state.
         $connRef = new \ReflectionProperty(GoldLapelServiceProvider::class, 'glConnections');
-        $connRef->setAccessible(true);
         $state = $connRef->getValue($provider);
-        $names = array_keys($state);
-
-        $throwing = new class extends GoldLapel {
+        $survivor = $state['analytics'];
+        $state['primary'] = new class ('postgresql://u:p@h/d') extends GoldLapel {
             public function stop(): void
             {
-                parent::stop();
                 throw new \RuntimeException('stop() failed');
             }
         };
-        $state[$names[0]]['instance'] = $throwing;
         $connRef->setValue($provider, $state);
-
-        // The second instance is the real spy — verify it gets stopped
-        // even though the first one threw.
-        $survivor = $state[$names[1]]['instance'];
-        $this->assertSame(0, $survivor->stopCalls);
 
         $this->app->terminate();
 
-        $this->assertSame(
-            1,
-            $survivor->stopCalls,
-            'Surviving instance must still be stopped when a sibling stop() throws.'
-        );
+        $this->assertFalse($survivor->isRunning(), 'A sibling stop() failure must not leak a proxy.');
+    }
+
+    public function testUnderOctaneProxiesOutliveRequestsAndStopWithTheWorker(): void
+    {
+        $_SERVER['LARAVEL_OCTANE'] = 1;
+        $provider = $this->bootProvider($this->twoDatabases());
+        $instances = $this->glConnections($provider);
+
+        // Octane terminates the app after every request.
+        $this->app->terminate();
+        $this->app->terminate();
+        foreach ($instances as $instance) {
+            $this->assertTrue($instance->isRunning(), 'A request ending must not stop the worker\'s proxies.');
+        }
+
+        $this->app['events']->dispatch(\Laravel\Octane\Events\WorkerStopping::class);
+        foreach ($instances as $instance) {
+            $this->assertFalse($instance->isRunning());
+        }
     }
 }

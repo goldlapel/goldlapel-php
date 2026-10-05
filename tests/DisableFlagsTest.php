@@ -165,35 +165,6 @@ class DisableFlagsTest extends TestCase
         }
     }
 
-    public function testRemovedOptionsEmitNoFlags(): void
-    {
-        // The wrapper's in-process cache and the proxy's matviews are gone;
-        // their options are no longer read, so none of the old flags reach
-        // the proxy even when a caller still passes them.
-        if (PHP_OS_FAMILY === 'Windows') {
-            $this->markTestSkipped('Fake-binary spawn test uses /bin/sh.');
-        }
-        if (!is_executable('/usr/bin/python3') && !is_executable('/usr/local/bin/python3')) {
-            $this->markTestSkipped('python3 required for fake binary that holds the port open');
-        }
-
-        $opts = [
-            'invalidation_port' => 7934,
-            'disable_native_cache' => true,
-            'disable_matviews' => true,
-            'aggressive_verify' => 'off',
-        ];
-        [$port, $argvFile, $cleanup] = $this->spawnFakeBinaryAndStart($opts);
-        try {
-            $argv = (string) file_get_contents($argvFile);
-            foreach (['--invalidation-port', '--native-cache', '--disable-matviews', '--aggressive-verify'] as $flag) {
-                $this->assertStringNotContainsString($flag, $argv, "argv must not contain {$flag}; got: {$argv}");
-            }
-        } finally {
-            $cleanup();
-        }
-    }
-
     // ─── helpers ───────────────────────────────────────────────────────
 
     /**

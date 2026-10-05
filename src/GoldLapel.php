@@ -61,6 +61,48 @@ class GoldLapel
         'replica', 'exclude_tables',
     ];
 
+    // Top-level options GoldLapel::start() (sync and Amp) accepts.
+    private const VALID_OPTIONS = [
+        'proxy_port', 'dashboard_port', 'log_level', 'mode', 'license',
+        'client', 'config_file', 'config', 'extra_args', 'silent', 'mesh',
+        'mesh_tag', 'disable_proxy_cache', 'disable_sqloptimize',
+        'disable_auto_indexes',
+    ];
+
+    private const WRAPPER_CACHE_REMOVED = 'it was removed with the in-process cache';
+    private const MATVIEWS_REMOVED = 'materialized views were removed';
+
+    // Options and config keys that used to exist, with why they're gone —
+    // so passing one says so instead of a bare "unknown".
+    private const REMOVED_OPTIONS = [
+        'invalidation_port' => self::WRAPPER_CACHE_REMOVED,
+        'disable_native_cache' => self::WRAPPER_CACHE_REMOVED,
+        'native_cache_size' => self::WRAPPER_CACHE_REMOVED,
+        'aggressive_verify' => self::WRAPPER_CACHE_REMOVED,
+        'disable_matviews' => self::MATVIEWS_REMOVED,
+    ];
+
+    private const REMOVED_CONFIG_KEYS = [
+        'refresh_interval_secs' => self::MATVIEWS_REMOVED,
+        'pattern_ttl_secs' => self::MATVIEWS_REMOVED,
+        'max_tables_per_view' => self::MATVIEWS_REMOVED,
+        'max_columns_per_view' => self::MATVIEWS_REMOVED,
+        'disable_consolidation' => self::MATVIEWS_REMOVED,
+        'disable_rewrite' => self::MATVIEWS_REMOVED,
+        'disable_shadow_mode' => self::MATVIEWS_REMOVED,
+        'enable_coalescing' => 'coalescing is on by default; use disable_coalescing',
+    ];
+
+    // Connection parameters for the TLS/GSS hop to the upstream. The proxy
+    // keeps using them upstream, but declines TLS from the app unless it was
+    // started with --tls-cert/--tls-key, so they come off the app's URL.
+    private const UPSTREAM_TLS_PARAMS = [
+        'sslmode', 'sslcert', 'sslkey', 'sslrootcert', 'sslcrl', 'sslcrldir',
+        'sslpassword', 'sslsni', 'sslnegotiation', 'ssl_min_protocol_version',
+        'ssl_max_protocol_version', 'requiressl', 'channel_binding',
+        'gssencmode', 'krbsrvname', 'gsslib',
+    ];
+
     /**
      * Stream the startup banner is written to. Defaults to STDERR; tests
      * can swap this for a php://memory stream to capture output without
@@ -102,6 +144,14 @@ class GoldLapel
     /** Per-instance cache of fetched DDL patterns keyed on "family:name". */
     private array $ddlCache = [];
 
+    /**
+     * How many start() / startProxyOnly() calls currently share this proxy.
+     * A start for an upstream that is already running here returns the same
+     * instance and counts one more holder; stop() terminates the proxy only
+     * when the last holder stops.
+     */
+    private int $holders = 0;
+
     /** @var array<int, self> */
     private static array $liveInstances = [];
     private static bool $cleanupRegistered = false;
@@ -110,7 +160,7 @@ class GoldLapel
      * Ports held by proxies this process started — sync and Amp alike —
      * keyed by the owning instance's spl_object_id. See claimPorts().
      *
-     * @var array<int, list<int>>
+     * @var array<int, array{owner: \WeakReference, upstream: string, ports: array<int, string>}>
      */
     private static array $claimedPorts = [];
 
@@ -172,6 +222,9 @@ class GoldLapel
      */
     public function __construct(string $upstream, array $options = [])
     {
+        // Every option is checked here, before anything is claimed or
+        // spawned, so a bad one can't leave half-started state behind.
+        self::checkOptions($options);
         $this->upstream = $upstream;
         // Without an explicit proxy_port the port is allocated at spawn
         // time (see claimPorts()); 7932 until then.
@@ -192,16 +245,7 @@ class GoldLapel
         $this->client = isset($options['client']) ? (string) $options['client'] : null;
         $this->configFile = isset($options['config_file']) ? (string) $options['config_file'] : null;
 
-        $config = $options['config'] ?? [];
-        // Validate structured-config keys eagerly so a test that constructs
-        // without spawning still catches bad keys.
-        $validKeys = array_flip(self::VALID_CONFIG_KEYS);
-        foreach ($config as $key => $_) {
-            if (!isset($validKeys[$key])) {
-                throw new \InvalidArgumentException("Unknown config key: {$key}");
-            }
-        }
-        $this->config = $config;
+        $this->config = $options['config'] ?? [];
         $this->extraArgs = $options['extra_args'] ?? [];
         $this->silent = !empty($options['silent']);
         // Mesh membership (startup intent — HQ enforces license).
@@ -235,7 +279,8 @@ class GoldLapel
      * Top-level options (all optional):
      *   - 'proxy_port' (int): proxy port. Defaults to the first free pair from
      *     7932 up — 7932 for the first proxy, 7934 for a second one this
-     *     process starts, and so on (see claimPorts()).
+     *     process starts, and so on, skipping ports anything else holds
+     *     (see claimPorts()).
      *   - 'dashboard_port' (int): dashboard port. Defaults to proxy_port + 1. 0 disables.
      *   - 'log_level' (string): 'trace'|'debug'|'info'|'warn'|'error' — translated to the proxy's -v/-vv/-vvv verbosity flag
      *   - 'mode' (string): proxy operating mode ('waiter', 'consideration')
@@ -253,13 +298,31 @@ class GoldLapel
      *
      * Promoted top-level concepts (proxy_port, dashboard_port, etc.) are NOT
      * valid keys inside `config` — passing them there raises at construction
-     * time. This matches the canonical config surface across all wrappers.
+     * time, as does any unknown top-level option. This matches the canonical
+     * config surface across all wrappers.
+     *
+     * One proxy per upstream: if this process already runs a proxy for
+     * $upstream, start() returns that same instance (its options win) and
+     * counts one more holder; each holder's stop() releases it, and the
+     * proxy stops with the last. An explicit port that another proxy of this
+     * process holds raises; a port another program holds makes the proxy
+     * refuse, and its message is in the RuntimeException.
      *
      * Eagerly opens a PDO connection to the proxy; raises RuntimeException
      * if pdo_pgsql is not enabled.
      */
     public static function start(string $upstream, array $options = []): self
     {
+        $running = self::runningProxy($upstream);
+        if ($running !== null) {
+            // A startProxyOnly() holder may have left it without a PDO.
+            if ($running->pdo === null) {
+                $running->connect();
+            }
+            $running->holders++;
+            return $running;
+        }
+
         $instance = new self($upstream, $options);
         // startProxyWithoutConnect() (invoked via startProxy) registers the
         // instance with cleanupAll as soon as the subprocess spawns, before
@@ -284,6 +347,7 @@ class GoldLapel
             throw $e;
         }
 
+        $instance->holders = 1;
         return $instance;
     }
 
@@ -297,13 +361,45 @@ class GoldLapel
      * onto the returned instance can call `$gl->stop()` at worker shutdown
      * (Octane, Swoole, RoadRunner) to release the subprocess deterministically
      * rather than relying on `__destruct` or the process-wide shutdown hook.
+     *
+     * Like start(), a second call for an upstream already running in this
+     * process returns that instance; see start().
      */
     public static function startProxyOnly(string $upstream, array $options = []): self
     {
-        $instance = new self($upstream, $options);
-        $instance->startProxyWithoutConnect();
+        $running = self::runningProxy($upstream);
+        if ($running !== null) {
+            $running->holders++;
+            return $running;
+        }
 
+        $instance = new self($upstream, $options);
+        try {
+            $instance->startProxyWithoutConnect();
+        } catch (\Throwable $e) {
+            try {
+                $instance->stop();
+            } catch (\Throwable $cleanupErr) {
+                // Don't mask the original failure with a teardown error.
+            }
+            throw $e;
+        }
+
+        $instance->holders = 1;
         return $instance;
+    }
+
+    /**
+     * The live proxy this process already runs for $upstream, if any.
+     */
+    private static function runningProxy(string $upstream): ?self
+    {
+        foreach (self::$liveInstances as $instance) {
+            if ($instance->upstream === $upstream && $instance->isRunning()) {
+                return $instance;
+            }
+        }
+        return null;
     }
 
     /**
@@ -311,10 +407,11 @@ class GoldLapel
      * The Rust binary exposes verbosity as -v / -vv / -vvv (count flag) rather
      * than --log-level <level>, so wrappers translate on the spawn side.
      *
+     * @internal Used by GoldLapel\GoldLapel and GoldLapel\Amp\GoldLapel.
      * @return string|null "-v"/"-vv"/"-vvv" for info/debug/trace, null for warn/error
      * @throws \InvalidArgumentException if the value is not a recognized level
      */
-    private static function translateLogLevel($level): ?string
+    public static function translateLogLevel($level): ?string
     {
         if (!is_string($level)) {
             throw new \InvalidArgumentException(
@@ -352,7 +449,10 @@ class GoldLapel
 
         foreach ($config as $key => $value) {
             if (!isset($validKeys[$key])) {
-                throw new \InvalidArgumentException("Unknown config key: {$key}");
+                $reason = self::REMOVED_CONFIG_KEYS[$key] ?? null;
+                throw new \InvalidArgumentException(
+                    "Unknown config key: {$key}" . ($reason !== null ? " ({$reason})" : '')
+                );
             }
 
             $flag = '--' . str_replace('_', '-', $key);
@@ -391,21 +491,60 @@ class GoldLapel
     }
 
     /**
+     * Reject options start() doesn't know — naming the removed ones — and
+     * check the values that become proxy flags (log_level, config), so every
+     * option error surfaces before anything is claimed or spawned. Shared
+     * by the sync and Amp constructors.
+     *
+     * @internal Used by GoldLapel\GoldLapel and GoldLapel\Amp\GoldLapel.
+     * @throws \InvalidArgumentException|\TypeError
+     */
+    public static function checkOptions(array $options): void
+    {
+        $valid = array_flip(self::VALID_OPTIONS);
+        foreach ($options as $key => $_) {
+            if (!isset($valid[$key])) {
+                $reason = self::REMOVED_OPTIONS[$key] ?? null;
+                throw new \InvalidArgumentException(
+                    "Unknown option: {$key}" . ($reason !== null ? " ({$reason})" : '')
+                );
+            }
+        }
+        if (isset($options['log_level'])) {
+            self::translateLogLevel($options['log_level']);
+        }
+        self::configToArgs($options['config'] ?? []);
+    }
+
+    /**
      * Pick and hold the ports for a proxy about to spawn. Each proxy holds
      * its proxy port P and its dashboard port (explicit, or P + 1; none when
      * 0). A null $proxyPort takes the smallest P >= 7932 such that neither P
      * nor its dashboard port is held by another live proxy this process
-     * started, so several proxies coexist without configuration. An explicit
-     * $proxyPort is used as given and held like any other. Shared by the
-     * sync and Amp factories; release with releasePorts().
+     * started, and both can be bound right now (so a port some other program
+     * — or another process's Gold Lapel — holds is skipped). An explicit port
+     * another live proxy of this process holds raises; one that is busy at
+     * the OS level is left to the proxy, which refuses it with a message the
+     * start error carries. A proxy whose process has exited holds nothing.
+     * Shared by the sync and Amp factories; release with releasePorts().
      *
      * @internal Used by GoldLapel\GoldLapel and GoldLapel\Amp\GoldLapel.
+     * @param object $owner the instance about to spawn; anything with isRunning()
      * @return array{0:int,1:int} [proxy port, dashboard port]
      */
-    public static function claimPorts(int $owner, ?int $proxyPort, ?int $dashboardPort): array
+    public static function claimPorts(object $owner, string $upstream, ?int $proxyPort, ?int $dashboardPort): array
     {
-        unset(self::$claimedPorts[$owner]);
-        $held = array_flip(array_merge([], ...array_values(self::$claimedPorts)));
+        unset(self::$claimedPorts[spl_object_id($owner)]);
+        $held = []; // port => [upstream, 'proxy' | 'dashboard']
+        foreach (self::$claimedPorts as $claim) {
+            $other = $claim['owner']->get();
+            if ($other === null || !$other->isRunning()) {
+                continue;
+            }
+            foreach ($claim['ports'] as $port => $role) {
+                $held[$port] = [$claim['upstream'], $role];
+            }
+        }
 
         if ($proxyPort === null) {
             $proxyPort = self::DEFAULT_PROXY_PORT;
@@ -413,22 +552,67 @@ class GoldLapel
                 isset($held[$proxyPort])
                 || $proxyPort === $dashboardPort
                 || ($dashboardPort === null && isset($held[$proxyPort + 1]))
+                || !self::canBind($proxyPort)
+                || ($dashboardPort === null && !self::canBind($proxyPort + 1))
             ) {
                 $proxyPort++;
+                if ($proxyPort > 65534) {
+                    throw new RuntimeException('Gold Lapel found no free proxy port from ' . self::DEFAULT_PROXY_PORT . ' up.');
+                }
             }
         }
         $dashboardPort ??= $proxyPort + 1;
 
-        self::$claimedPorts[$owner] = $dashboardPort > 0 ? [$proxyPort, $dashboardPort] : [$proxyPort];
+        foreach ([$proxyPort => 'proxy', $dashboardPort => 'dashboard'] as $port => $role) {
+            if ($port > 0 && isset($held[$port])) {
+                [$otherUpstream, $heldAs] = $held[$port];
+                throw new RuntimeException(
+                    "Gold Lapel cannot use port {$port} as the {$role} port: this process's proxy for "
+                    . self::redactPassword($otherUpstream) . " already holds it as its {$heldAs} port. "
+                    . 'Choose another port, or omit proxy_port and dashboard_port to have a free pair assigned.'
+                );
+            }
+        }
+
+        self::$claimedPorts[spl_object_id($owner)] = [
+            'owner' => \WeakReference::create($owner),
+            'upstream' => $upstream,
+            'ports' => $dashboardPort > 0
+                ? [$proxyPort => 'proxy', $dashboardPort => 'dashboard']
+                : [$proxyPort => 'proxy'],
+        ];
         return [$proxyPort, $dashboardPort];
     }
 
     /**
      * @internal Used by GoldLapel\GoldLapel and GoldLapel\Amp\GoldLapel.
      */
-    public static function releasePorts(int $owner): void
+    public static function releasePorts(object $owner): void
     {
-        unset(self::$claimedPorts[$owner]);
+        unset(self::$claimedPorts[spl_object_id($owner)]);
+    }
+
+    /**
+     * Whether $port can be bound right now: bind 0.0.0.0:$port — as the
+     * proxy's own startup check does, without SO_REUSEPORT — and let go.
+     */
+    private static function canBind(int $port): bool
+    {
+        $server = @stream_socket_server("tcp://0.0.0.0:{$port}");
+        if ($server === false) {
+            return false;
+        }
+        fclose($server);
+        return true;
+    }
+
+    /**
+     * `$url` with the password in its userinfo replaced by `***`, for error
+     * messages.
+     */
+    private static function redactPassword(string $url): string
+    {
+        return (string) preg_replace('/^([^:\/?#]+:\/\/[^:\/?#@]*:).*@/', '$1***@', $url);
     }
 
     // ------------------------------------------------------------------
@@ -521,7 +705,16 @@ class GoldLapel
     private function startProxy(): string
     {
         $url = $this->startProxyWithoutConnect();
+        $this->connect();
 
+        return $url;
+    }
+
+    /**
+     * Open the internal PDO to the running proxy.
+     */
+    private function connect(): void
+    {
         if (!extension_loaded('pdo_pgsql')) {
             // Partial success — keep the proxy running and let the caller
             // fetch the URL via url(), but raise so they know no PDO is
@@ -532,13 +725,9 @@ class GoldLapel
             );
         }
 
-        $dsn = self::urlToPdoDsn($url);
-        $parsed = parse_url($url);
-        $user = isset($parsed['user']) ? rawurldecode($parsed['user']) : null;
-        $pass = isset($parsed['pass']) ? rawurldecode($parsed['pass']) : null;
+        $dsn = self::urlToPdoDsn($this->url);
+        [$user, $pass] = $this->pdoCredentials();
         $this->pdo = new \PDO($dsn, $user, $pass);
-
-        return $url;
     }
 
     private function startProxyWithoutConnect(): string
@@ -549,7 +738,8 @@ class GoldLapel
 
         $binary = self::findBinary();
         [$this->proxyPort, $this->dashboardPort] = self::claimPorts(
-            spl_object_id($this),
+            $this,
+            $this->upstream,
             $this->proxyPortExplicit ? $this->proxyPort : null,
             $this->dashboardPortExplicit ? $this->dashboardPort : null,
         );
@@ -558,7 +748,8 @@ class GoldLapel
         // Top-level options (promoted out of the config map by the canonical
         // surface) emit their own CLI flags before the tuning-knob config
         // map. Each is suppressed when the user hasn't set it, so the Rust
-        // binary applies its own defaults.
+        // binary applies its own defaults. The constructor already checked
+        // log_level and config (checkOptions()), so nothing here throws.
         if ($this->dashboardPortExplicit) {
             $cmd[] = '--dashboard-port';
             $cmd[] = (string) $this->dashboardPort;
@@ -606,13 +797,6 @@ class GoldLapel
         }
         $cmd = array_merge($cmd, self::configToArgs($this->config), $this->extraArgs);
 
-        $nullDevice = PHP_OS_FAMILY === 'Windows' ? 'NUL' : '/dev/null';
-        $descriptors = [
-            0 => ['file', $nullDevice, 'r'],
-            1 => ['file', $nullDevice, 'w'],
-            2 => ['pipe', 'w'],
-        ];
-
         $env = getenv();
         // GOLDLAPEL_CLIENT env var is only set when the user hasn't opted
         // in via the top-level `client` option (which emits --client and
@@ -629,14 +813,65 @@ class GoldLapel
             $env['GOLDLAPEL_DASHBOARD_TOKEN'] = $this->dashboardToken;
         }
 
-        $pipes = [];
-        $this->process = proc_open($cmd, $descriptors, $pipes, null, $env);
+        try {
+            $this->process = self::launch($cmd, $env, $this->proxyPort);
+        } catch (\Throwable $e) {
+            self::releasePorts($this);
+            throw $e;
+        }
 
-        if (!is_resource($this->process)) {
-            $this->process = null;
-            self::releasePorts(spl_object_id($this));
+        $this->url = self::makeProxyUrl(
+            $this->upstream,
+            $this->proxyPort,
+            !self::clientTls($this->config, $this->extraArgs),
+        );
+
+        // Print the banner BEFORE registering for cleanup: fwrite()
+        // to stderr is vanishingly unlikely to fail, but if it does
+        // (closed fd in a long-running SAPI, unwritable stream, FPM
+        // after fastcgi_finish_request() has detached stderr) we'd
+        // rather let the throw escape with no registry entry than
+        // leak an orphan reference into $liveInstances. Registration
+        // is the last side-effect because it's the one whose cleanup
+        // is most expensive to get wrong.
+        self::printBanner($this->proxyPort, $this->dashboardPort, $this->silent);
+
+        // Register the instance for global cleanup immediately so
+        // that any subsequent init step (e.g. PDO construction in
+        // startProxy()) can throw without leaking the subprocess.
+        self::registerForCleanup($this);
+
+        return $this->url;
+    }
+
+    /**
+     * Spawn the proxy and wait until it is ready: its port answers and the
+     * child is still alive at that moment. A port that already answered
+     * before the spawn belongs to someone else — the proxy refuses it — so
+     * then only the child's exit (or the timeout) ends the wait. On failure
+     * the child is stopped and the error carries its exit status and the
+     * tail of its stderr, which is where the proxy explains itself ("I'm
+     * afraid port N … is already in use"). Shared by the sync and Amp
+     * factories.
+     *
+     * @internal Used by GoldLapel\GoldLapel and GoldLapel\Amp\GoldLapel.
+     * @return resource the proc_open() handle of the ready proxy
+     */
+    public static function launch(array $cmd, array $env, int $proxyPort)
+    {
+        $occupied = self::portAnswers($proxyPort);
+
+        $nullDevice = PHP_OS_FAMILY === 'Windows' ? 'NUL' : '/dev/null';
+        $descriptors = [
+            0 => ['file', $nullDevice, 'r'],
+            1 => ['file', $nullDevice, 'w'],
+            2 => ['pipe', 'w'],
+        ];
+        $pipes = [];
+        $process = proc_open($cmd, $descriptors, $pipes, null, $env);
+        if (!is_resource($process)) {
             throw new RuntimeException(
-                "Failed to start Gold Lapel process (proc_open returned false for {$binary}). " .
+                "Failed to start Gold Lapel process (proc_open returned false for {$cmd[0]}). " .
                 "Check that the binary is executable and the system has free resources."
             );
         }
@@ -644,54 +879,51 @@ class GoldLapel
         $stderr = $pipes[2];
         stream_set_blocking($stderr, false);
         $stderrOutput = '';
-
+        $exited = null;
         $deadline = hrtime(true) + (int) (self::STARTUP_TIMEOUT * 1e9);
 
         while (hrtime(true) < $deadline) {
-            $chunk = @fread($stderr, 65536);
-            if ($chunk !== false && $chunk !== '') {
-                $stderrOutput .= $chunk;
-            }
+            $stderrOutput .= (string) @fread($stderr, 65536);
 
-            $status = proc_get_status($this->process);
+            $status = proc_get_status($process);
             if (!$status['running']) {
+                $exited = $status;
                 break;
             }
 
-            if (self::waitForPort('127.0.0.1', $this->proxyPort, 0.5)) {
-                fclose($stderr);
-                $this->url = self::makeProxyUrl($this->upstream, $this->proxyPort);
-
-                // Print the banner BEFORE registering for cleanup: fwrite()
-                // to stderr is vanishingly unlikely to fail, but if it does
-                // (closed fd in a long-running SAPI, unwritable stream, FPM
-                // after fastcgi_finish_request() has detached stderr) we'd
-                // rather let the throw escape with no registry entry than
-                // leak an orphan reference into $liveInstances. Registration
-                // is the last side-effect because it's the one whose cleanup
-                // is most expensive to get wrong.
-                self::printBanner($this->proxyPort, $this->dashboardPort, $this->silent);
-
-                // Register the instance for global cleanup immediately so
-                // that any subsequent init step (e.g. PDO construction in
-                // startProxy()) can throw without leaking the subprocess.
-                self::registerForCleanup($this);
-
-                return $this->url;
+            if ($occupied) {
+                usleep((int) (self::STARTUP_POLL_INTERVAL * 1e6));
+            } elseif (self::waitForPort('127.0.0.1', $proxyPort, 0.5)) {
+                $status = proc_get_status($process);
+                if ($status['running']) {
+                    fclose($stderr);
+                    return $process;
+                }
+                $exited = $status;
+                break;
             }
         }
 
-        // Failure path — drain remaining stderr, terminate, throw
-        $chunk = @fread($stderr, 65536);
-        if ($chunk !== false && $chunk !== '') {
-            $stderrOutput .= $chunk;
-        }
+        // Failure — collect what the child said, stop it, explain.
+        $stderrOutput .= (string) @stream_get_contents($stderr);
         fclose($stderr);
+        self::killProcess($process);
 
-        $this->terminate();
-
+        $tail = trim(substr($stderrOutput, -2000));
+        if ($exited === null) {
+            throw new RuntimeException(
+                "Gold Lapel failed to start on port {$proxyPort} within " . self::STARTUP_TIMEOUT . "s.\nstderr: {$tail}"
+            );
+        }
+        if ($exited['signaled']) {
+            $how = "was killed by signal {$exited['termsig']}";
+        } elseif ($exited['exitcode'] >= 0) {
+            $how = "exited with status {$exited['exitcode']}";
+        } else {
+            $how = 'exited';
+        }
         throw new RuntimeException(
-            "Gold Lapel failed to start on port {$this->proxyPort} within " . self::STARTUP_TIMEOUT . "s.\nstderr: {$stderrOutput}"
+            "Gold Lapel {$how} before it was ready on port {$proxyPort}.\nstderr: {$tail}"
         );
     }
 
@@ -719,21 +951,24 @@ class GoldLapel
     }
 
     /**
-     * Stop the proxy for this instance. Idempotent.
+     * Stop the proxy for this instance. Idempotent. When several start()
+     * calls share this proxy (same upstream), each stop() releases one of
+     * them and the proxy stops with the last.
      */
     public function stop(): void
     {
+        if ($this->holders > 1) {
+            $this->holders--;
+            return;
+        }
+        $this->holders = 0;
+
         $this->pdo = null;
         $this->scopedConn = null;
         // Drop cached DDL patterns — they're tied to the proxy we're about
         // to terminate.
         $this->ddlCache = [];
         $this->dashboardToken = null;
-
-        if ($this->process === null) {
-            unset(self::$liveInstances[spl_object_id($this)]);
-            return;
-        }
 
         $this->terminate();
         $this->url = null;
@@ -887,6 +1122,7 @@ class GoldLapel
     {
         foreach (self::$liveInstances as $instance) {
             try {
+                $instance->holders = 0;
                 $instance->stop();
             } catch (\Throwable $e) {
                 // Shutdown-time errors should not abort cleanup.
@@ -1206,21 +1442,78 @@ class GoldLapel
         return $url . $sep . 'application_name=' . self::applicationNameMarker();
     }
 
-    public static function makeProxyUrl(string $upstream, int $port): string
+    /**
+     * The URL the app connects to: the upstream URL pointed at the proxy.
+     * `$stripTls` drops the upstream TLS/GSS parameters (UPSTREAM_TLS_PARAMS)
+     * — the proxy declines TLS from the app unless it was started with
+     * --tls-cert/--tls-key, so `?sslmode=require` would make the app's
+     * connection fail. The factories pass false when the proxy has client
+     * TLS on.
+     */
+    public static function makeProxyUrl(string $upstream, int $port, bool $stripTls = true): string
     {
         $withPort = '/^(postgres(?:ql)?:\/\/(?:.*@)?)([^\/:?#]+):(\d+)(.*)$/';
         $noPort = '/^(postgres(?:ql)?:\/\/(?:.*@)?)([^\/:?#]+)(.*)$/';
 
         if (preg_match($withPort, $upstream, $m)) {
-            return self::injectApplicationName($m[1] . 'localhost:' . $port . $m[4]);
+            $rest = $stripTls ? self::stripTlsParams($m[4]) : $m[4];
+            return self::injectApplicationName($m[1] . 'localhost:' . $port . $rest);
         }
 
         if (preg_match($noPort, $upstream, $m)) {
-            return self::injectApplicationName($m[1] . 'localhost:' . $port . $m[3]);
+            $rest = $stripTls ? self::stripTlsParams($m[3]) : $m[3];
+            return self::injectApplicationName($m[1] . 'localhost:' . $port . $rest);
         }
 
         // Bare-host form skips the marker — atypical caller path.
         return 'localhost:' . $port;
+    }
+
+    private static function portAnswers(int $port): bool
+    {
+        $fp = @fsockopen('127.0.0.1', $port, $errno, $errstr, 0.5);
+        if ($fp === false) {
+            return false;
+        }
+        fclose($fp);
+        return true;
+    }
+
+    /**
+     * `$rest` (path and query of a URL) without the UPSTREAM_TLS_PARAMS
+     * query parameters; keys compare case-insensitively.
+     */
+    private static function stripTlsParams(string $rest): string
+    {
+        $q = strpos($rest, '?');
+        if ($q === false) {
+            return $rest;
+        }
+        $kept = array_filter(
+            explode('&', substr($rest, $q + 1)),
+            fn ($pair) => $pair !== ''
+                && !in_array(strtolower(explode('=', $pair, 2)[0]), self::UPSTREAM_TLS_PARAMS, true),
+        );
+        return substr($rest, 0, $q) . ($kept ? '?' . implode('&', $kept) : '');
+    }
+
+    /**
+     * Whether the proxy will accept TLS from the app: a tls_cert/tls_key in
+     * `config`, or --tls-cert/--tls-key in `extra_args`.
+     *
+     * @internal Used by GoldLapel\GoldLapel and GoldLapel\Amp\GoldLapel.
+     */
+    public static function clientTls(array $config, array $extraArgs): bool
+    {
+        if (!empty($config['tls_cert']) || !empty($config['tls_key'])) {
+            return true;
+        }
+        foreach ($extraArgs as $arg) {
+            if (str_starts_with((string) $arg, '--tls-cert') || str_starts_with((string) $arg, '--tls-key')) {
+                return true;
+            }
+        }
+        return false;
     }
 
     public static function waitForPort(string $host, int $port, float $timeout): bool
@@ -1269,32 +1562,42 @@ class GoldLapel
 
     private function terminate(): void
     {
-        self::releasePorts(spl_object_id($this));
+        self::releasePorts($this);
         if ($this->process === null) {
             return;
         }
+        self::killProcess($this->process);
+        $this->process = null;
+    }
 
-        $status = proc_get_status($this->process);
+    /**
+     * SIGTERM, up to 5s for a clean exit, then SIGKILL; reaps the child.
+     *
+     * @internal Used by GoldLapel\GoldLapel and GoldLapel\Amp\GoldLapel.
+     * @param resource $process
+     */
+    public static function killProcess($process): void
+    {
+        $status = proc_get_status($process);
         if ($status['running']) {
-            proc_terminate($this->process, 15); // SIGTERM
+            proc_terminate($process, 15); // SIGTERM
 
             $deadline = hrtime(true) + (int) (5 * 1e9);
             while (hrtime(true) < $deadline) {
-                $status = proc_get_status($this->process);
+                $status = proc_get_status($process);
                 if (!$status['running']) {
                     break;
                 }
                 usleep(50000);
             }
 
-            $status = proc_get_status($this->process);
+            $status = proc_get_status($process);
             if ($status['running']) {
-                proc_terminate($this->process, 9); // SIGKILL
+                proc_terminate($process, 9); // SIGKILL
             }
         }
 
-        proc_close($this->process);
-        $this->process = null;
+        proc_close($process);
     }
 
     private static function isMusl(string $arch): bool

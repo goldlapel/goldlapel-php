@@ -31,7 +31,9 @@ $gl->stop();  // (also cleaned up in __destruct)
 
 Point PDO at `$gl->pdoDsn()` (with `$gl->pdoCredentials()`, since PDO doesn't accept `postgresql://` URLs directly). The PDO is a plain `\PDO` connected to the proxy; any other Postgres driver can use `$gl->url()`.
 
-The proxy listens on two ports: the proxy itself (`proxy_port`, default 7932) and the dashboard (`dashboard_port`, default `proxy_port + 1`; `0` disables it). Start several proxies in one process and, unless you set `proxy_port`, each takes the next free pair — 7932/7933, then 7934/7935, and so on; `$gl->getProxyPort()` tells you which. The async factory (`GoldLapel\Amp\GoldLapel::start()`) takes the same options.
+The proxy listens on two ports: the proxy itself (`proxy_port`, default 7932) and the dashboard (`dashboard_port`, default `proxy_port + 1`; `0` disables it). Unless you set `proxy_port`, each proxy takes the first free pair from 7932 up — 7932/7933, then 7934/7935, and so on — skipping ports any other program holds; `$gl->getProxyPort()` tells you which. A port you set explicitly that's already taken fails the start with the reason. One upstream gets one proxy per process: `start()` for an upstream that's already running returns the same instance, and the proxy stops when the last of those callers calls `stop()`. The async factory (`GoldLapel\Amp\GoldLapel::start()`) takes the same options.
+
+`$gl->url()` and `$gl->pdoDsn()` leave out the upstream's TLS settings (`sslmode`, `sslrootcert`, `channel_binding`, …): those apply between the proxy and your database, and the proxy talks plain TCP to your app on localhost unless you give it `tls_cert`/`tls_key`.
 
 Document store and streams live under nested namespaces:
 

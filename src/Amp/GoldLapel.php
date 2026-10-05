@@ -93,6 +93,12 @@ class GoldLapel
      */
     private FiberLocal $scopedConn;
 
+    /**
+     * How many start() / startProxyOnly() calls currently share this proxy;
+     * see SyncGoldLapel::start().
+     */
+    private int $holders = 0;
+
     /** @var array<int, self> */
     private static array $liveInstances = [];
     private static bool $cleanupRegistered = false;
@@ -140,6 +146,9 @@ class GoldLapel
      */
     public function __construct(string $upstream, array $options = [])
     {
+        // Every option is checked here, before anything is claimed or
+        // spawned, so a bad one can't leave half-started state behind.
+        SyncGoldLapel::checkOptions($options);
         $this->upstream = $upstream;
         // Without an explicit proxy_port the port is allocated at spawn
         // time (see SyncGoldLapel::claimPorts()); 7932 until then.
@@ -160,16 +169,7 @@ class GoldLapel
         $this->client = isset($options['client']) ? (string) $options['client'] : null;
         $this->configFile = isset($options['config_file']) ? (string) $options['config_file'] : null;
 
-        $config = $options['config'] ?? [];
-        // Validate structured-config keys eagerly, as the sync constructor
-        // does, so a bad key fails before anything is spawned.
-        $validKeys = array_flip(SyncGoldLapel::configKeys());
-        foreach ($config as $key => $_) {
-            if (!isset($validKeys[$key])) {
-                throw new \InvalidArgumentException("Unknown config key: {$key}");
-            }
-        }
-        $this->config = $config;
+        $this->config = $options['config'] ?? [];
         $this->extraArgs = $options['extra_args'] ?? [];
         $this->silent = !empty($options['silent']);
         // Mesh membership (startup intent — HQ enforces license).
@@ -206,6 +206,11 @@ class GoldLapel
      * `dashboard_port`, `log_level`, `mode`, `license`, `client`,
      * `config_file`, `config`, `extra_args`, `silent`, `mesh`, `mesh_tag`,
      * `disable_proxy_cache`, `disable_sqloptimize`, `disable_auto_indexes`).
+     *
+     * One proxy per upstream, as with the sync factory: a start for an
+     * upstream this process already runs (through this async API) resolves
+     * to that same instance, and the proxy stops with its last holder's
+     * stop().
      */
     public static function start(string $upstream, array $options = []): Future
     {
@@ -214,6 +219,11 @@ class GoldLapel
             try {
                 $instance->connect();
             } catch (\Throwable $e) {
+                if ($instance->holders > 1) {
+                    // Someone else's running proxy — just drop our claim.
+                    $instance->holders--;
+                    throw $e;
+                }
                 // Mirror the sync factory's inner-guarded cleanup: if
                 // terminate() itself throws (a proc_close() edge case or
                 // SIGTERM race), we must not mask the original $e with a
@@ -224,8 +234,9 @@ class GoldLapel
                 } catch (\Throwable $cleanupErr) {
                     // Don't mask the original failure with a teardown error.
                 }
-                SyncGoldLapel::releasePorts(spl_object_id($instance));
+                SyncGoldLapel::releasePorts($instance);
                 unset(self::$liveInstances[spl_object_id($instance)]);
+                $instance->holders = 0;
                 throw $e;
             }
             return $instance;
@@ -246,30 +257,32 @@ class GoldLapel
 
     private static function startProxyInstance(string $upstream, array $options): self
     {
+        foreach (self::$liveInstances as $running) {
+            if ($running->upstream === $upstream && $running->isRunning()) {
+                $running->holders++;
+                return $running;
+            }
+        }
+
         // `new static(...)` (not `new self(...)`) so test subclasses can
         // override instance methods like terminate() to simulate rare
         // cleanup-throws scenarios from the catch block in start().
         $instance = new static($upstream, $options);
-        $instance->startSubprocess();
-        return $instance;
-    }
-
-    private static function translateLogLevel($level): ?string
-    {
-        if (!is_string($level)) {
-            throw new \InvalidArgumentException(
-                'log_level must be a string (one of: trace, debug, info, warn, error)'
-            );
+        try {
+            $instance->startSubprocess();
+        } catch (\Throwable $e) {
+            // A throw after the spawn (the banner write) must not leave the
+            // child running; before it, this just releases the claim.
+            try {
+                $instance->terminate();
+            } catch (\Throwable $cleanupErr) {
+                // Don't mask the original failure with a teardown error.
+            }
+            SyncGoldLapel::releasePorts($instance);
+            throw $e;
         }
-        return match (strtolower($level)) {
-            'trace' => '-vvv',
-            'debug' => '-vv',
-            'info' => '-v',
-            'warn', 'warning', 'error' => null,
-            default => throw new \InvalidArgumentException(
-                'log_level must be one of: trace, debug, info, warn, error'
-            ),
-        };
+        $instance->holders = 1;
+        return $instance;
     }
 
     // ------------------------------------------------------------------
@@ -283,20 +296,22 @@ class GoldLapel
         }
         $binary = SyncGoldLapel::findBinary();
         [$this->proxyPort, $this->dashboardPort] = SyncGoldLapel::claimPorts(
-            spl_object_id($this),
+            $this,
+            $this->upstream,
             $this->proxyPortExplicit ? $this->proxyPort : null,
             $this->dashboardPortExplicit ? $this->dashboardPort : null,
         );
         $cmd = [$binary, '--upstream', $this->upstream, '--proxy-port', (string) $this->proxyPort];
 
         // Top-level options (promoted out of the config map) emit their own
-        // CLI flags before the tuning-knob config map.
+        // CLI flags before the tuning-knob config map. The constructor
+        // already checked log_level and config, so nothing here throws.
         if ($this->dashboardPortExplicit) {
             $cmd[] = '--dashboard-port';
             $cmd[] = (string) $this->dashboardPort;
         }
         if ($this->logLevel !== null) {
-            $verboseFlag = self::translateLogLevel($this->logLevel);
+            $verboseFlag = SyncGoldLapel::translateLogLevel($this->logLevel);
             if ($verboseFlag !== null) {
                 $cmd[] = $verboseFlag;
             }
@@ -335,12 +350,6 @@ class GoldLapel
         }
         $cmd = array_merge($cmd, SyncGoldLapel::configToArgs($this->config), $this->extraArgs);
 
-        $nullDevice = PHP_OS_FAMILY === 'Windows' ? 'NUL' : '/dev/null';
-        $descriptors = [
-            0 => ['file', $nullDevice, 'r'],
-            1 => ['file', $nullDevice, 'w'],
-            2 => ['pipe', 'w'],
-        ];
         $env = getenv();
         if ($this->client === null && !isset($env['GOLDLAPEL_CLIENT'])) {
             $env['GOLDLAPEL_CLIENT'] = 'php-amp';
@@ -352,54 +361,22 @@ class GoldLapel
             $this->dashboardToken = bin2hex(random_bytes(32));
             $env['GOLDLAPEL_DASHBOARD_TOKEN'] = $this->dashboardToken;
         }
-        $pipes = [];
-        $this->process = proc_open($cmd, $descriptors, $pipes, null, $env);
-        if (!is_resource($this->process)) {
-            $this->process = null;
-            SyncGoldLapel::releasePorts(spl_object_id($this));
-            throw new RuntimeException(
-                "Failed to start Gold Lapel process (proc_open returned false for {$binary}). " .
-                "Check that the binary is executable and the system has free resources."
-            );
-        }
 
-        $stderr = $pipes[2];
-        stream_set_blocking($stderr, false);
-        $stderrOutput = '';
-        $deadline = hrtime(true) + (int) (self::STARTUP_TIMEOUT * 1e9);
-
-        while (hrtime(true) < $deadline) {
-            $chunk = @fread($stderr, 65536);
-            if ($chunk !== false && $chunk !== '') {
-                $stderrOutput .= $chunk;
-            }
-            $status = proc_get_status($this->process);
-            if (!$status['running']) {
-                break;
-            }
-            if (SyncGoldLapel::waitForPort('127.0.0.1', $this->proxyPort, 0.5)) {
-                fclose($stderr);
-                $this->url = SyncGoldLapel::makeProxyUrl($this->upstream, $this->proxyPort);
-                // Print the banner BEFORE registering for cleanup: an fwrite()
-                // failure on stderr must not leak an orphan entry in
-                // $liveInstances. Registration is the last side-effect so
-                // that any throw between "subprocess confirmed listening"
-                // and "return $this->url" bubbles out with no registry
-                // cleanup required. Mirrors the sync factory.
-                $this->printBanner();
-                self::registerForCleanup($this);
-                return $this->url;
-            }
-        }
-        $chunk = @fread($stderr, 65536);
-        if ($chunk !== false && $chunk !== '') {
-            $stderrOutput .= $chunk;
-        }
-        fclose($stderr);
-        $this->terminate();
-        throw new RuntimeException(
-            "Gold Lapel failed to start on port {$this->proxyPort} within " . self::STARTUP_TIMEOUT . "s.\nstderr: {$stderrOutput}"
+        $this->process = SyncGoldLapel::launch($cmd, $env, $this->proxyPort);
+        $this->url = SyncGoldLapel::makeProxyUrl(
+            $this->upstream,
+            $this->proxyPort,
+            !SyncGoldLapel::clientTls($this->config, $this->extraArgs),
         );
+        // Print the banner BEFORE registering for cleanup: an fwrite()
+        // failure on stderr must not leak an orphan entry in
+        // $liveInstances. Registration is the last side-effect so that any
+        // throw between "subprocess confirmed listening" and
+        // "return $this->url" bubbles out with no registry cleanup
+        // required. Mirrors the sync factory.
+        $this->printBanner();
+        self::registerForCleanup($this);
+        return $this->url;
     }
 
     private function printBanner(): void
@@ -437,12 +414,19 @@ class GoldLapel
     }
 
     /**
-     * Stop the proxy for this instance. Idempotent.
+     * Stop the proxy for this instance. Idempotent. When several start()
+     * calls share this proxy (same upstream), each stop() releases one of
+     * them and the proxy stops with the last.
      * Returns Future<void>.
      */
     public function stop(): Future
     {
         return async(function (): void {
+            if ($this->holders > 1) {
+                $this->holders--;
+                return;
+            }
+            $this->holders = 0;
             if ($this->connection !== null) {
                 try {
                     $this->connection->close();
@@ -459,10 +443,6 @@ class GoldLapel
             // "each fiber's on teardown".) Either way, stop() runs in
             // its own async fiber — no other fiber's scope is visible
             // here, and there's nothing to reset.
-            if ($this->process === null) {
-                unset(self::$liveInstances[spl_object_id($this)]);
-                return;
-            }
             $this->terminate();
             $this->url = null;
             unset(self::$liveInstances[spl_object_id($this)]);
@@ -492,27 +472,11 @@ class GoldLapel
      */
     protected function terminate(): void
     {
-        SyncGoldLapel::releasePorts(spl_object_id($this));
+        SyncGoldLapel::releasePorts($this);
         if ($this->process === null) {
             return;
         }
-        $status = proc_get_status($this->process);
-        if ($status['running']) {
-            proc_terminate($this->process, 15);
-            $deadline = hrtime(true) + (int) (5 * 1e9);
-            while (hrtime(true) < $deadline) {
-                $status = proc_get_status($this->process);
-                if (!$status['running']) {
-                    break;
-                }
-                usleep(50000);
-            }
-            $status = proc_get_status($this->process);
-            if ($status['running']) {
-                proc_terminate($this->process, 9);
-            }
-        }
-        proc_close($this->process);
+        SyncGoldLapel::killProcess($this->process);
         $this->process = null;
     }
 
@@ -529,6 +493,7 @@ class GoldLapel
     {
         foreach (self::$liveInstances as $instance) {
             try {
+                $instance->holders = 0;
                 $instance->terminate();
             } catch (\Throwable $e) {
                 // shutdown-time errors shouldn't abort cleanup

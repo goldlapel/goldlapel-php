@@ -8,20 +8,18 @@ use Illuminate\Support\ServiceProvider;
 class GoldLapelServiceProvider extends ServiceProvider
 {
     /**
-     * Per-connection state for each Gold Lapel proxy spawned by boot().
+     * The GoldLapel instance behind each Laravel connection, keyed by
+     * connection name. Connections pointing at the same database share one
+     * instance (the core reuses a running proxy per upstream), and each
+     * holds it once, so each one's stop() releases its own hold.
      *
-     * Keyed by Laravel connection name. Holds the live `GoldLapel` instance
-     * so the terminating callback can call `->stop()` on it under long-lived
-     * workers (Octane / Swoole / RoadRunner).
-     *
-     * @var array<string, array{proxy_port:int, instance:GoldLapel}>
+     * @var array<string, GoldLapel>
      */
     private array $glConnections = [];
 
     public function boot(): void
     {
         $connections = config('database.connections', []);
-        $proxies = []; // upstream URL => GoldLapel instance
 
         foreach ($connections as $name => $config) {
             if (($config['driver'] ?? '') !== 'pgsql') {
@@ -45,61 +43,54 @@ class GoldLapelServiceProvider extends ServiceProvider
 
             try {
                 $upstream = buildUpstreamUrl($config);
-                // Use the connection-less factory variant — Laravel opens
-                // its own PDOs against the rewritten host/port. We hold
-                // onto the returned instance so the terminating callback
-                // below can stop each subprocess deterministically at
-                // worker shutdown (Octane/Swoole/RoadRunner). Connections
-                // pointing at the same database share one proxy; the first
-                // connection's options win.
-                $instance = $proxies[$upstream] ??= GoldLapel::startProxyOnly($upstream, $startOptions);
-            } catch (\Exception $e) {
+                // The connection-less factory variant — Laravel opens its
+                // own PDOs against the rewritten host/port. Connections
+                // pointing at the same database get the same running proxy
+                // back from the core; the first connection's options win.
+                $instance = GoldLapel::startProxyOnly($upstream, $startOptions);
+            } catch (\Throwable $e) {
+                // \Throwable, not \Exception: a mistyped option value
+                // raises \TypeError, which must not take the app down.
                 logger()->warning("Gold Lapel failed to start for connection '{$name}': " . $e->getMessage());
                 continue;
             }
 
-            $proxyPort = $instance->getProxyPort();
-            $this->glConnections[$name] = [
-                'proxy_port' => $proxyPort,
-                'instance' => $instance,
-            ];
+            $this->glConnections[$name] = $instance;
 
             config([
                 "database.connections.{$name}.host" => '127.0.0.1',
-                "database.connections.{$name}.port" => $proxyPort,
+                "database.connections.{$name}.port" => $instance->getProxyPort(),
                 "database.connections.{$name}.url" => null,
                 "database.connections.{$name}.sslmode" => 'prefer',
             ]);
         }
 
-        if (!empty($this->glConnections)) {
-            // Register a terminating callback so Octane / Swoole / RoadRunner
-            // worker shutdown releases each subprocess deterministically
-            // rather than waiting for __destruct or the PHP shutdown hook
-            // (which may never fire inside a long-lived worker until the
-            // whole worker process exits).
-            //
-            // Octane invokes $app->terminate() between requests. We guard
-            // against double-stop under that pattern by keying the callback
-            // on this provider instance and stopping only instances still in
-            // $this->glConnections — the first call clears them out.
-            $this->app->terminating(function () {
-                $stopped = [];
-                foreach ($this->glConnections as $state) {
-                    // A proxy shared by several connections stops once.
-                    $id = spl_object_id($state['instance']);
-                    if (isset($stopped[$id])) {
-                        continue;
-                    }
-                    $stopped[$id] = true;
-                    try {
-                        $state['instance']->stop();
-                    } catch (\Throwable $e) {
-                        // Never let a stop() error abort worker shutdown.
-                    }
+        if (empty($this->glConnections)) {
+            return;
+        }
+
+        $stop = function () {
+            foreach ($this->glConnections as $instance) {
+                try {
+                    $instance->stop();
+                } catch (\Throwable $e) {
+                    // Never let one stop() error keep the rest running.
                 }
-                $this->glConnections = [];
-            });
+            }
+            $this->glConnections = [];
+        };
+
+        if (isset($_SERVER['LARAVEL_OCTANE'])) {
+            // Octane boots this provider once per worker but runs the
+            // terminating callbacks after every request, so stopping there
+            // would leave every later request pointed at a dead proxy. The
+            // proxies live as long as the worker and stop with it.
+            $this->app['events']->listen(\Laravel\Octane\Events\WorkerStopping::class, $stop);
+        } else {
+            // One request (PHP-FPM) or one console command: stop when the
+            // app terminates. The process-exit hook in the core would too;
+            // this just makes it deterministic.
+            $this->app->terminating($stop);
         }
     }
 }

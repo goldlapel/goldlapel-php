@@ -141,15 +141,38 @@ not supplied. Direct callers should migrate to the namespace verbs
 (`$gl->documents->insert(...)`); the static helpers remain on the public
 surface for advanced uses but require the patterns map.
 
+**Unknown `GoldLapel::start()` options raise.** Sync and async, an option
+the factory doesn't know now throws `InvalidArgumentException`
+(`Unknown option: …`) instead of being ignored; the removed ones say why
+(`invalidation_port`, `disable_native_cache`, `native_cache_size` and
+`aggressive_verify` went with the in-process cache, `disable_matviews` with
+materialized views). Removed `config` keys name their reason the same way.
+
 ### Changed
 
 - Several proxies in one process no longer collide. Each proxy holds two
   ports (proxy and dashboard), and without an explicit `proxy_port` a proxy
-  now takes the first free pair from 7932 up: 7932/7933 for the first, then
-  7934/7935, and so on. An explicit `proxy_port` is used as given and still
-  counts as taken; stopping a proxy frees its ports. Sync and async proxies
-  share the same bookkeeping. Read the chosen port with `getProxyPort()`.
-- Laravel: the `goldlapel` block of a connection now accepts every
+  takes the first free pair from 7932 up: 7932/7933 for the first, then
+  7934/7935, and so on, skipping any port another program (or another
+  process's Gold Lapel) holds. Stopping a proxy, a failed start and the
+  proxy exiting all free its ports. Sync and async proxies share the same
+  bookkeeping. Read the chosen port with `getProxyPort()`.
+- An explicit `proxy_port` or `dashboard_port` that another proxy of this
+  process holds raises a `RuntimeException` naming the port and that proxy's
+  upstream (password masked). One that another program holds makes the proxy
+  refuse to start, and its message is in the `RuntimeException`.
+- One upstream, one proxy: `start()` / `startProxyOnly()` for an upstream
+  this process already runs returns that same instance (its options apply),
+  and the proxy stops when the last caller calls `stop()`. Same for the
+  async factory.
+- The app's connection URL (`url()`, `pdoDsn()`) no longer carries the
+  upstream's TLS/GSS parameters (`sslmode`, `sslrootcert`,
+  `channel_binding`, `gssencmode`, …). They configure the proxy's hop to the
+  database, which still uses them; the proxy declines TLS from the app unless
+  given `tls_cert`/`tls_key` (then they're kept). Before, an upstream URL with
+  `?sslmode=require` — every Neon, Supabase and RDS URL — made the app's
+  connection fail.
+- Laravel: the `goldlapel` block of a connection accepts every
   `GoldLapel::start()` option (`dashboard_port`, `license`, `config_file`,
   `silent`, `mesh`, `mesh_tag`, `disable_proxy_cache`, `disable_sqloptimize`,
   `disable_auto_indexes`, and `client`, which defaults to `laravel`), and
@@ -157,6 +180,23 @@ surface for advanced uses but require the patterns map.
   share one proxy (the first connection's options apply).
 
 ### Fixed
+
+- A start counted as ready as soon as the proxy port answered — even when
+  another program was answering there and the proxy had just exited. Now the
+  proxy must still be running, a port that answered before the spawn isn't
+  taken as readiness, and a failed start reports the proxy's exit status and
+  the end of its stderr.
+- A start that failed before the spawn (a bad `log_level`, a mistyped
+  `config` value) kept its ports claimed, and `stop()` on an instance with no
+  process didn't release them. Options are now checked when the instance is
+  constructed, and every failure path releases.
+- Laravel: under Octane, the provider stopped every proxy when the first
+  request terminated, so every later request on that worker connected to a
+  dead port. Under Octane the proxies now live as long as the worker and stop
+  with it (`WorkerStopping`); elsewhere they still stop when the app
+  terminates.
+- Laravel: a mistyped option value (`TypeError`) escaped the provider and
+  took the app down instead of being logged like any other start failure.
 
 - The async factory (`GoldLapel\Amp\GoldLapel`) silently ignored `mesh`,
   `mesh_tag`, `disable_proxy_cache`, `disable_sqloptimize` and

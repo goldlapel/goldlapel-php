@@ -69,6 +69,19 @@ class StartupOptionsTest extends TestCase
         new GoldLapel('postgresql://u:p@h/d', ['config' => [$option => true]]);
     }
 
+    public function testUnknownTopLevelOptionRejectedAtConstruction(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('Unknown option: invalidation_port (it was removed with the in-process cache)');
+        new GoldLapel('postgresql://u:p@h/d', ['invalidation_port' => 7934]);
+    }
+
+    public function testBadLogLevelRejectedAtConstruction(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        new GoldLapel('postgresql://u:p@h/d', ['log_level' => 'loud']);
+    }
+
     public function testUnknownConfigKeyRejectedAtConstruction(): void
     {
         // Eager validation — matches the sync constructor, so a typo fails

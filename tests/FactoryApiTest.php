@@ -72,6 +72,55 @@ class FactoryApiTest extends TestCase
         }
     }
 
+    public function testConstructRejectsUnknownTopLevelOptions(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('Unknown option: proxy_prot');
+        new GoldLapel('postgresql://u:p@h/d', ['proxy_prot' => 7932]);
+    }
+
+    public function testConstructNamesRemovedOptions(): void
+    {
+        $removed = [
+            'invalidation_port' => 'it was removed with the in-process cache',
+            'disable_native_cache' => 'it was removed with the in-process cache',
+            'native_cache_size' => 'it was removed with the in-process cache',
+            'aggressive_verify' => 'it was removed with the in-process cache',
+            'disable_matviews' => 'materialized views were removed',
+        ];
+        foreach ($removed as $option => $reason) {
+            try {
+                new GoldLapel('postgresql://u:p@h/d', [$option => 1]);
+                $this->fail("expected '{$option}' to be rejected");
+            } catch (\InvalidArgumentException $e) {
+                $this->assertSame("Unknown option: {$option} ({$reason})", $e->getMessage());
+            }
+        }
+    }
+
+    public function testConstructNamesRemovedConfigKeys(): void
+    {
+        $this->expectException(\InvalidArgumentException::class);
+        $this->expectExceptionMessage('Unknown config key: refresh_interval_secs (materialized views were removed)');
+        new GoldLapel('postgresql://u:p@h/d', ['config' => ['refresh_interval_secs' => 60]]);
+    }
+
+    public function testConstructChecksOptionValuesBeforeAnyStart(): void
+    {
+        foreach ([
+            [['log_level' => 'loud'], \InvalidArgumentException::class],
+            [['config' => ['disable_pool' => 'yes']], \TypeError::class],
+            [['config' => ['replica' => 'r1']], \TypeError::class],
+        ] as [$options, $class]) {
+            try {
+                new GoldLapel('postgresql://u:p@h/d', $options);
+                $this->fail('expected ' . json_encode($options) . ' to be rejected at construction');
+            } catch (\Throwable $e) {
+                $this->assertInstanceOf($class, $e);
+            }
+        }
+    }
+
     public function testConstructModeAndLogLevelTopLevel(): void
     {
         $gl = new GoldLapel('postgresql://u:p@h/d', [

@@ -45,14 +45,12 @@ class StreamsIntegrationTest extends TestCase
 
     public function testStreamAddCreatesPrefixedTable(): void
     {
-        $port = 7700 + (int) (microtime(true) * 1000) % 100;
         $name = 'gl_php_int_stream_' . (int) (microtime(true) * 1000);
         // Proxy proxy_cache / rewrite_prepared_cache are
         // intentionally left on — the FOR UPDATE tx-poisoning bug that used to require
         // disabling them was fixed in goldlapel d77fe37 / 945d674 and has
         // regression coverage in tests/phase32_for_update_cache.rs.
         $gl = GoldLapel::start(self::$pgUrl, [
-            'proxy_port' => $port,
             'silent' => true,
         ]);
         try {
@@ -79,11 +77,9 @@ class StreamsIntegrationTest extends TestCase
 
     public function testSchemaMetaRowRecorded(): void
     {
-        $port = 7800 + (int) (microtime(true) * 1000) % 100;
         $name = 'gl_php_int_meta_' . (int) (microtime(true) * 1000);
         // Proxy cache features left on — see testStreamAddCreatesPrefixedTable.
         $gl = GoldLapel::start(self::$pgUrl, [
-            'proxy_port' => $port,
             'silent' => true,
         ]);
         try {
@@ -105,11 +101,9 @@ class StreamsIntegrationTest extends TestCase
 
     public function testRoundTrip(): void
     {
-        $port = 7900 + (int) (microtime(true) * 1000) % 100;
         $name = 'gl_php_int_rt_' . (int) (microtime(true) * 1000);
         // Proxy cache features left on — see testStreamAddCreatesPrefixedTable.
         $gl = GoldLapel::start(self::$pgUrl, [
-            'proxy_port' => $port,
             'silent' => true,
         ]);
         try {
@@ -146,17 +140,15 @@ class StreamsIntegrationTest extends TestCase
      */
     public function testForUpdateInTransactionRoundTrips(): void
     {
-        $port = 8000 + (int) (microtime(true) * 1000) % 100;
         $table = 'gl_php_fu_' . (int) (microtime(true) * 1000);
         // Proxy cache features on — this is the regression case.
         $gl = GoldLapel::start(self::$pgUrl, [
-            'proxy_port' => $port,
             'silent' => true,
         ]);
         try {
             $dsn = self::_toPdoDsn(str_replace(
                 self::_hostPort(self::$pgUrl),
-                "127.0.0.1:{$port}",
+                "127.0.0.1:{$gl->getProxyPort()}",
                 self::$pgUrl
             ));
             $pdo = new \PDO($dsn);

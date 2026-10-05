@@ -133,9 +133,60 @@ class GoldLapelTest extends TestCase
     public function testMakeProxyUrlQueryParams(): void
     {
         $this->assertSame(
-            'postgresql://user:pass@localhost:7932/mydb?sslmode=require&' . $this->appNameSuffix(),
-            GoldLapel::makeProxyUrl('postgresql://user:pass@remote:5432/mydb?sslmode=require', 7932)
+            'postgresql://user:pass@localhost:7932/mydb?connect_timeout=5&' . $this->appNameSuffix(),
+            GoldLapel::makeProxyUrl('postgresql://user:pass@remote:5432/mydb?connect_timeout=5', 7932)
         );
+    }
+
+    // -- Upstream TLS parameters --
+    //
+    // sslmode & co. configure the proxy's hop to the upstream. The proxy
+    // declines TLS from the app unless it has --tls-cert/--tls-key, so the
+    // app's URL must not carry them: `?sslmode=require` (every Neon,
+    // Supabase and RDS URL) made the app's connection fail.
+
+    public function testMakeProxyUrlStripsUpstreamTlsParams(): void
+    {
+        $this->assertSame(
+            'postgresql://user:pass@localhost:7932/mydb?application_name=myapp&connect_timeout=5',
+            GoldLapel::makeProxyUrl(
+                'postgresql://user:pass@remote:5432/mydb?sslmode=require&application_name=myapp'
+                . '&channel_binding=require&connect_timeout=5',
+                7932
+            )
+        );
+    }
+
+    public function testMakeProxyUrlStripsEveryTlsAndGssParamCaseInsensitively(): void
+    {
+        $params = [
+            'sslmode=verify-full', 'SSLCert=/c', 'sslkey=/k', 'sslrootcert=/r', 'sslcrl=/l',
+            'sslcrldir=/d', 'sslpassword=x', 'sslsni=1', 'sslnegotiation=direct',
+            'ssl_min_protocol_version=TLSv1.2', 'ssl_max_protocol_version=TLSv1.3',
+            'requiressl=1', 'Channel_Binding=require', 'gssencmode=disable',
+            'krbsrvname=postgres', 'gsslib=gssapi',
+        ];
+        $this->assertSame(
+            'postgresql://u@localhost:7932/db?' . $this->appNameSuffix(),
+            GoldLapel::makeProxyUrl('postgresql://u@h/db?' . implode('&', $params), 7932)
+        );
+    }
+
+    public function testMakeProxyUrlKeepsTlsParamsWhenTheProxyAcceptsTls(): void
+    {
+        $this->assertSame(
+            'postgresql://u@localhost:7932/db?sslmode=require&' . $this->appNameSuffix(),
+            GoldLapel::makeProxyUrl('postgresql://u@h:5432/db?sslmode=require', 7932, false)
+        );
+    }
+
+    public function testClientTlsComesFromTlsCertOrKey(): void
+    {
+        $this->assertFalse(GoldLapel::clientTls([], []));
+        $this->assertFalse(GoldLapel::clientTls(['tls_client_ca' => '/ca'], ['--mode', 'waiter']));
+        $this->assertTrue(GoldLapel::clientTls(['tls_cert' => '/c', 'tls_key' => '/k'], []));
+        $this->assertTrue(GoldLapel::clientTls([], ['--tls-cert', '/c', '--tls-key', '/k']));
+        $this->assertTrue(GoldLapel::clientTls([], ['--tls-cert=/c']));
     }
 
     public function testMakeProxyUrlPercentEncoded(): void
@@ -189,7 +240,7 @@ class GoldLapelTest extends TestCase
     public function testMakeProxyUrlLiteralAtInPasswordWithQueryParams(): void
     {
         $this->assertSame(
-            'postgresql://user:p@ss@localhost:7932/mydb?sslmode=require&param=val@ue&' . $this->appNameSuffix(),
+            'postgresql://user:p@ss@localhost:7932/mydb?param=val@ue&' . $this->appNameSuffix(),
             GoldLapel::makeProxyUrl('postgresql://user:p@ss@host:5432/mydb?sslmode=require&param=val@ue', 7932)
         );
     }
@@ -230,8 +281,8 @@ class GoldLapelTest extends TestCase
 
     public function testApplicationNameMarkerAppendedWithExistingQuery(): void
     {
-        $out = GoldLapel::makeProxyUrl('postgresql://localhost:5432/mydb?sslmode=require', 7932);
-        $this->assertStringContainsString('sslmode=require', $out);
+        $out = GoldLapel::makeProxyUrl('postgresql://localhost:5432/mydb?connect_timeout=5', 7932);
+        $this->assertStringContainsString('connect_timeout=5', $out);
         $this->assertStringContainsString('&application_name=goldlapel:php:', $out);
     }
 
