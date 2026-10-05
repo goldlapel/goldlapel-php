@@ -31,7 +31,7 @@ $gl->stop();  // (also cleaned up in __destruct)
 
 Point PDO at `$gl->pdoDsn()` (with `$gl->pdoCredentials()`, since PDO doesn't accept `postgresql://` URLs directly). The PDO is a plain `\PDO` connected to the proxy; any other Postgres driver can use `$gl->url()`.
 
-The proxy listens on two ports: the proxy itself (`proxy_port`, default 7932) and the dashboard (`dashboard_port`, default `proxy_port + 1`).
+The proxy listens on two ports: the proxy itself (`proxy_port`, default 7932) and the dashboard (`dashboard_port`, default `proxy_port + 1`; `0` disables it). Start several proxies in one process and, unless you set `proxy_port`, each takes the next free pair — 7932/7933, then 7934/7935, and so on; `$gl->getProxyPort()` tells you which. The async factory (`GoldLapel\Amp\GoldLapel::start()`) takes the same options.
 
 Document store and streams live under nested namespaces:
 

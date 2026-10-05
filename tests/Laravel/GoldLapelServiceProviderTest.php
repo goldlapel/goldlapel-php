@@ -41,7 +41,8 @@ class GoldLapelServiceProviderTest extends TestCase
         $this->assertCount(1, GoldLapel::$calls);
         $call = GoldLapel::$calls[0];
         $this->assertSame('postgresql://admin:secret@db.example.com:5432/mydb', $call['upstream']);
-        $this->assertSame(GoldLapel::DEFAULT_PROXY_PORT, $call['port']);
+        // No proxy_port configured → none forwarded; the core picks one.
+        $this->assertNull($call['port']);
         $this->assertSame([], $call['config']);
         $this->assertSame([], $call['extraArgs']);
 
@@ -259,6 +260,11 @@ class GoldLapelServiceProviderTest extends TestCase
 
     public function testMultiplePgsqlConnections(): void
     {
+        // Regression: without explicit ports every connection asked for
+        // 7932 (and an explicit 7933 collided with the first proxy's
+        // dashboard). The provider now forwards proxy_port only when
+        // configured and rewrites each connection to the port the core
+        // actually allocated.
         $this->bootProvider([
             'primary' => [
                 'driver' => 'pgsql',
@@ -267,7 +273,6 @@ class GoldLapelServiceProviderTest extends TestCase
                 'database' => 'app',
                 'username' => 'u',
                 'password' => 'p',
-                'goldlapel' => ['proxy_port' => 7932],
             ],
             'analytics' => [
                 'driver' => 'pgsql',
@@ -276,16 +281,86 @@ class GoldLapelServiceProviderTest extends TestCase
                 'database' => 'analytics',
                 'username' => 'u',
                 'password' => 'p',
-                'goldlapel' => ['proxy_port' => 7933],
             ],
         ]);
 
         $this->assertCount(2, GoldLapel::$calls);
-        $this->assertSame(7932, GoldLapel::$calls[0]['port']);
-        $this->assertSame(7933, GoldLapel::$calls[1]['port']);
+        $this->assertNull(GoldLapel::$calls[0]['port']);
+        $this->assertNull(GoldLapel::$calls[1]['port']);
 
         $this->assertSame('127.0.0.1', config('database.connections.primary.host'));
         $this->assertSame('127.0.0.1', config('database.connections.analytics.host'));
+        $this->assertSame(7932, config('database.connections.primary.port'));
+        $this->assertSame(7934, config('database.connections.analytics.port'));
+    }
+
+    public function testSameUpstreamSharesOneProxy(): void
+    {
+        $db = [
+            'driver' => 'pgsql',
+            'host' => 'db1.example.com',
+            'port' => '5432',
+            'database' => 'app',
+            'username' => 'u',
+            'password' => 'p',
+        ];
+        $this->bootProvider(['primary' => $db, 'reporting' => $db]);
+
+        $this->assertCount(1, GoldLapel::$calls, 'Same upstream must reuse the running proxy.');
+        $this->assertSame(7932, config('database.connections.primary.port'));
+        $this->assertSame(7932, config('database.connections.reporting.port'));
+
+        $gl = array_values(GoldLapel::$liveInstances)[0];
+        $this->app->terminate();
+        $this->assertSame(1, $gl->stopCalls, 'A shared proxy is stopped once.');
+    }
+
+    public function testForwardsCoreOptions(): void
+    {
+        // Laravel accepts the same options as GoldLapel::start().
+        $options = [
+            'proxy_port' => 9000,
+            'dashboard_port' => 0,
+            'license' => '/etc/gl.license',
+            'config_file' => '/etc/gl.toml',
+            'silent' => true,
+            'mesh' => true,
+            'mesh_tag' => 'prod-east',
+            'disable_proxy_cache' => true,
+            'disable_sqloptimize' => true,
+            'disable_auto_indexes' => true,
+            'client' => 'my-app',
+        ];
+        $this->bootProvider([
+            'pgsql' => [
+                'driver' => 'pgsql',
+                'host' => 'h',
+                'port' => '5432',
+                'database' => 'db',
+                'username' => 'u',
+                'password' => 'p',
+                'goldlapel' => $options + ['enabled' => true],
+            ],
+        ]);
+
+        $this->assertCount(1, GoldLapel::$calls);
+        $this->assertSame($options, GoldLapel::$calls[0]['options']);
+    }
+
+    public function testClientDefaultsToLaravel(): void
+    {
+        $this->bootProvider([
+            'pgsql' => [
+                'driver' => 'pgsql',
+                'host' => 'h',
+                'port' => '5432',
+                'database' => 'db',
+                'username' => 'u',
+                'password' => 'p',
+            ],
+        ]);
+
+        $this->assertSame(['client' => 'laravel'], GoldLapel::$calls[0]['options']);
     }
 
     public function testDefaultsWhenNoGoldlapelConfig(): void
@@ -303,7 +378,8 @@ class GoldLapelServiceProviderTest extends TestCase
 
         $this->assertCount(1, GoldLapel::$calls);
         $call = GoldLapel::$calls[0];
-        $this->assertSame(GoldLapel::DEFAULT_PROXY_PORT, $call['port']);
+        $this->assertNull($call['port']);
+        $this->assertSame(GoldLapel::DEFAULT_PROXY_PORT, config('database.connections.pgsql.port'));
         $this->assertSame([], $call['config']);
         $this->assertSame([], $call['extraArgs']);
     }

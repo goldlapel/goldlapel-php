@@ -143,6 +143,84 @@ class AsyncParityTest extends TestCase
     }
 
     /**
+     * Instance state that legitimately exists on one side only. Everything
+     * else is parsed from the shared options array, so a property missing on
+     * one side means an option one factory silently drops.
+     *
+     *   - pdo (sync) / connection (amp): the driver-specific connection
+     *   - scopedConn: a nullable PDO on sync, a FiberLocal object on Amp
+     */
+    private const SYNC_ONLY_PROPERTIES = ['pdo', 'scopedConn'];
+    private const AMP_ONLY_PROPERTIES = ['connection'];
+
+    /**
+     * Every option either factory accepts. Adding an option to one
+     * constructor without the other fails testOptionStateMatches.
+     */
+    private const ALL_OPTIONS = [
+        'proxy_port' => 9100,
+        'dashboard_port' => 0,
+        'log_level' => 'debug',
+        'mode' => 'waiter',
+        'license' => '/tmp/gl.license',
+        'client' => 'parity',
+        'config_file' => '/tmp/gl.toml',
+        'config' => ['pool_size' => 5],
+        'extra_args' => ['--flag'],
+        'silent' => true,
+        'mesh' => true,
+        'mesh_tag' => 'east',
+        'disable_proxy_cache' => true,
+        'disable_sqloptimize' => true,
+        'disable_auto_indexes' => true,
+    ];
+
+    /**
+     * Scalar/array instance state (sub-API objects, FiberLocal and the like
+     * are wiring, not parsed options).
+     *
+     * @return array<string, mixed>
+     */
+    private function optionState(object $gl): array
+    {
+        $rc = new ReflectionClass($gl);
+        $state = [];
+        foreach ($rc->getProperties() as $p) {
+            if ($p->isStatic() || $p->getDeclaringClass()->getName() !== $rc->getName()) {
+                continue;
+            }
+            $p->setAccessible(true);
+            $value = $p->isInitialized($gl) ? $p->getValue($gl) : null;
+            if (is_object($value)) {
+                continue;
+            }
+            $state[$p->getName()] = $value;
+        }
+        return $state;
+    }
+
+    public function testOptionStateMatches(): void
+    {
+        $sync = $this->optionState(new SyncGoldLapel('postgresql://u:p@h/d', self::ALL_OPTIONS));
+        $amp = $this->optionState(new AmpGoldLapel('postgresql://u:p@h/d', self::ALL_OPTIONS));
+        foreach (self::SYNC_ONLY_PROPERTIES as $name) {
+            unset($sync[$name]);
+        }
+        foreach (self::AMP_ONLY_PROPERTIES as $name) {
+            unset($amp[$name]);
+        }
+        ksort($sync);
+        ksort($amp);
+        $this->assertSame(
+            $sync,
+            $amp,
+            'Sync and Amp constructors parse options into different state. Either '
+            . 'mirror the option on both factories, or list the property in '
+            . 'SYNC_ONLY_PROPERTIES / AMP_ONLY_PROPERTIES with a reason.',
+        );
+    }
+
+    /**
      * Capture the part of a method's signature that should match across
      * sync/amp: parameter names, optionality, default values, by-reference,
      * variadic-ness, nullability. The async surface's return type is

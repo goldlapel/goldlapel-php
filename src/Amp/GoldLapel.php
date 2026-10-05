@@ -57,6 +57,7 @@ class GoldLapel
 
     private string $upstream;
     private int $proxyPort;
+    private bool $proxyPortExplicit;
     private int $dashboardPort;
     private bool $dashboardPortExplicit;
     private ?string $logLevel;
@@ -65,6 +66,11 @@ class GoldLapel
     private ?string $client;
     private ?string $configFile;
     private bool $silent;
+    private bool $mesh;
+    private ?string $meshTag;
+    private bool $disableProxyCache;
+    private bool $disableSqloptimize;
+    private bool $disableAutoIndexes;
     private array $config;
     private array $extraArgs;
 
@@ -127,10 +133,18 @@ class GoldLapel
      */
     private static $bannerStream = null;
 
+    /**
+     * Constructor — use GoldLapel::start() to create and start an instance.
+     * Accepts the same options array as the sync factory; see
+     * GoldLapel\GoldLapel::start() for the full list.
+     */
     public function __construct(string $upstream, array $options = [])
     {
         $this->upstream = $upstream;
-        $this->proxyPort = isset($options['proxy_port']) ? (int) $options['proxy_port'] : self::DEFAULT_PROXY_PORT;
+        // Without an explicit proxy_port the port is allocated at spawn
+        // time (see SyncGoldLapel::claimPorts()); 7932 until then.
+        $this->proxyPortExplicit = isset($options['proxy_port']);
+        $this->proxyPort = $this->proxyPortExplicit ? (int) $options['proxy_port'] : self::DEFAULT_PROXY_PORT;
 
         // Dashboard port defaults to proxyPort + 1 when unset. An explicit
         // value (including 0 for "disable dashboard") overrides the
@@ -146,11 +160,26 @@ class GoldLapel
         $this->client = isset($options['client']) ? (string) $options['client'] : null;
         $this->configFile = isset($options['config_file']) ? (string) $options['config_file'] : null;
 
-        $this->config = $options['config'] ?? [];
+        $config = $options['config'] ?? [];
+        // Validate structured-config keys eagerly, as the sync constructor
+        // does, so a bad key fails before anything is spawned.
+        $validKeys = array_flip(SyncGoldLapel::configKeys());
+        foreach ($config as $key => $_) {
+            if (!isset($validKeys[$key])) {
+                throw new \InvalidArgumentException("Unknown config key: {$key}");
+            }
+        }
+        $this->config = $config;
         $this->extraArgs = $options['extra_args'] ?? [];
         $this->silent = !empty($options['silent']);
-        // Leave structured-config validation to SyncGoldLapel::configToArgs()
-        // at spawn time — same contract as the sync wrapper pre-rollout.
+        // Mesh membership (startup intent — HQ enforces license).
+        $this->mesh = !empty($options['mesh']);
+        $tag = isset($options['mesh_tag']) ? (string) $options['mesh_tag'] : '';
+        $this->meshTag = $tag === '' ? null : $tag;
+        // Promoted top-level disable flags; each maps 1:1 to a proxy CLI flag.
+        $this->disableProxyCache = !empty($options['disable_proxy_cache']);
+        $this->disableSqloptimize = !empty($options['disable_sqloptimize']);
+        $this->disableAutoIndexes = !empty($options['disable_auto_indexes']);
         $this->scopedConn = new FiberLocal(static fn () => null);
 
         // Nested namespaces — see src/Amp/Documents.php, src/Amp/Streams.php,
@@ -172,8 +201,11 @@ class GoldLapel
      * Returns a Future<GoldLapel> resolved when the proxy is ready and
      * connected.
      *
-     * Options match the sync factory (`port`, `log_level`, `config`,
-     * `extra_args`, `silent`, plus top-level config keys).
+     * Options are the same as the sync factory's — see
+     * GoldLapel\GoldLapel::start() for the full list (`proxy_port`,
+     * `dashboard_port`, `log_level`, `mode`, `license`, `client`,
+     * `config_file`, `config`, `extra_args`, `silent`, `mesh`, `mesh_tag`,
+     * `disable_proxy_cache`, `disable_sqloptimize`, `disable_auto_indexes`).
      */
     public static function start(string $upstream, array $options = []): Future
     {
@@ -192,6 +224,7 @@ class GoldLapel
                 } catch (\Throwable $cleanupErr) {
                     // Don't mask the original failure with a teardown error.
                 }
+                SyncGoldLapel::releasePorts(spl_object_id($instance));
                 unset(self::$liveInstances[spl_object_id($instance)]);
                 throw $e;
             }
@@ -249,6 +282,11 @@ class GoldLapel
             return $this->url;
         }
         $binary = SyncGoldLapel::findBinary();
+        [$this->proxyPort, $this->dashboardPort] = SyncGoldLapel::claimPorts(
+            spl_object_id($this),
+            $this->proxyPortExplicit ? $this->proxyPort : null,
+            $this->dashboardPortExplicit ? $this->dashboardPort : null,
+        );
         $cmd = [$binary, '--upstream', $this->upstream, '--proxy-port', (string) $this->proxyPort];
 
         // Top-level options (promoted out of the config map) emit their own
@@ -279,6 +317,22 @@ class GoldLapel
             $cmd[] = '--config';
             $cmd[] = $this->configFile;
         }
+        if ($this->mesh) {
+            $cmd[] = '--mesh';
+        }
+        if ($this->meshTag !== null) {
+            $cmd[] = '--mesh-tag';
+            $cmd[] = $this->meshTag;
+        }
+        if ($this->disableProxyCache) {
+            $cmd[] = '--disable-proxy-cache';
+        }
+        if ($this->disableSqloptimize) {
+            $cmd[] = '--disable-sqloptimize';
+        }
+        if ($this->disableAutoIndexes) {
+            $cmd[] = '--disable-auto-indexes';
+        }
         $cmd = array_merge($cmd, SyncGoldLapel::configToArgs($this->config), $this->extraArgs);
 
         $nullDevice = PHP_OS_FAMILY === 'Windows' ? 'NUL' : '/dev/null';
@@ -301,6 +355,8 @@ class GoldLapel
         $pipes = [];
         $this->process = proc_open($cmd, $descriptors, $pipes, null, $env);
         if (!is_resource($this->process)) {
+            $this->process = null;
+            SyncGoldLapel::releasePorts(spl_object_id($this));
             throw new RuntimeException(
                 "Failed to start Gold Lapel process (proc_open returned false for {$binary}). " .
                 "Check that the binary is executable and the system has free resources."
@@ -436,6 +492,7 @@ class GoldLapel
      */
     protected function terminate(): void
     {
+        SyncGoldLapel::releasePorts(spl_object_id($this));
         if ($this->process === null) {
             return;
         }

@@ -72,6 +72,7 @@ class GoldLapel
 
     private string $upstream;
     private int $proxyPort;
+    private bool $proxyPortExplicit;
     private int $dashboardPort;
     private bool $dashboardPortExplicit;
     private ?string $logLevel;
@@ -104,6 +105,14 @@ class GoldLapel
     /** @var array<int, self> */
     private static array $liveInstances = [];
     private static bool $cleanupRegistered = false;
+
+    /**
+     * Ports held by proxies this process started — sync and Amp alike —
+     * keyed by the owning instance's spl_object_id. See claimPorts().
+     *
+     * @var array<int, list<int>>
+     */
+    private static array $claimedPorts = [];
 
     /**
      * Documents sub-API — `$gl->documents-><verb>(...)`. Holds a back-reference
@@ -164,7 +173,10 @@ class GoldLapel
     public function __construct(string $upstream, array $options = [])
     {
         $this->upstream = $upstream;
-        $this->proxyPort = isset($options['proxy_port']) ? (int) $options['proxy_port'] : self::DEFAULT_PROXY_PORT;
+        // Without an explicit proxy_port the port is allocated at spawn
+        // time (see claimPorts()); 7932 until then.
+        $this->proxyPortExplicit = isset($options['proxy_port']);
+        $this->proxyPort = $this->proxyPortExplicit ? (int) $options['proxy_port'] : self::DEFAULT_PROXY_PORT;
 
         // Dashboard port defaults to proxyPort + 1 when unset. An explicit
         // value (including 0 for "disable dashboard") overrides the
@@ -221,7 +233,9 @@ class GoldLapel
      * Factory — start a Gold Lapel proxy and return a ready-to-use instance.
      *
      * Top-level options (all optional):
-     *   - 'proxy_port' (int): proxy port (default 7932)
+     *   - 'proxy_port' (int): proxy port. Defaults to the first free pair from
+     *     7932 up — 7932 for the first proxy, 7934 for a second one this
+     *     process starts, and so on (see claimPorts()).
      *   - 'dashboard_port' (int): dashboard port. Defaults to proxy_port + 1. 0 disables.
      *   - 'log_level' (string): 'trace'|'debug'|'info'|'warn'|'error' — translated to the proxy's -v/-vv/-vvv verbosity flag
      *   - 'mode' (string): proxy operating mode ('waiter', 'consideration')
@@ -376,6 +390,47 @@ class GoldLapel
         return self::VALID_CONFIG_KEYS;
     }
 
+    /**
+     * Pick and hold the ports for a proxy about to spawn. Each proxy holds
+     * its proxy port P and its dashboard port (explicit, or P + 1; none when
+     * 0). A null $proxyPort takes the smallest P >= 7932 such that neither P
+     * nor its dashboard port is held by another live proxy this process
+     * started, so several proxies coexist without configuration. An explicit
+     * $proxyPort is used as given and held like any other. Shared by the
+     * sync and Amp factories; release with releasePorts().
+     *
+     * @internal Used by GoldLapel\GoldLapel and GoldLapel\Amp\GoldLapel.
+     * @return array{0:int,1:int} [proxy port, dashboard port]
+     */
+    public static function claimPorts(int $owner, ?int $proxyPort, ?int $dashboardPort): array
+    {
+        unset(self::$claimedPorts[$owner]);
+        $held = array_flip(array_merge([], ...array_values(self::$claimedPorts)));
+
+        if ($proxyPort === null) {
+            $proxyPort = self::DEFAULT_PROXY_PORT;
+            while (
+                isset($held[$proxyPort])
+                || $proxyPort === $dashboardPort
+                || ($dashboardPort === null && isset($held[$proxyPort + 1]))
+            ) {
+                $proxyPort++;
+            }
+        }
+        $dashboardPort ??= $proxyPort + 1;
+
+        self::$claimedPorts[$owner] = $dashboardPort > 0 ? [$proxyPort, $dashboardPort] : [$proxyPort];
+        return [$proxyPort, $dashboardPort];
+    }
+
+    /**
+     * @internal Used by GoldLapel\GoldLapel and GoldLapel\Amp\GoldLapel.
+     */
+    public static function releasePorts(int $owner): void
+    {
+        unset(self::$claimedPorts[$owner]);
+    }
+
     // ------------------------------------------------------------------
     // Connection resolution
     // ------------------------------------------------------------------
@@ -493,6 +548,11 @@ class GoldLapel
         }
 
         $binary = self::findBinary();
+        [$this->proxyPort, $this->dashboardPort] = self::claimPorts(
+            spl_object_id($this),
+            $this->proxyPortExplicit ? $this->proxyPort : null,
+            $this->dashboardPortExplicit ? $this->dashboardPort : null,
+        );
         $cmd = [$binary, '--upstream', $this->upstream, '--proxy-port', (string) $this->proxyPort];
 
         // Top-level options (promoted out of the config map by the canonical
@@ -573,6 +633,8 @@ class GoldLapel
         $this->process = proc_open($cmd, $descriptors, $pipes, null, $env);
 
         if (!is_resource($this->process)) {
+            $this->process = null;
+            self::releasePorts(spl_object_id($this));
             throw new RuntimeException(
                 "Failed to start Gold Lapel process (proc_open returned false for {$binary}). " .
                 "Check that the binary is executable and the system has free resources."
@@ -1207,6 +1269,7 @@ class GoldLapel
 
     private function terminate(): void
     {
+        self::releasePorts(spl_object_id($this));
         if ($this->process === null) {
             return;
         }

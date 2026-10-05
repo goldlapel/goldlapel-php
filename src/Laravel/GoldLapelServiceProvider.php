@@ -21,6 +21,7 @@ class GoldLapelServiceProvider extends ServiceProvider
     public function boot(): void
     {
         $connections = config('database.connections', []);
+        $proxies = []; // upstream URL => GoldLapel instance
 
         foreach ($connections as $name => $config) {
             if (($config['driver'] ?? '') !== 'pgsql') {
@@ -33,12 +34,14 @@ class GoldLapelServiceProvider extends ServiceProvider
                 continue;
             }
 
-            // YAML / config.php key follows the canonical snake_case name.
-            $proxyPort = $glConfig['proxy_port'] ?? GoldLapel::DEFAULT_PROXY_PORT;
-            $glOptions = $glConfig['config'] ?? [];
-            $extraArgs = $glConfig['extra_args'] ?? [];
-            $logLevel = $glConfig['log_level'] ?? null;
-            $mode = $glConfig['mode'] ?? null;
+            // The `goldlapel` block takes the same options as
+            // GoldLapel::start(), passed through as-is (unset keys are left
+            // to the core's defaults — notably proxy_port, which the core
+            // allocates so several connections don't collide).
+            $startOptions = array_filter(
+                array_diff_key($glConfig, ['enabled' => true]),
+                fn ($value) => $value !== null,
+            ) + ['client' => 'laravel'];
 
             try {
                 $upstream = buildUpstreamUrl($config);
@@ -46,25 +49,16 @@ class GoldLapelServiceProvider extends ServiceProvider
                 // its own PDOs against the rewritten host/port. We hold
                 // onto the returned instance so the terminating callback
                 // below can stop each subprocess deterministically at
-                // worker shutdown (Octane/Swoole/RoadRunner).
-                $startOptions = [
-                    'proxy_port' => $proxyPort,
-                    'client' => 'laravel',
-                    'config' => $glOptions,
-                    'extra_args' => $extraArgs,
-                ];
-                if ($logLevel !== null) {
-                    $startOptions['log_level'] = $logLevel;
-                }
-                if ($mode !== null) {
-                    $startOptions['mode'] = $mode;
-                }
-                $instance = GoldLapel::startProxyOnly($upstream, $startOptions);
+                // worker shutdown (Octane/Swoole/RoadRunner). Connections
+                // pointing at the same database share one proxy; the first
+                // connection's options win.
+                $instance = $proxies[$upstream] ??= GoldLapel::startProxyOnly($upstream, $startOptions);
             } catch (\Exception $e) {
                 logger()->warning("Gold Lapel failed to start for connection '{$name}': " . $e->getMessage());
                 continue;
             }
 
+            $proxyPort = $instance->getProxyPort();
             $this->glConnections[$name] = [
                 'proxy_port' => $proxyPort,
                 'instance' => $instance,
@@ -90,7 +84,14 @@ class GoldLapelServiceProvider extends ServiceProvider
             // on this provider instance and stopping only instances still in
             // $this->glConnections — the first call clears them out.
             $this->app->terminating(function () {
-                foreach ($this->glConnections as $name => $state) {
+                $stopped = [];
+                foreach ($this->glConnections as $state) {
+                    // A proxy shared by several connections stops once.
+                    $id = spl_object_id($state['instance']);
+                    if (isset($stopped[$id])) {
+                        continue;
+                    }
+                    $stopped[$id] = true;
                     try {
                         $state['instance']->stop();
                     } catch (\Throwable $e) {

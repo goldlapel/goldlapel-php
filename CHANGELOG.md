@@ -141,8 +141,30 @@ not supplied. Direct callers should migrate to the namespace verbs
 (`$gl->documents->insert(...)`); the static helpers remain on the public
 surface for advanced uses but require the patterns map.
 
+### Changed
+
+- Several proxies in one process no longer collide. Each proxy holds two
+  ports (proxy and dashboard), and without an explicit `proxy_port` a proxy
+  now takes the first free pair from 7932 up: 7932/7933 for the first, then
+  7934/7935, and so on. An explicit `proxy_port` is used as given and still
+  counts as taken; stopping a proxy frees its ports. Sync and async proxies
+  share the same bookkeeping. Read the chosen port with `getProxyPort()`.
+- Laravel: the `goldlapel` block of a connection now accepts every
+  `GoldLapel::start()` option (`dashboard_port`, `license`, `config_file`,
+  `silent`, `mesh`, `mesh_tag`, `disable_proxy_cache`, `disable_sqloptimize`,
+  `disable_auto_indexes`, and `client`, which defaults to `laravel`), and
+  `proxy_port` is passed only when set. Connections with the same upstream
+  share one proxy (the first connection's options apply).
+
 ### Fixed
 
+- The async factory (`GoldLapel\Amp\GoldLapel`) silently ignored `mesh`,
+  `mesh_tag`, `disable_proxy_cache`, `disable_sqloptimize` and
+  `disable_auto_indexes`; it now passes them to the proxy exactly as the sync
+  factory does, and rejects unknown `config` keys at construction rather than
+  at spawn.
+- Laravel: two `pgsql` connections without explicit ports both asked for
+  7932, so the second proxy failed to start.
 - The `application_name` tag carried the package version unencoded, so a
   version with build metadata — Composer reports an unversioned checkout as
   `1.0.0+no-version-set` — broke every connection (`+` decodes to a space).
