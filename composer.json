@@ -1,10 +1,10 @@
 {
   "name": "goldlapel/goldlapel",
-  "description": "Self-optimizing Postgres proxy — automatic materialized views and indexes",
+  "description": "Self-optimizing Postgres proxy — automatic result caching and indexes",
   "type": "library",
   "license": "MIT",
   "homepage": "https://goldlapel.com",
-  "keywords": ["postgres", "proxy", "optimization", "materialized-views", "database", "cache", "redis-compat", "mongo-compat", "query-optimization"],
+  "keywords": ["postgres", "proxy", "optimization", "database", "cache", "redis-compat", "mongo-compat", "query-optimization"],
   "authors": [
     {
       "name": "The Waiter of Gold Lapel",

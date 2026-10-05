@@ -7,11 +7,10 @@ use PHPUnit\Framework\Attributes\DataProvider;
 use PHPUnit\Framework\TestCase;
 
 /**
- * Tests for the four "master kill switch" disable flags promoted from the
+ * Tests for the three "master kill switch" disable flags promoted from the
  * structured config map to top-level options:
  *
  *   - disable_proxy_cache    → --disable-proxy-cache
- *   - disable_matviews       → --disable-matviews
  *   - disable_sqloptimize    → --disable-sqloptimize
  *   - disable_auto_indexes   → --disable-auto-indexes
  *
@@ -37,7 +36,6 @@ class DisableFlagsTest extends TestCase
     {
         return [
             ['disable_proxy_cache', 'disableProxyCache', '--disable-proxy-cache'],
-            ['disable_matviews', 'disableMatviews', '--disable-matviews'],
             ['disable_sqloptimize', 'disableSqloptimize', '--disable-sqloptimize'],
             ['disable_auto_indexes', 'disableAutoIndexes', '--disable-auto-indexes'],
         ];
@@ -111,7 +109,7 @@ class DisableFlagsTest extends TestCase
         }
     }
 
-    public function testDefaultArgvOmitsAllFourFlags(): void
+    public function testDefaultArgvOmitsAllThreeFlags(): void
     {
         if (PHP_OS_FAMILY === 'Windows') {
             $this->markTestSkipped('Fake-binary spawn test uses /bin/sh.');
@@ -137,7 +135,7 @@ class DisableFlagsTest extends TestCase
 
     public function testMultipleFlagsAllAppearTogether(): void
     {
-        // Combined startup: turn all four on at once. Verifies each flag
+        // Combined startup: turn all three on at once. Verifies each flag
         // is independently emitted and ordering doesn't trip the
         // argv-builder up.
         if (PHP_OS_FAMILY === 'Windows') {
@@ -149,7 +147,6 @@ class DisableFlagsTest extends TestCase
 
         $opts = [
             'disable_proxy_cache' => true,
-            'disable_matviews' => true,
             'disable_sqloptimize' => true,
             'disable_auto_indexes' => true,
         ];
@@ -162,6 +159,35 @@ class DisableFlagsTest extends TestCase
                     $argv,
                     "combined argv must contain {$cliFlag}; got: {$argv}",
                 );
+            }
+        } finally {
+            $cleanup();
+        }
+    }
+
+    public function testRemovedOptionsEmitNoFlags(): void
+    {
+        // The wrapper's in-process cache and the proxy's matviews are gone;
+        // their options are no longer read, so none of the old flags reach
+        // the proxy even when a caller still passes them.
+        if (PHP_OS_FAMILY === 'Windows') {
+            $this->markTestSkipped('Fake-binary spawn test uses /bin/sh.');
+        }
+        if (!is_executable('/usr/bin/python3') && !is_executable('/usr/local/bin/python3')) {
+            $this->markTestSkipped('python3 required for fake binary that holds the port open');
+        }
+
+        $opts = [
+            'invalidation_port' => 7934,
+            'disable_native_cache' => true,
+            'disable_matviews' => true,
+            'aggressive_verify' => 'off',
+        ];
+        [$port, $argvFile, $cleanup] = $this->spawnFakeBinaryAndStart($opts);
+        try {
+            $argv = (string) file_get_contents($argvFile);
+            foreach (['--invalidation-port', '--native-cache', '--disable-matviews', '--aggressive-verify'] as $flag) {
+                $this->assertStringNotContainsString($flag, $argv, "argv must not contain {$flag}; got: {$argv}");
             }
         } finally {
             $cleanup();

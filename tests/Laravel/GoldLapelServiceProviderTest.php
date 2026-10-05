@@ -4,7 +4,6 @@ namespace GoldLapel\Laravel\Tests;
 
 use GoldLapel\GoldLapel;
 use GoldLapel\Laravel\GoldLapelServiceProvider;
-use Illuminate\Database\Connection;
 use Orchestra\Testbench\TestCase;
 
 class GoldLapelServiceProviderTest extends TestCase
@@ -12,22 +11,7 @@ class GoldLapelServiceProviderTest extends TestCase
     protected function setUp(): void
     {
         GoldLapel::reset();
-        self::clearPgsqlResolver();
         parent::setUp();
-    }
-
-    protected function tearDown(): void
-    {
-        self::clearPgsqlResolver();
-        parent::tearDown();
-    }
-
-    private static function clearPgsqlResolver(): void
-    {
-        $ref = new \ReflectionProperty(Connection::class, 'resolvers');
-        $resolvers = $ref->getValue();
-        unset($resolvers['pgsql']);
-        $ref->setValue(null, $resolvers);
     }
 
     private function bootProvider(array $connections): GoldLapelServiceProvider

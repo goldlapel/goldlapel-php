@@ -6,7 +6,6 @@ use Amp\Future;
 use Amp\Postgres\PostgresConfig;
 use Amp\Postgres\PostgresConnection;
 use Amp\Postgres\PostgresExecutor;
-use GoldLapel\AggressiveVerify;
 use GoldLapel\GoldLapel as SyncGoldLapel;
 use Revolt\EventLoop\FiberLocal;
 use RuntimeException;
@@ -60,20 +59,12 @@ class GoldLapel
     private int $proxyPort;
     private int $dashboardPort;
     private bool $dashboardPortExplicit;
-    private int $invalidationPort;
-    private bool $invalidationPortExplicit;
     private ?string $logLevel;
     private ?string $mode;
     private ?string $license;
     private ?string $client;
     private ?string $configFile;
     private bool $silent;
-    /**
-     * Aggressive-verify mode — `'auto'` (default), `'on'`, `'off'`. See
-     * GoldLapel\AggressiveVerify and the sync GoldLapel docstring for
-     * the full design.
-     */
-    private string $aggressiveVerify;
     private array $config;
     private array $extraArgs;
 
@@ -141,17 +132,13 @@ class GoldLapel
         $this->upstream = $upstream;
         $this->proxyPort = isset($options['proxy_port']) ? (int) $options['proxy_port'] : self::DEFAULT_PROXY_PORT;
 
-        // Dashboard / invalidation ports default to proxyPort + 1 / + 2 when
-        // unset. An explicit value (including 0 for "disable dashboard")
-        // overrides the derivation.
+        // Dashboard port defaults to proxyPort + 1 when unset. An explicit
+        // value (including 0 for "disable dashboard") overrides the
+        // derivation.
         $this->dashboardPortExplicit = array_key_exists('dashboard_port', $options);
         $this->dashboardPort = $this->dashboardPortExplicit
             ? (int) $options['dashboard_port']
             : $this->proxyPort + 1;
-        $this->invalidationPortExplicit = array_key_exists('invalidation_port', $options);
-        $this->invalidationPort = $this->invalidationPortExplicit
-            ? (int) $options['invalidation_port']
-            : $this->proxyPort + 2;
 
         $this->logLevel = isset($options['log_level']) ? (string) $options['log_level'] : null;
         $this->mode = isset($options['mode']) ? (string) $options['mode'] : null;
@@ -162,27 +149,6 @@ class GoldLapel
         $this->config = $options['config'] ?? [];
         $this->extraArgs = $options['extra_args'] ?? [];
         $this->silent = !empty($options['silent']);
-        // Aggressive verify (always-on dml_seq bump, opt-out via 'off'):
-        // see the sync GoldLapel constructor for the full rationale.
-        // Eager validation here so a misspelled value raises before
-        // spawn rather than silently at first DML inside a fiber.
-        $aggressiveVerifyRaw = $options['aggressive_verify'] ?? AggressiveVerify::MODE_AUTO;
-        if (!is_string($aggressiveVerifyRaw)) {
-            throw new \InvalidArgumentException(
-                "aggressive_verify must be a string ('auto', 'on', 'off')"
-            );
-        }
-        $aggressiveVerifyNormalized = strtolower($aggressiveVerifyRaw);
-        if (!in_array(
-            $aggressiveVerifyNormalized,
-            [AggressiveVerify::MODE_AUTO, AggressiveVerify::MODE_ON, AggressiveVerify::MODE_OFF],
-            true,
-        )) {
-            throw new \InvalidArgumentException(
-                "aggressive_verify must be one of: auto, on, off (got '{$aggressiveVerifyRaw}')"
-            );
-        }
-        $this->aggressiveVerify = $aggressiveVerifyNormalized;
         // Leave structured-config validation to SyncGoldLapel::configToArgs()
         // at spawn time — same contract as the sync wrapper pre-rollout.
         $this->scopedConn = new FiberLocal(static fn () => null);
@@ -290,10 +256,6 @@ class GoldLapel
         if ($this->dashboardPortExplicit) {
             $cmd[] = '--dashboard-port';
             $cmd[] = (string) $this->dashboardPort;
-        }
-        if ($this->invalidationPortExplicit) {
-            $cmd[] = '--invalidation-port';
-            $cmd[] = (string) $this->invalidationPort;
         }
         if ($this->logLevel !== null) {
             $verboseFlag = self::translateLogLevel($this->logLevel);
@@ -558,11 +520,6 @@ class GoldLapel
         return $this->dashboardPort;
     }
 
-    public function getInvalidationPort(): int
-    {
-        return $this->invalidationPort;
-    }
-
     public function getDashboardUrl(): ?string
     {
         if ($this->dashboardPort > 0 && $this->isRunning()) {
@@ -586,44 +543,6 @@ class GoldLapel
             );
         }
         return $this->connection;
-    }
-
-    /**
-     * Return a CachedConnection wrapping the given executor. Uses the
-     * shared NativeCache (same instance the sync CachedPDO talks to), so
-     * writes through either path invalidate the other's cache entries.
-     *
-     * Pass $invalidationPort to override the derived port (default is
-     * proxy port + 2, or the `invalidation_port` config key).
-     */
-    public function wrapCached(
-        PostgresExecutor $conn,
-        ?int $invalidationPort = null,
-    ): CachedConnection {
-        if ($invalidationPort === null) {
-            // Top-level invalidation_port option takes precedence; otherwise
-            // fall back to proxy_port + 2 (matches the Rust binary default).
-            $invalidationPort = $this->invalidationPort;
-        }
-        $cache = \GoldLapel\NativeCache::getInstance();
-        if (!$cache->isConnected()) {
-            $cache->connectInvalidation($invalidationPort);
-        }
-        // Use the upstream URL as the detection cache key so all fibers
-        // wrapping the same database share a single detection result —
-        // the trigger inventory is database-scoped, not connection-
-        // scoped.
-        $cacheKey = 'upstream:' . $this->upstream;
-        return new CachedConnection($conn, $cache, $this->aggressiveVerify, $cacheKey);
-    }
-
-    /**
-     * Convenience: return a CachedConnection wrapping this instance's
-     * async connection. Shortcut for wrapCached($this->connection()).
-     */
-    public function cached(): CachedConnection
-    {
-        return $this->wrapCached($this->connection());
     }
 
     /**

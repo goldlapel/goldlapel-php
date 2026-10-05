@@ -15,8 +15,8 @@ class GoldLapelTest extends TestCase
 
     /**
      * The wrapper appends `application_name=goldlapel:php:<version>` to every
-     * rewritten URL so the proxy can classify wrapper-vs-raw traffic and skip
-     * L2 result cache for wrappers (they have their own L1).
+     * rewritten URL so wrapper connections are recognisable in
+     * pg_stat_activity.
      */
     private function appNameSuffix(): string
     {
@@ -194,11 +194,11 @@ class GoldLapelTest extends TestCase
         );
     }
 
-    // -- ApplicationName marker (L2-router architecture) --
+    // -- ApplicationName marker --
     //
-    // Wrappers identify themselves to the proxy via PG `application_name` so
-    // the proxy can gate L2 result cache (wrappers have their own L1; raw
-    // clients don't).
+    // Wrappers tag their connections via PG `application_name` so they're
+    // recognisable in pg_stat_activity. The proxy treats them like any
+    // other client.
 
     public function testApplicationNameMarkerHasGoldlapelPhpShape(): void
     {
@@ -206,6 +206,20 @@ class GoldLapelTest extends TestCase
             '/^goldlapel:php:.+$/',
             GoldLapel::applicationNameMarker()
         );
+    }
+
+    // The marker goes into the URL query unencoded, so the version must stay
+    // URL- and conninfo-safe: Composer reports a checkout without a version
+    // as `1.0.0+no-version-set`, and the `+` decoded to a space broke every
+    // connection.
+    public function testApplicationNameMarkerIsSafeInAUrl(): void
+    {
+        $this->assertMatchesRegularExpression(
+            '/^goldlapel:php:[A-Za-z0-9._-]+$/',
+            GoldLapel::applicationNameMarker()
+        );
+        $this->assertSame('1.0.0-no-version-set', GoldLapel::urlSafeVersion('1.0.0+no-version-set'));
+        $this->assertSame('dev-main', GoldLapel::urlSafeVersion('dev-main'));
     }
 
     public function testApplicationNameMarkerAppendedWhenNoExistingQuery(): void
@@ -378,10 +392,10 @@ class GoldLapelTest extends TestCase
         $result = GoldLapel::configToArgs([
             'pool_mode' => 'transaction',
             'pool_size' => 10,
-            'disable_rewrite' => true,
+            'disable_pool' => true,
         ]);
         $this->assertSame(
-            ['--pool-mode', 'transaction', '--pool-size', '10', '--disable-rewrite'],
+            ['--pool-mode', 'transaction', '--pool-size', '10', '--disable-pool'],
             $result
         );
     }
@@ -417,7 +431,7 @@ class GoldLapelTest extends TestCase
     {
         $gl = new GoldLapel('postgresql://host:5432/db', [
             'mode' => 'waiter',
-            'config' => ['disable_rewrite' => true],
+            'config' => ['disable_pool' => true],
         ]);
         $this->assertSame(7932, $gl->getProxyPort());
         $this->assertFalse($gl->isRunning());
@@ -475,26 +489,24 @@ class GoldLapelTest extends TestCase
         // Tuning knobs still live in the structured config map.
         $keys = GoldLapel::configKeys();
         $this->assertContains('pool_size', $keys);
-        $this->assertContains('disable_rewrite', $keys);
+        $this->assertContains('disable_pool', $keys);
         $this->assertContains('replica', $keys);
     }
 
     public function testConfigKeysDoesNotContainPromotedTopLevelKeys(): void
     {
         // Top-level concepts (mode, log_level, dashboard_port, etc.) were
-        // promoted out of the structured config map. The four "master"
-        // disable flags (proxy_cache / matviews / sqloptimize /
-        // auto_indexes) were also promoted to top-level options.
+        // promoted out of the structured config map. The three "master"
+        // disable flags (proxy_cache / sqloptimize / auto_indexes) were
+        // also promoted to top-level options.
         $keys = GoldLapel::configKeys();
         $this->assertNotContains('mode', $keys);
         $this->assertNotContains('log_level', $keys);
         $this->assertNotContains('dashboard_port', $keys);
-        $this->assertNotContains('invalidation_port', $keys);
         $this->assertNotContains('config', $keys);
         $this->assertNotContains('license', $keys);
         $this->assertNotContains('client', $keys);
         $this->assertNotContains('disable_proxy_cache', $keys);
-        $this->assertNotContains('disable_matviews', $keys);
         $this->assertNotContains('disable_sqloptimize', $keys);
         $this->assertNotContains('disable_auto_indexes', $keys);
     }
@@ -502,10 +514,7 @@ class GoldLapelTest extends TestCase
     public function testConfigKeysCount(): void
     {
         $keys = GoldLapel::configKeys();
-        // 38 pre-pivot, minus 2 (disable_proxy_cache, disable_matviews)
-        // promoted to top-level. disable_sqloptimize and
-        // disable_auto_indexes were never in the structured map.
-        $this->assertCount(36, $keys);
+        $this->assertCount(29, $keys);
     }
 
     // -- urlToPdoDsn (3 tests) --

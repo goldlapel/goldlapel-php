@@ -29,33 +29,32 @@ class GoldLapel
     const STARTUP_POLL_INTERVAL = 0.05;
 
     // Keys that are valid inside the structured `config` map. Top-level
-    // concepts (proxy_port, dashboard_port, invalidation_port, log_level,
-    // mode, license, client, config_file) are accepted as top-level options
+    // concepts (proxy_port, dashboard_port, log_level, mode, license,
+    // client, config_file) are accepted as top-level options
     // on GoldLapel::start() and are NOT valid keys here — passing them
     // through `config` raises.
     private const VALID_CONFIG_KEYS = [
-        'min_pattern_count', 'refresh_interval_secs', 'pattern_ttl_secs',
-        'max_tables_per_view', 'max_columns_per_view', 'deep_pagination_threshold',
+        'min_pattern_count', 'deep_pagination_threshold',
         'report_interval_secs', 'proxy_cache_size', 'batch_cache_size',
         'batch_cache_ttl_secs', 'pool_size', 'pool_timeout_secs',
         'pool_mode', 'mgmt_idle_timeout', 'fallback', 'read_after_write_secs',
         'n1_threshold', 'n1_window_ms', 'n1_cross_threshold',
         'tls_cert', 'tls_key', 'tls_client_ca',
-        'disable_consolidation', 'disable_btree_indexes',
+        'disable_btree_indexes',
         'disable_trigram_indexes', 'disable_expression_indexes',
-        'disable_partial_indexes', 'disable_rewrite', 'disable_rewrite_prepared_cache',
+        'disable_partial_indexes', 'disable_rewrite_prepared_cache',
         'disable_pool',
-        'disable_n1', 'disable_n1_cross_connection', 'disable_shadow_mode',
-        'enable_coalescing', 'replica', 'exclude_tables',
+        'disable_n1', 'disable_n1_cross_connection',
+        'disable_coalescing', 'replica', 'exclude_tables',
     ];
 
     private const BOOLEAN_KEYS = [
-        'disable_consolidation', 'disable_btree_indexes',
+        'disable_btree_indexes',
         'disable_trigram_indexes', 'disable_expression_indexes',
-        'disable_partial_indexes', 'disable_rewrite', 'disable_rewrite_prepared_cache',
+        'disable_partial_indexes', 'disable_rewrite_prepared_cache',
         'disable_pool',
-        'disable_n1', 'disable_n1_cross_connection', 'disable_shadow_mode',
-        'enable_coalescing',
+        'disable_n1', 'disable_n1_cross_connection',
+        'disable_coalescing',
     ];
 
     private const LIST_KEYS = [
@@ -75,8 +74,6 @@ class GoldLapel
     private int $proxyPort;
     private int $dashboardPort;
     private bool $dashboardPortExplicit;
-    private int $invalidationPort;
-    private bool $invalidationPortExplicit;
     private ?string $logLevel;
     private ?string $mode;
     private ?string $license;
@@ -85,18 +82,9 @@ class GoldLapel
     private bool $silent;
     private bool $mesh;
     private ?string $meshTag;
-    private bool $disableNativeCache;
     private bool $disableProxyCache;
-    private bool $disableMatviews;
     private bool $disableSqloptimize;
     private bool $disableAutoIndexes;
-    /**
-     * Aggressive-verify mode. One of `'auto'` (default — always bump
-     * dml_seq after DML / function calls), `'on'` (alias for 'auto'),
-     * or `'off'` (skip the bump and emit a one-shot warning). See
-     * AggressiveVerify for the mode-resolution details.
-     */
-    private string $aggressiveVerify;
     private array $config;
     private array $extraArgs;
     /** @var resource|null */
@@ -158,7 +146,6 @@ class GoldLapel
      * @param array{
      *   proxy_port?: int,
      *   dashboard_port?: int,
-     *   invalidation_port?: int,
      *   log_level?: string,
      *   mode?: string,
      *   license?: string,
@@ -169,12 +156,9 @@ class GoldLapel
      *   silent?: bool,
      *   mesh?: bool,
      *   mesh_tag?: string,
-     *   disable_native_cache?: bool,
      *   disable_proxy_cache?: bool,
-     *   disable_matviews?: bool,
      *   disable_sqloptimize?: bool,
      *   disable_auto_indexes?: bool,
-     *   aggressive_verify?: string,
      * } $options
      */
     public function __construct(string $upstream, array $options = [])
@@ -182,18 +166,13 @@ class GoldLapel
         $this->upstream = $upstream;
         $this->proxyPort = isset($options['proxy_port']) ? (int) $options['proxy_port'] : self::DEFAULT_PROXY_PORT;
 
-        // Dashboard / invalidation ports default to proxyPort + 1 / + 2 when
-        // unset. An explicit value (including 0 for "disable dashboard")
-        // overrides the derivation and is emitted as --dashboard-port /
-        // --invalidation-port at spawn time.
+        // Dashboard port defaults to proxyPort + 1 when unset. An explicit
+        // value (including 0 for "disable dashboard") overrides the
+        // derivation and is emitted as --dashboard-port at spawn time.
         $this->dashboardPortExplicit = array_key_exists('dashboard_port', $options);
         $this->dashboardPort = $this->dashboardPortExplicit
             ? (int) $options['dashboard_port']
             : $this->proxyPort + 1;
-        $this->invalidationPortExplicit = array_key_exists('invalidation_port', $options);
-        $this->invalidationPort = $this->invalidationPortExplicit
-            ? (int) $options['invalidation_port']
-            : $this->proxyPort + 2;
 
         $this->logLevel = isset($options['log_level']) ? (string) $options['log_level'] : null;
         $this->mode = isset($options['mode']) ? (string) $options['mode'] : null;
@@ -222,42 +201,8 @@ class GoldLapel
         // the keys are no longer accepted inside the structured config
         // map (validation in __construct above raises on unknown keys).
         $this->disableProxyCache = !empty($options['disable_proxy_cache']);
-        $this->disableMatviews = !empty($options['disable_matviews']);
         $this->disableSqloptimize = !empty($options['disable_sqloptimize']);
         $this->disableAutoIndexes = !empty($options['disable_auto_indexes']);
-        // disable_native_cache turns the wrapper-side NativeCache into a no-op
-        // pass-through without forcing the user to drop their tuned
-        // `cache_size`. The flag is applied to the singleton NativeCache the
-        // first time wrapPDO()/wrapPDOStatic() is called from this instance,
-        // and surfaces on the native-cache telemetry snapshot as
-        // `disabled: true`.
-        $this->disableNativeCache = !empty($options['disable_native_cache']);
-        // Aggressive verify (post-DML dml_seq bump for trigger-internal
-        // SET coverage). 'auto' is the default — bumps the per-
-        // connection counter after every observed DML / function call
-        // so any subsequent cacheable read on this connection can't
-        // share an L1 slot with a pre-DML read. 'on' is identical to
-        // 'auto'; 'off' is the opt-out (with a one-shot warning).
-        // Validate eagerly so a misspelled value raises before spawn,
-        // not silently at first DML.
-        $aggressiveVerifyRaw = $options['aggressive_verify'] ?? AggressiveVerify::MODE_AUTO;
-        if (!is_string($aggressiveVerifyRaw)) {
-            throw new \InvalidArgumentException(
-                "aggressive_verify must be a string ('auto', 'on', 'off')"
-            );
-        }
-        $aggressiveVerifyNormalized = strtolower($aggressiveVerifyRaw);
-        if (!in_array(
-            $aggressiveVerifyNormalized,
-            [AggressiveVerify::MODE_AUTO, AggressiveVerify::MODE_ON, AggressiveVerify::MODE_OFF],
-            true,
-        )) {
-            throw new \InvalidArgumentException(
-                "aggressive_verify must be one of: auto, on, off (got '{$aggressiveVerifyRaw}')"
-            );
-        }
-        $this->aggressiveVerify = $aggressiveVerifyNormalized;
-
         // Nested namespaces — see src/Documents.php, src/Streams.php, plus
         // the Phase 5 Redis-compat families under src/{Counters,Zsets,
         // Hashes,Queues,Geos}.php. Each holds a back-reference to this
@@ -278,7 +223,6 @@ class GoldLapel
      * Top-level options (all optional):
      *   - 'proxy_port' (int): proxy port (default 7932)
      *   - 'dashboard_port' (int): dashboard port. Defaults to proxy_port + 1. 0 disables.
-     *   - 'invalidation_port' (int): cache-invalidation port. Defaults to proxy_port + 2.
      *   - 'log_level' (string): 'trace'|'debug'|'info'|'warn'|'error' — translated to the proxy's -v/-vv/-vvv verbosity flag
      *   - 'mode' (string): proxy operating mode ('waiter', 'consideration')
      *   - 'license' (string): path to a signed license file
@@ -289,12 +233,9 @@ class GoldLapel
      *   - 'silent' (bool): suppress the startup banner
      *   - 'mesh' (bool): opt into the mesh at startup (HQ enforces license; denial is non-fatal)
      *   - 'mesh_tag' (string): optional mesh tag — instances with the same tag cluster together
-     *   - 'disable_native_cache' (bool): turn the wrapper's NativeCache into a no-op pass-through. Default false. Lets you toggle the layer off without losing your tuned `cache_size` — get() returns null, put() is a no-op, misses still tick (so the proxy sees the traffic shape via telemetry), the snapshot reports `disabled: true`.
      *   - 'disable_proxy_cache' (bool): emit `--disable-proxy-cache`. Master kill-switch for the proxy's shared cache.
-     *   - 'disable_matviews' (bool): emit `--disable-matviews`. Skip materialized-view rewrites.
      *   - 'disable_sqloptimize' (bool): emit `--disable-sqloptimize`. Master kill-switch for query rewriting + coalescing.
      *   - 'disable_auto_indexes' (bool): emit `--disable-auto-indexes`. Master kill-switch for automatic index creation.
-     *   - 'aggressive_verify' (string): one of 'auto' (default), 'on', 'off'. Controls whether the wrapper bumps a per-connection dml_seq counter after every observed DML / function-call to close the trigger-internal-SET coverage gap. 'auto' / 'on' both enable the bump (zero round-trips — just a counter mix into the L1 cache-key state hash, so post-DML reads can't share a cache slot with pre-DML reads on the same connection). 'off' disables it and emits a one-shot warning surfacing the correctness envelope shrink.
      *
      * Promoted top-level concepts (proxy_port, dashboard_port, etc.) are NOT
      * valid keys inside `config` — passing them there raises at construction
@@ -562,10 +503,6 @@ class GoldLapel
             $cmd[] = '--dashboard-port';
             $cmd[] = (string) $this->dashboardPort;
         }
-        if ($this->invalidationPortExplicit) {
-            $cmd[] = '--invalidation-port';
-            $cmd[] = (string) $this->invalidationPort;
-        }
         if ($this->logLevel !== null) {
             $verboseFlag = self::translateLogLevel($this->logLevel);
             if ($verboseFlag !== null) {
@@ -600,9 +537,6 @@ class GoldLapel
         // Rust binary applies its own defaults otherwise.
         if ($this->disableProxyCache) {
             $cmd[] = '--disable-proxy-cache';
-        }
-        if ($this->disableMatviews) {
-            $cmd[] = '--disable-matviews';
         }
         if ($this->disableSqloptimize) {
             $cmd[] = '--disable-sqloptimize';
@@ -742,10 +676,6 @@ class GoldLapel
         $this->terminate();
         $this->url = null;
         unset(self::$liveInstances[spl_object_id($this)]);
-
-        if (empty(self::$liveInstances)) {
-            NativeCache::reset();
-        }
     }
 
     public function dashboardToken(): ?string
@@ -818,11 +748,6 @@ class GoldLapel
     public function getDashboardPort(): int
     {
         return $this->dashboardPort;
-    }
-
-    public function getInvalidationPort(): int
-    {
-        return $this->invalidationPort;
     }
 
     public function getDashboardUrl(): ?string
@@ -906,79 +831,6 @@ class GoldLapel
             }
         }
         self::$liveInstances = [];
-        NativeCache::reset();
-    }
-
-    // ------------------------------------------------------------------
-    // Integration helper: wrap a PDO with the native cache
-    // ------------------------------------------------------------------
-
-    public function wrapPDO(\PDO $pdo, ?int $invalidationPort = null): CachedPDO
-    {
-        if ($invalidationPort === null) {
-            $invalidationPort = isset($this->config['invalidation_port'])
-                ? (int) $this->config['invalidation_port']
-                : $this->proxyPort + 2;
-        }
-
-        // Use the upstream URL as the detection cache key so multiple
-        // wrapPDO() calls against the same database in the same process
-        // share a single detection result. Falls back to per-PDO when
-        // upstream is unset (low-level use).
-        $cacheKey = 'upstream:' . $this->upstream;
-        return self::wrapPDOStatic(
-            $pdo,
-            $invalidationPort,
-            $this->disableNativeCache,
-            $this->aggressiveVerify,
-            $cacheKey,
-        );
-    }
-
-    /**
-     * Low-level helper: wrap a PDO with the native cache, connecting the
-     * cache to the given invalidation port. Used by the Laravel integration
-     * where PDOs are constructed by the framework outside the factory
-     * lifecycle.
-     *
-     * `$disableNativeCache` is tri-state: null leaves the singleton's
-     * current disabled state untouched (so Laravel callers that don't know
-     * about the option don't accidentally re-enable a previously-disabled
-     * cache), while true/false set it explicitly. wrapPDO() forwards the
-     * factory's `disable_native_cache` startup option here, so the
-     * disable_native_cache=true path always wins over a passive Laravel
-     * wrap that follows it.
-     */
-    public static function wrapPDOStatic(
-        \PDO $pdo,
-        int $invalidationPort,
-        ?bool $disableNativeCache = null,
-        string $aggressiveVerify = AggressiveVerify::MODE_AUTO,
-        ?string $detectionCacheKey = null,
-    ): CachedPDO {
-        $cache = NativeCache::getInstance();
-        if ($disableNativeCache !== null) {
-            $cache->setDisabled($disableNativeCache);
-        }
-        if (!$cache->isConnected()) {
-            $cache->connectInvalidation($invalidationPort);
-        }
-
-        return new CachedPDO($pdo, $cache, $aggressiveVerify, $detectionCacheKey);
-    }
-
-    /**
-     * Convenience: return a CachedPDO wrapping this instance's internal PDO.
-     * Useful when you want the native cache on the factory-managed connection.
-     */
-    public function cached(): CachedPDO
-    {
-        if ($this->pdo === null) {
-            throw new RuntimeException(
-                'Not connected. cached() requires the internal PDO opened by start().'
-            );
-        }
-        return $this->wrapPDO($this->pdo);
     }
 
     // ------------------------------------------------------------------
@@ -1258,14 +1110,26 @@ class GoldLapel
 
     public static function applicationNameMarker(): string
     {
-        return 'goldlapel:php:' . self::wrapperVersion();
+        return 'goldlapel:php:' . self::urlSafeVersion(self::wrapperVersion());
+    }
+
+    /**
+     * The marker goes into the URL query unencoded, so anything outside
+     * [A-Za-z0-9._-] becomes `-`: a `+` (Composer's `1.0.0+no-version-set`
+     * for an unversioned checkout, or any build metadata) decodes to a space
+     * and breaks the connection string.
+     */
+    public static function urlSafeVersion(string $version): string
+    {
+        return (string) preg_replace('/[^A-Za-z0-9._-]/', '-', $version);
     }
 
     /**
      * Append `application_name=goldlapel:php:<version>` to the URL unless one
-     * is already present (or PGAPPNAME is set). Tells the proxy this is
-     * wrapper traffic so it can skip the proxy cache (the wrapper has its
-     * own native cache). Idempotent and override-respecting.
+     * is already present (or PGAPPNAME is set), so wrapper connections are
+     * recognisable in pg_stat_activity. The proxy passes the tag through and
+     * treats these connections like any other client. Idempotent and
+     * override-respecting.
      */
     public static function injectApplicationName(string $url): string
     {

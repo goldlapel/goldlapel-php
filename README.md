@@ -2,7 +2,9 @@
 
 [![Tests](https://github.com/goldlapel/goldlapel-php/actions/workflows/test.yml/badge.svg)](https://github.com/goldlapel/goldlapel-php/actions/workflows/test.yml)
 
-The PHP wrapper for [Gold Lapel](https://goldlapel.com) — a self-optimizing Postgres proxy that watches query patterns and creates materialized views + indexes automatically. Zero code changes beyond the connection string.
+The PHP wrapper for [Gold Lapel](https://goldlapel.com) — a self-optimizing Postgres proxy that caches query results and creates indexes automatically. Zero code changes beyond the connection string.
+
+The wrapper finds the bundled proxy binary, starts and stops it with your app, translates options into proxy flags, and hands back a driver-ready connection. Caching happens in the proxy, so every client — this wrapper, `psql`, a cron job — shares one result cache that stays correct across connections. It also ships Postgres-backed helpers (search, documents, streams, counters, sorted sets, hashes, queues, geo, pub/sub) and a Laravel integration.
 
 ## Install
 
@@ -27,7 +29,9 @@ $rows = $pdo->query('SELECT * FROM users')->fetchAll(PDO::FETCH_ASSOC);
 $gl->stop();  // (also cleaned up in __destruct)
 ```
 
-Point PDO at `$gl->pdoDsn()` (with `$gl->pdoCredentials()`, since PDO doesn't accept `postgresql://` URLs directly). Gold Lapel sits between your app and your DB, watching query patterns and creating materialized views + indexes automatically. Zero code changes beyond the connection string.
+Point PDO at `$gl->pdoDsn()` (with `$gl->pdoCredentials()`, since PDO doesn't accept `postgresql://` URLs directly). The PDO is a plain `\PDO` connected to the proxy; any other Postgres driver can use `$gl->url()`.
+
+The proxy listens on two ports: the proxy itself (`proxy_port`, default 7932) and the dashboard (`dashboard_port`, default `proxy_port + 1`).
 
 Document store and streams live under nested namespaces:
 
@@ -41,10 +45,10 @@ Scoped transactional coordination via `$gl->using($pdo, $cb)`, Laravel auto-wiri
 
 ## Dashboard
 
-Gold Lapel exposes a live dashboard at `$gl->dashboardUrl()`:
+Gold Lapel exposes a live dashboard at `$gl->getDashboardUrl()`:
 
 ```php
-echo $gl->dashboardUrl();
+echo $gl->getDashboardUrl();
 // -> http://127.0.0.1:7933
 ```
 
@@ -54,7 +58,7 @@ Full API reference, configuration, Laravel integration, async (Amp), upgrading f
 
 ## Uninstalling
 
-Before removing the package, drop Gold Lapel's helper schema and cached matviews from your Postgres:
+Before removing the package, drop Gold Lapel's helper schema and the indexes it created from your Postgres:
 
 ```bash
 goldlapel clean
@@ -68,7 +72,7 @@ rm -rf ~/.goldlapel
 rm -f goldlapel.toml     # only if you wrote one
 ```
 
-Cancelling your subscription does not delete your data — only Gold Lapel's helper schema and cached matviews go away.
+Cancelling your subscription does not delete your data — only Gold Lapel's helper schema and the indexes it created go away.
 
 ## License
 

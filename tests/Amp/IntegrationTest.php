@@ -86,8 +86,8 @@ class IntegrationTest extends TestCase
     private function uniqPort(): int
     {
         // Ephemeral range — avoid proxy port collisions between tests.
-        // Use a random high port (leaving enough headroom for dashboard
-        // port = port + 1 and invalidation = port + 2).
+        // Use a random high port (leaving headroom for dashboard
+        // port = port + 1).
         return random_int(18000, 28000);
     }
 
@@ -468,7 +468,7 @@ class IntegrationTest extends TestCase
         $this->assertTrue($dead, "subprocess pid {$pid} should exit after stop()");
     }
 
-    public function testCachedConnectionHitsL1OnRepeatRead(): void
+    public function testRepeatReadSeesWriteThroughProxy(): void
     {
         $port = $this->uniqPort();
         $gl = GoldLapel::start(self::$upstream, ['proxy_port' => $port, 'silent' => true])->await();
@@ -479,37 +479,23 @@ class IntegrationTest extends TestCase
             $conn->execute("INSERT INTO {$table} VALUES (\$1, \$2)", [1, 'alice']);
             $conn->execute("INSERT INTO {$table} VALUES (\$1, \$2)", [2, 'bob']);
 
-            $cached = $gl->cached();
-            $cache = $cached->getCache();
-            $before = $cache->statsMisses;
+            $read = function () use ($conn, $table): array {
+                $rows = [];
+                foreach ($conn->query("SELECT * FROM {$table} ORDER BY id") as $r) {
+                    $rows[] = $r;
+                }
+                return $rows;
+            };
 
-            // First read — miss
-            $rows1 = [];
-            foreach ($cached->query("SELECT * FROM {$table} ORDER BY id") as $r) {
-                $rows1[] = $r;
-            }
+            // Identical reads return identical rows, whether or not the
+            // proxy served the second from its result cache.
+            $rows1 = $read();
             $this->assertCount(2, $rows1);
+            $this->assertSame($rows1, $read());
 
-            // Second identical read — cache hit (if invalidation is connected)
-            $hitsBefore = $cache->statsHits;
-            $rows2 = [];
-            foreach ($cached->query("SELECT * FROM {$table} ORDER BY id") as $r) {
-                $rows2[] = $r;
-            }
-            $this->assertSame($rows1, $rows2);
-            // Only assert on cache stats if the invalidation socket is up —
-            // without it, put() short-circuits and every read is a miss.
-            if ($cache->isConnected()) {
-                $this->assertGreaterThan($hitsBefore, $cache->statsHits);
-            }
-
-            // Write via cached wrapper invalidates
-            $cached->execute("UPDATE {$table} SET v = \$1 WHERE id = \$2", ['carol', 1]);
-            $rows3 = [];
-            foreach ($cached->query("SELECT * FROM {$table} ORDER BY id") as $r) {
-                $rows3[] = $r;
-            }
-            $this->assertSame('carol', $rows3[0]['v']);
+            // A write invalidates: the next read sees the new value.
+            $conn->execute("UPDATE {$table} SET v = \$1 WHERE id = \$2", ['carol', 1]);
+            $this->assertSame('carol', $read()[0]['v']);
         } finally {
             $this->cleanup($table, $gl);
             $gl->stop()->await();

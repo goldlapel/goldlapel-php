@@ -47,7 +47,7 @@ class StreamsIntegrationTest extends TestCase
     {
         $port = 7700 + (int) (microtime(true) * 1000) % 100;
         $name = 'gl_php_int_stream_' . (int) (microtime(true) * 1000);
-        // Proxy proxy_cache / consolidation / rewrite_prepared_cache are
+        // Proxy proxy_cache / rewrite_prepared_cache are
         // intentionally left on — the FOR UPDATE tx-poisoning bug that used to require
         // disabling them was fixed in goldlapel d77fe37 / 945d674 and has
         // regression coverage in tests/phase32_for_update_cache.rs.
@@ -148,7 +148,7 @@ class StreamsIntegrationTest extends TestCase
     {
         $port = 8000 + (int) (microtime(true) * 1000) % 100;
         $table = 'gl_php_fu_' . (int) (microtime(true) * 1000);
-        // All three cache features on — this is the regression case.
+        // Proxy cache features on — this is the regression case.
         $gl = GoldLapel::start(self::$pgUrl, [
             'proxy_port' => $port,
             'silent' => true,

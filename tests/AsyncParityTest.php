@@ -36,14 +36,14 @@ class AsyncParityTest extends TestCase
      * intentional, not drift.
      *
      * Type-specific accessors (PDO is the sync-only driver):
-     *   - pdo, pdoDsn, pdoCredentials, wrapPDO
+     *   - pdo, pdoDsn, pdoCredentials
      *
      * Internal accessors used by tests / Ddl helpers — Amp's class accesses
      * the same private state directly without needing a public accessor:
      *   - dashboardToken, ddlCache
      */
     private const SYNC_ONLY = [
-        'pdo', 'pdoDsn', 'pdoCredentials', 'wrapPDO',
+        'pdo', 'pdoDsn', 'pdoCredentials',
         'dashboardToken', 'ddlCache',
     ];
 
@@ -53,10 +53,9 @@ class AsyncParityTest extends TestCase
      *
      * Type-specific accessors (amphp PostgresConnection is async-only):
      *   - connect, connection — open / fetch the amphp connection
-     *   - wrapCached         — sync analogue is wrapPDO (different driver type)
      */
     private const AMP_ONLY = [
-        'connect', 'connection', 'wrapCached',
+        'connect', 'connection',
     ];
 
     /**

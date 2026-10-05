@@ -4,6 +4,42 @@
 
 ### Breaking changes
 
+**The in-process cache is gone.** The wrapper no longer keeps its own
+query-result cache ("native cache" / L1). Caching now happens only in the
+proxy, which caches every client the same way and stays correct across
+connections. What the wrapper does now: find and run the proxy binary,
+translate options into proxy flags, hand back a driver-ready connection,
+and provide the Postgres-backed helpers and the Laravel integration.
+
+- Removed classes: `GoldLapel\NativeCache`, `GoldLapel\CachedPDO`,
+  `GoldLapel\ConnectionGucState`, `GoldLapel\AggressiveVerify`,
+  `GoldLapel\Amp\CachedConnection`, `GoldLapel\Amp\CachedResult`, and
+  `GoldLapel\Laravel\GoldLapelConnection`.
+- Removed methods: `GoldLapel::wrapPDO()`, `GoldLapel::wrapPDOStatic()`,
+  `GoldLapel::cached()`, `GoldLapel\Amp\GoldLapel::wrapCached()`,
+  `GoldLapel\Amp\GoldLapel::cached()`, and `getInvalidationPort()` on both.
+  Use the plain PDO from `$gl->pdo()` (or `new PDO($gl->pdoDsn(), ...$gl->pdoCredentials())`)
+  and the plain amphp connection from `$gl->connection()`.
+- Removed `GoldLapel::start()` options (sync and async): `invalidation_port`,
+  `disable_native_cache`, `aggressive_verify`, and `disable_matviews` (the
+  proxy no longer builds materialized views). The proxy now uses two ports:
+  proxy and dashboard (`proxy_port + 1`).
+- Removed `config` keys for the retired materialized-view engine:
+  `refresh_interval_secs`, `pattern_ttl_secs`, `max_tables_per_view`,
+  `max_columns_per_view`, `disable_consolidation`, `disable_rewrite`, and
+  `disable_shadow_mode`. Passing them now raises `Unknown config key`.
+- `config` key `enable_coalescing` is now `disable_coalescing`, the only
+  coalescing flag the proxy has (it rejected `--enable-coalescing`, so the old
+  key stopped the proxy from starting).
+- Laravel: the `goldlapel.invalidation_port` connection setting is gone, and
+  the provider no longer replaces Laravel's `pgsql` connection resolver —
+  Gold Lapel connections are ordinary `PostgresConnection`s pointed at the
+  proxy.
+
+Connections are still tagged `application_name=goldlapel:php:<version>` so
+they're recognisable in `pg_stat_activity`; the proxy treats them like any
+other client.
+
 **Doc-store and stream methods moved under nested namespaces.** The flat
 `$gl->doc*()` and `$gl->stream*()` methods are gone; document and stream
 operations now live under `$gl->documents-><verb>()` and
@@ -104,3 +140,10 @@ helpers in `GoldLapel\Utils` and `GoldLapel\Amp\Utils` no longer issue
 not supplied. Direct callers should migrate to the namespace verbs
 (`$gl->documents->insert(...)`); the static helpers remain on the public
 surface for advanced uses but require the patterns map.
+
+### Fixed
+
+- The `application_name` tag carried the package version unencoded, so a
+  version with build metadata — Composer reports an unversioned checkout as
+  `1.0.0+no-version-set` — broke every connection (`+` decodes to a space).
+  The version is now limited to `[A-Za-z0-9._-]`.

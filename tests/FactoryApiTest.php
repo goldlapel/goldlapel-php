@@ -60,7 +60,7 @@ class FactoryApiTest extends TestCase
         // Regression guard: mode, log_level, dashboard_port, etc. are top-
         // level options on the canonical surface. Passing them through the
         // `config` map must raise at construction.
-        foreach (['mode', 'log_level', 'dashboard_port', 'invalidation_port', 'config', 'license', 'client'] as $promoted) {
+        foreach (['mode', 'log_level', 'dashboard_port', 'config', 'license', 'client'] as $promoted) {
             $caught = false;
             try {
                 new GoldLapel('postgresql://u:p@h/d', ['config' => [$promoted => 'x']]);
@@ -87,15 +87,12 @@ class FactoryApiTest extends TestCase
     {
         $gl = new GoldLapel('postgresql://u:p@h/d', ['proxy_port' => 17932]);
         $this->assertSame(17933, $gl->getDashboardPort());
-        $this->assertSame(17934, $gl->getInvalidationPort());
 
         $gl2 = new GoldLapel('postgresql://u:p@h/d', [
             'proxy_port' => 17932,
             'dashboard_port' => 9999,
-            'invalidation_port' => 9998,
         ]);
         $this->assertSame(9999, $gl2->getDashboardPort());
-        $this->assertSame(9998, $gl2->getInvalidationPort());
     }
 
     public function testConstructExtraArgsPreserved(): void
@@ -495,19 +492,6 @@ class FactoryApiTest extends TestCase
         });
 
         $this->assertSame(99, $observed);
-    }
-
-    // ------------------------------------------------------------------
-    // cached() helper
-    // ------------------------------------------------------------------
-
-    public function testCachedThrowsWithoutInternalPdo(): void
-    {
-        $gl = new GoldLapel('postgresql://user:pass@host:5432/db');
-
-        $this->expectException(RuntimeException::class);
-        $this->expectExceptionMessage('Not connected');
-        $gl->cached();
     }
 
     // ------------------------------------------------------------------
