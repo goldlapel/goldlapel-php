@@ -150,6 +150,17 @@ materialized views). Removed `config` keys name their reason the same way.
 
 ### Changed
 
+- PHP-FPM, CGI, Apache and the built-in server share one proxy per machine
+  instead of starting one per request (which paid the proxy's whole startup
+  and served from an empty cache every time). The first request starts it;
+  later requests and processes with the same configuration attach to it.
+  `stop()` lets go of a shared proxy, which exits once unused for 15
+  minutes. New option `shared` (default: on except for CLI scripts). Needs
+  the `posix` extension on Linux and macOS.
+- Laravel: requests, artisan commands and Octane workers share one proxy
+  (`'shared' => false` in the `goldlapel` block opts out; test runs keep
+  their own). It's started from the app's root, so it finds the app's
+  `.env` and `goldlapel.toml` under PHP-FPM too.
 - Several proxies in one process no longer collide. Each proxy holds two
   ports (proxy and dashboard), and without an explicit `proxy_port` a proxy
   takes the first free pair from 7932 up: 7932/7933 for the first, then

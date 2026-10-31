@@ -45,6 +45,12 @@ $gl->streams->add('clicks', ['url' => '/']);
 
 Scoped transactional coordination via `$gl->using($pdo, $cb)`, Laravel auto-wiring, and native async via `GoldLapel\Amp\` are in the docs.
 
+## PHP-FPM, artisan and Laravel: one shared proxy
+
+PHP starts every request from nothing, so a proxy per process would be a proxy per request. Under PHP-FPM, CGI, Apache and the built-in server, `start()` shares one proxy with every process on the machine started with the same configuration: the first request starts it, and the rest find it and attach in microseconds. Laravel shares it across requests, artisan commands and Octane workers alike (not in a test run). `stop()` lets go of a shared proxy rather than stopping it; it exits by itself once nothing has used it for 15 minutes (`GOLDLAPEL_IDLE_EXIT_SECS`).
+
+A change to the options, the `GOLDLAPEL_*` environment, `goldlapel.toml`, `.env` or the binary (a new release) starts a new proxy, and the old one idles out. Its files (owner-only, with its output in `<key>.log`) are in `$TMPDIR/goldlapel-<uid>/`. Processes of different users, or of a PHP-FPM with its own `/tmp`, run separate proxies. Pass `'shared' => false` (in Laravel, in the connection's `goldlapel` block) for a proxy owned by the process; CLI scripts get one by default. On Linux and macOS it needs PHP's `posix` extension, on by default.
+
 ## Dashboard
 
 Gold Lapel exposes a live dashboard at `$gl->getDashboardUrl()`:
