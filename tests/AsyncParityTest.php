@@ -150,7 +150,9 @@ class AsyncParityTest extends TestCase
      *   - pdo (sync) / connection (amp): the driver-specific connection
      *   - scopedConn: a nullable PDO on sync, a FiberLocal object on Amp
      */
-    private const SYNC_ONLY_PROPERTIES = ['pdo', 'scopedConn'];
+    // The shared proxy is sync-only: the async client runs in one long
+    // process, and owns its proxy.
+    private const SYNC_ONLY_PROPERTIES = ['pdo', 'scopedConn', 'shared', 'keyOptions', 'sharedPrefix', 'hold'];
     private const AMP_ONLY_PROPERTIES = ['connection'];
 
     /**

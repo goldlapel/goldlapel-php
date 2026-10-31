@@ -36,10 +36,13 @@ class GoldLapelServiceProvider extends ServiceProvider
             // GoldLapel::start(), passed through as-is (unset keys are left
             // to the core's defaults — notably proxy_port, which the core
             // allocates so several connections don't collide).
+            // Requests and commands share one proxy per machine (see the
+            // core's attachShared()); a test run keeps its own, so nothing
+            // lingers to hold its databases.
             $startOptions = array_filter(
                 array_diff_key($glConfig, ['enabled' => true]),
                 fn ($value) => $value !== null,
-            ) + ['client' => 'laravel'];
+            ) + ['client' => 'laravel', 'shared' => !$this->app->runningUnitTests()];
 
             try {
                 $upstream = buildUpstreamUrl($config);
@@ -47,7 +50,18 @@ class GoldLapelServiceProvider extends ServiceProvider
                 // own PDOs against the rewritten host/port. Connections
                 // pointing at the same database get the same running proxy
                 // back from the core; the first connection's options win.
-                $instance = GoldLapel::startProxyOnly($upstream, $startOptions);
+                // Started from the app's root, whichever directory the request
+                // began in (FPM: public/): that's where its .env and
+                // goldlapel.toml are, for the proxy and for the shared key.
+                $cwd = getcwd();
+                @chdir($this->app->basePath());
+                try {
+                    $instance = GoldLapel::startProxyOnly($upstream, $startOptions);
+                } finally {
+                    if ($cwd !== false) {
+                        @chdir($cwd);
+                    }
+                }
             } catch (\Throwable $e) {
                 // \Throwable, not \Exception: a mistyped option value
                 // raises \TypeError, which must not take the app down.
@@ -88,8 +102,9 @@ class GoldLapelServiceProvider extends ServiceProvider
             $this->app['events']->listen(\Laravel\Octane\Events\WorkerStopping::class, $stop);
         } else {
             // One request (PHP-FPM) or one console command: stop when the
-            // app terminates. The process-exit hook in the core would too;
-            // this just makes it deterministic.
+            // app terminates (for a shared proxy, let go of it). The
+            // process-exit hook in the core would too; this just makes it
+            // deterministic.
             $this->app->terminating($stop);
         }
     }

@@ -565,7 +565,7 @@ class GoldLapelTest extends TestCase
     public function testConfigKeysCount(): void
     {
         $keys = GoldLapel::configKeys();
-        $this->assertCount(31, $keys);
+        $this->assertCount(32, $keys);
     }
 
     // -- urlToPdoDsn (3 tests) --

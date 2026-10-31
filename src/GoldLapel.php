@@ -27,6 +27,13 @@ class GoldLapel
     const DEFAULT_PROXY_PORT = 7932;
     const STARTUP_TIMEOUT = 10.0;
     const STARTUP_POLL_INTERVAL = 0.05;
+    /** A shared proxy exits once no process has used it for this long. */
+    const SHARED_IDLE_EXIT_SECS = 900;
+    /**
+     * How long a request waits on a shared proxy another process is
+     * starting, before it gives up rather than tie up a worker.
+     */
+    const SHARED_START_WAIT = 2.0;
 
     // Keys that are valid inside the structured `config` map. Top-level
     // concepts (proxy_port, dashboard_port, log_level, mode, license,
@@ -66,7 +73,7 @@ class GoldLapel
         'proxy_port', 'dashboard_port', 'log_level', 'mode', 'license',
         'client', 'config_file', 'config', 'extra_args', 'silent', 'mesh',
         'mesh_tag', 'disable_proxy_cache', 'disable_sqloptimize',
-        'disable_auto_indexes',
+        'disable_auto_indexes', 'shared',
     ];
 
     private const WRAPPER_CACHE_REMOVED = 'it was removed with the in-process cache';
@@ -132,6 +139,18 @@ class GoldLapel
     private array $extraArgs;
     /** @var resource|null */
     private $process = null;
+
+    /**
+     * Whether this proxy is shared by every process on the machine with the
+     * same configuration (see attachShared()), rather than owned by this one.
+     */
+    private bool $shared;
+    /** What the shared proxy is keyed on: the options, less shared and silent. */
+    private array $keyOptions;
+    /** The shared proxy's files: <prefix>.lock, .json, .hold, .spawn, .log. */
+    private ?string $sharedPrefix = null;
+    /** @var resource|null shared lock on <prefix>.hold while this uses the shared proxy */
+    private $hold = null;
     private ?string $url = null;
     private ?\PDO $pdo = null;
 
@@ -259,6 +278,8 @@ class GoldLapel
         $this->disableProxyCache = !empty($options['disable_proxy_cache']);
         $this->disableSqloptimize = !empty($options['disable_sqloptimize']);
         $this->disableAutoIndexes = !empty($options['disable_auto_indexes']);
+        $this->shared = $options['shared'] ?? self::sharedByDefault();
+        $this->keyOptions = array_diff_key($options, ['shared' => true, 'silent' => true]);
         // Nested namespaces — see src/Documents.php, src/Streams.php, plus
         // the Phase 5 Redis-compat families under src/{Counters,Zsets,
         // Hashes,Queues,Geos}.php. Each holds a back-reference to this
@@ -295,6 +316,11 @@ class GoldLapel
      *   - 'disable_proxy_cache' (bool): emit `--disable-proxy-cache`. Master kill-switch for the proxy's shared cache.
      *   - 'disable_sqloptimize' (bool): emit `--disable-sqloptimize`. Master kill-switch for query rewriting + coalescing.
      *   - 'disable_auto_indexes' (bool): emit `--disable-auto-indexes`. Master kill-switch for automatic index creation.
+     *   - 'shared' (bool): share one proxy with every process on this machine started with the same
+     *     configuration, instead of running one for this process (see attachShared()). Defaults to
+     *     true where PHP starts each request from nothing (PHP-FPM, CGI, the built-in server, Apache)
+     *     and false for CLI scripts. A shared proxy outlives this process: stop() lets go of it, and it
+     *     exits once unused for SHARED_IDLE_EXIT_SECS.
      *
      * Promoted top-level concepts (proxy_port, dashboard_port, etc.) are NOT
      * valid keys inside `config` — passing them there raises at construction
@@ -512,6 +538,9 @@ class GoldLapel
         }
         if (isset($options['log_level'])) {
             self::translateLogLevel($options['log_level']);
+        }
+        if (isset($options['shared']) && !is_bool($options['shared'])) {
+            throw new \InvalidArgumentException('shared must be true or false');
         }
         self::configToArgs($options['config'] ?? []);
     }
@@ -732,8 +761,11 @@ class GoldLapel
 
     private function startProxyWithoutConnect(): string
     {
-        if ($this->process !== null && $this->isRunning()) {
+        if ($this->url !== null && $this->isRunning()) {
             return $this->url;
+        }
+        if ($this->shared) {
+            return $this->attachShared();
         }
 
         $binary = self::findBinary();
@@ -743,6 +775,41 @@ class GoldLapel
             $this->proxyPortExplicit ? $this->proxyPort : null,
             $this->dashboardPortExplicit ? $this->dashboardPort : null,
         );
+
+        try {
+            $this->process = self::launch($this->command($binary), $this->childEnv(), $this->proxyPort);
+        } catch (\Throwable $e) {
+            self::releasePorts($this);
+            throw $e;
+        }
+
+        $this->url = self::makeProxyUrl(
+            $this->upstream,
+            $this->proxyPort,
+            !self::clientTls($this->config, $this->extraArgs),
+        );
+
+        // Print the banner BEFORE registering for cleanup: fwrite()
+        // to stderr is vanishingly unlikely to fail, but if it does
+        // (closed fd in a long-running SAPI, unwritable stream, FPM
+        // after fastcgi_finish_request() has detached stderr) we'd
+        // rather let the throw escape with no registry entry than
+        // leak an orphan reference into $liveInstances. Registration
+        // is the last side-effect because it's the one whose cleanup
+        // is most expensive to get wrong.
+        self::printBanner($this->proxyPort, $this->dashboardPort, $this->silent);
+
+        // Register the instance for global cleanup immediately so
+        // that any subsequent init step (e.g. PDO construction in
+        // startProxy()) can throw without leaking the subprocess.
+        self::registerForCleanup($this);
+
+        return $this->url;
+    }
+
+    /** The proxy's command line, for the ports already claimed. */
+    private function command(string $binary): array
+    {
         $cmd = [$binary, '--upstream', $this->upstream, '--proxy-port', (string) $this->proxyPort];
 
         // Top-level options (promoted out of the config map by the canonical
@@ -795,8 +862,12 @@ class GoldLapel
         if ($this->disableAutoIndexes) {
             $cmd[] = '--disable-auto-indexes';
         }
-        $cmd = array_merge($cmd, self::configToArgs($this->config), $this->extraArgs);
+        return array_merge($cmd, self::configToArgs($this->config), $this->extraArgs);
+    }
 
+    /** The proxy's environment; provisions this instance's dashboard token. */
+    private function childEnv(): array
+    {
         $env = getenv();
         // GOLDLAPEL_CLIENT env var is only set when the user hasn't opted
         // in via the top-level `client` option (which emits --client and
@@ -812,36 +883,323 @@ class GoldLapel
             $this->dashboardToken = bin2hex(random_bytes(32));
             $env['GOLDLAPEL_DASHBOARD_TOKEN'] = $this->dashboardToken;
         }
+        return $env;
+    }
 
-        try {
-            $this->process = self::launch($cmd, $env, $this->proxyPort);
-        } catch (\Throwable $e) {
-            self::releasePorts($this);
-            throw $e;
+    // ------------------------------------------------------------------
+    // Shared proxy: one per machine, for PHP that starts every request
+    // from nothing
+    // ------------------------------------------------------------------
+
+    /**
+     * Where PHP starts each request from nothing (PHP-FPM, CGI, the built-in
+     * server, Apache), a proxy per process would be a proxy per request:
+     * started, cold, and stopped again each time. A CLI script owns its own.
+     */
+    private static function sharedByDefault(): bool
+    {
+        return !in_array(PHP_SAPI, ['cli', 'phpdbg'], true);
+    }
+
+    /**
+     * Use the proxy this configuration shares across the machine, starting
+     * it if no process has. The files under sharedPrefix():
+     *
+     *   .lock   held exclusively by the proxy for its life: one owns the key
+     *   .json   written by the proxy once it serves: pid, ports, token
+     *   .hold   held shared by every process using it; the proxy takes it
+     *           exclusively to exit, so it never leaves under a user, and no
+     *           one attaches once it's leaving
+     *   .spawn  held by the one process starting it
+     *   .log    the proxy's output, for a start that fails
+     *
+     * The hold is this instance's until stop(), or the end of the request
+     * (PHP closes the file). The proxy exits once nothing has used it for
+     * SHARED_IDLE_EXIT_SECS.
+     */
+    private function attachShared(): string
+    {
+        $prefix = $this->sharedPrefix ??= self::sharedPrefix($this->upstream, $this->keyOptions);
+        $deadline = hrtime(true) + (int) (self::STARTUP_TIMEOUT * 1e9);
+        $startingSince = null;
+        while (true) {
+            $state = $this->sharedState($prefix, $info);
+            if ($state === 'ready') {
+                return $this->adopt($info);
+            }
+            if (hrtime(true) >= $deadline) {
+                throw new RuntimeException(
+                    "Gold Lapel's shared proxy didn't start within " . self::STARTUP_TIMEOUT . "s.\nlog: " . self::logTail($prefix)
+                );
+            }
+            if ($state === 'starting') {
+                // Another process is starting it: don't tie this one up long
+                $startingSince ??= hrtime(true);
+                if (hrtime(true) - $startingSince > self::SHARED_START_WAIT * 1e9) {
+                    throw new RuntimeException(
+                        'Gold Lapel is still starting for another process; it will be ready for the next request.'
+                    );
+                }
+                usleep((int) (self::STARTUP_POLL_INTERVAL * 1e6));
+                continue;
+            }
+            if ($state === 'absent' && $startingSince !== null) {
+                // The start it waited on stopped without serving: starting
+                // another would fail the same way
+                throw new RuntimeException(
+                    "Gold Lapel stopped before it was ready.\nlog: " . self::logTail($prefix)
+                );
+            }
+            if ($state === 'exiting' || !$this->spawnShared($prefix)) {
+                usleep((int) (self::STARTUP_POLL_INTERVAL * 1e6));
+            }
         }
+    }
 
+    /**
+     * 'ready' (the hold is taken and $info set), 'starting' (owned, not yet
+     * serving), 'exiting' (the proxy holds .hold to leave) or 'absent'.
+     */
+    private function sharedState(string $prefix, ?array &$info): string
+    {
+        $info = null;
+        $hold = self::openLock("{$prefix}.hold");
+        if (!flock($hold, LOCK_SH | LOCK_NB)) {
+            fclose($hold);
+            return 'exiting';
+        }
+        // Under the hold it can't idle out; it must still be alive and serving
+        if (!self::lockHeld("{$prefix}.lock")) {
+            fclose($hold);
+            return 'absent';
+        }
+        $json = @file_get_contents("{$prefix}.json");
+        $info = $json === false ? null : json_decode($json, true);
+        if (!is_array($info) || !isset($info['proxy_port'])) {
+            $info = null;
+            fclose($hold);
+            return 'starting';
+        }
+        $this->hold = $hold;
+        return 'ready';
+    }
+
+    /**
+     * Start the shared proxy, unless another process is: false when one is.
+     * Throws when the proxy can't start.
+     */
+    private function spawnShared(string $prefix): bool
+    {
+        $spawn = self::openLock("{$prefix}.spawn");
+        if (!flock($spawn, LOCK_EX | LOCK_NB)) {
+            fclose($spawn);
+            return false;
+        }
+        try {
+            if (self::lockHeld("{$prefix}.lock")) {
+                return true;
+            }
+            // A crashed owner's
+            @unlink("{$prefix}.json");
+            $binary = self::findBinary();
+            for ($attempt = 0; ; $attempt++) {
+                [$this->proxyPort, $this->dashboardPort] = self::claimPorts(
+                    $this,
+                    $this->upstream,
+                    $this->proxyPortExplicit ? $this->proxyPort : null,
+                    $this->dashboardPortExplicit ? $this->dashboardPort : null,
+                );
+                $cmd = array_merge($this->command($binary), ['--instance', $prefix, '--detach']);
+                $env = $this->childEnv();
+                $env['GOLDLAPEL_IDLE_EXIT_SECS'] ??= (string) self::SHARED_IDLE_EXIT_SECS;
+                $status = self::launchDetached($cmd, $env, "{$prefix}.log", $this->proxyPort);
+                if ($status === 0) {
+                    self::printBanner($this->proxyPort, $this->dashboardPort, $this->silent);
+                    return true;
+                }
+                if ($status === 3) {
+                    return true;
+                }
+                $tail = self::logTail($prefix);
+                // Another configuration starting at the same moment took the
+                // port it was given: claim the next free one
+                if (!$this->proxyPortExplicit && $attempt < 3 && str_contains($tail, 'is already in use')) {
+                    continue;
+                }
+                self::releasePorts($this);
+                throw new RuntimeException(
+                    "Gold Lapel exited with status {$status} before it was ready on port {$this->proxyPort}.\nstderr: {$tail}"
+                );
+            }
+        } finally {
+            flock($spawn, LOCK_UN);
+            fclose($spawn);
+        }
+    }
+
+    /**
+     * Run the proxy's `--detach` start: it returns once the proxy it started
+     * serves (0), or with that proxy's exit status. Its output goes to $log.
+     */
+    private static function launchDetached(array $cmd, array $env, string $log, int $proxyPort): int
+    {
+        $out = fopen($log, 'w');
+        $nullDevice = PHP_OS_FAMILY === 'Windows' ? 'NUL' : '/dev/null';
+        $pipes = [];
+        $process = proc_open($cmd, [0 => ['file', $nullDevice, 'r'], 1 => $out, 2 => $out], $pipes, null, $env);
+        fclose($out);
+        if (!is_resource($process)) {
+            throw new RuntimeException(
+                "Failed to start Gold Lapel process (proc_open returned false for {$cmd[0]}). " .
+                "Check that the binary is executable and the system has free resources."
+            );
+        }
+        $deadline = hrtime(true) + (int) (self::STARTUP_TIMEOUT * 1e9);
+        while (hrtime(true) < $deadline) {
+            // The status from the call that sees it stop: later calls report -1
+            $status = proc_get_status($process);
+            if (!$status['running']) {
+                proc_close($process);
+                return $status['signaled'] ? 1 : $status['exitcode'];
+            }
+            usleep((int) (self::STARTUP_POLL_INTERVAL * 1e6));
+        }
+        // The proxy may still come up for later requests; it gives up by itself if not
+        self::killProcess($process);
+        throw new RuntimeException(
+            "Gold Lapel failed to start on port {$proxyPort} within " . self::STARTUP_TIMEOUT . "s.\nstderr: "
+            . trim(substr((string) @file_get_contents($log), -2000))
+        );
+    }
+
+    private function adopt(array $info): string
+    {
+        $this->proxyPort = (int) $info['proxy_port'];
+        $this->dashboardPort = (int) ($info['dashboard_port'] ?? 0);
+        $this->dashboardToken = $info['dashboard_token'] ?? null;
         $this->url = self::makeProxyUrl(
             $this->upstream,
             $this->proxyPort,
             !self::clientTls($this->config, $this->extraArgs),
         );
-
-        // Print the banner BEFORE registering for cleanup: fwrite()
-        // to stderr is vanishingly unlikely to fail, but if it does
-        // (closed fd in a long-running SAPI, unwritable stream, FPM
-        // after fastcgi_finish_request() has detached stderr) we'd
-        // rather let the throw escape with no registry entry than
-        // leak an orphan reference into $liveInstances. Registration
-        // is the last side-effect because it's the one whose cleanup
-        // is most expensive to get wrong.
-        self::printBanner($this->proxyPort, $this->dashboardPort, $this->silent);
-
-        // Register the instance for global cleanup immediately so
-        // that any subsequent init step (e.g. PDO construction in
-        // startProxy()) can throw without leaking the subprocess.
         self::registerForCleanup($this);
-
         return $this->url;
+    }
+
+    /**
+     * The shared proxy's files for this configuration: a hash of everything
+     * the proxy reads as it starts (binary, upstream, options, GOLDLAPEL_*
+     * environment, working directory, and the config file and .env it would
+     * load), so a changed setting or a new release gets a proxy of its own
+     * and the old one idles out.
+     *
+     * @internal
+     */
+    public static function sharedPrefix(string $upstream, array $options): string
+    {
+        $binary = self::findBinary();
+        $env = array_filter(getenv(), fn ($name) => str_starts_with($name, 'GOLDLAPEL_'), ARRAY_FILTER_USE_KEY);
+        ksort($env);
+        self::sortKeys($options);
+        $configFile = $options['config_file'] ?? (getenv('GOLDLAPEL_CONFIG') ?: (is_file('goldlapel.toml') ? 'goldlapel.toml' : null));
+        $key = hash('sha256', (string) json_encode([
+            $binary, @filemtime($binary), @filesize($binary),
+            $upstream, $options, $env, (string) getcwd(),
+            self::contentHash($configFile), self::contentHash(self::dotenvPath()),
+        ]));
+        return self::sharedDir() . DIRECTORY_SEPARATOR . substr($key, 0, 32);
+    }
+
+    private static function sortKeys(array &$value): void
+    {
+        ksort($value);
+        foreach ($value as &$item) {
+            if (is_array($item)) {
+                self::sortKeys($item);
+            }
+        }
+    }
+
+    private static function contentHash(?string $file): ?string
+    {
+        return $file !== null && is_file($file) ? (hash_file('sha256', $file) ?: null) : null;
+    }
+
+    /** The .env the proxy loads: the nearest one up from the working directory. */
+    private static function dotenvPath(): ?string
+    {
+        $dir = getcwd();
+        while ($dir !== false) {
+            if (is_file($dir . DIRECTORY_SEPARATOR . '.env')) {
+                return $dir . DIRECTORY_SEPARATOR . '.env';
+            }
+            $parent = dirname($dir);
+            if ($parent === $dir) {
+                return null;
+            }
+            $dir = $parent;
+        }
+        return null;
+    }
+
+    /**
+     * This user's private directory for shared proxies' files: they carry
+     * the dashboard token, and another user must not be able to plant them.
+     *
+     * @internal
+     */
+    public static function sharedDir(): string
+    {
+        if (PHP_OS_FAMILY === 'Windows') {
+            // %TEMP% is the user's own
+            $dir = sys_get_temp_dir() . '\\goldlapel';
+            @mkdir($dir);
+            return $dir;
+        }
+        if (!function_exists('posix_geteuid')) {
+            throw new RuntimeException(
+                "Gold Lapel's shared proxy needs PHP's posix extension, to keep its files private. "
+                . "Enable it, or pass 'shared' => false."
+            );
+        }
+        $uid = posix_geteuid();
+        $dir = rtrim(sys_get_temp_dir(), '/') . "/goldlapel-{$uid}";
+        @mkdir($dir, 0700);
+        clearstatcache(true, $dir);
+        $stat = @lstat($dir);
+        if ($stat === false || ($stat['mode'] & 0170000) !== 0040000 || $stat['uid'] !== $uid || ($stat['mode'] & 0077) !== 0) {
+            throw new RuntimeException(
+                "Gold Lapel won't keep its shared proxy's files in {$dir}: it must be a directory of this user's "
+                . "(uid {$uid}) that no one else can open (mode 0700). Remove it, or pass 'shared' => false."
+            );
+        }
+        return $dir;
+    }
+
+    /** @return resource */
+    private static function openLock(string $path)
+    {
+        // Not truncated (another process may hold a lock on it), and not
+        // inherited by anything this process starts
+        $file = @fopen($path, PHP_OS_FAMILY === 'Windows' ? 'c' : 'ce');
+        if ($file === false) {
+            throw new RuntimeException("Gold Lapel couldn't open {$path} for its shared proxy.");
+        }
+        return $file;
+    }
+
+    /** Whether a live proxy holds $path's lock. */
+    private static function lockHeld(string $path): bool
+    {
+        $file = self::openLock($path);
+        $free = flock($file, LOCK_SH | LOCK_NB);
+        fclose($file);
+        return !$free;
+    }
+
+    private static function logTail(string $prefix): string
+    {
+        return trim(substr((string) @file_get_contents("{$prefix}.log"), -2000));
     }
 
     /**
@@ -1057,6 +1415,9 @@ class GoldLapel
 
     public function isRunning(): bool
     {
+        if ($this->sharedPrefix !== null) {
+            return $this->url !== null && self::lockHeld("{$this->sharedPrefix}.lock");
+        }
         if ($this->process === null) {
             return false;
         }
@@ -1563,6 +1924,12 @@ class GoldLapel
     private function terminate(): void
     {
         self::releasePorts($this);
+        // A shared proxy isn't this process's to stop: let go of it
+        if ($this->hold !== null) {
+            flock($this->hold, LOCK_UN);
+            fclose($this->hold);
+            $this->hold = null;
+        }
         if ($this->process === null) {
             return;
         }

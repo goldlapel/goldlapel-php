@@ -149,6 +149,11 @@ class GoldLapel
         // Every option is checked here, before anything is claimed or
         // spawned, so a bad one can't leave half-started state behind.
         SyncGoldLapel::checkOptions($options);
+        if (!empty($options['shared'])) {
+            throw new \InvalidArgumentException(
+                "The async client runs its proxy in this process; 'shared' is for GoldLapel\\GoldLapel."
+            );
+        }
         $this->upstream = $upstream;
         // Without an explicit proxy_port the port is allocated at spawn
         // time (see SyncGoldLapel::claimPorts()); 7932 until then.

@@ -653,4 +653,43 @@ class GoldLapelServiceProviderTest extends TestCase
             $this->assertFalse($instance->isRunning());
         }
     }
+
+    /**
+     * Outside a test run, requests and commands share one proxy per machine:
+     * it outlives the request, and the next request's boot finds it.
+     */
+    public function testRequestsShareAProxyOutsideTests(): void
+    {
+        $this->app['env'] = 'production';
+        $connections = ['pgsql' => $this->twoDatabases()['primary']];
+        $provider = $this->bootProvider($connections);
+        $args = $this->spawns()[0];
+        $this->assertContains('--instance', $args);
+        $this->assertContains('--detach', $args);
+        $instance = $this->glConnections($provider)['pgsql'];
+        $port = $instance->getProxyPort();
+        $prefix = (new \ReflectionProperty(GoldLapel::class, 'sharedPrefix'))->getValue($instance);
+
+        $this->app->terminate();
+        $this->assertSame([], $this->glConnections($provider));
+        $pid = json_decode((string) file_get_contents("{$prefix}.json"), true)['pid'];
+        $this->assertTrue(posix_kill($pid, 0), 'the proxy stopped with the request');
+
+        // The next request
+        $this->bootProvider($connections);
+        $this->assertCount(1, $this->spawns(), 'the next request started another proxy');
+        $this->assertSame($port, config('database.connections.pgsql.port'));
+    }
+
+    public function testSharedFalseKeepsAProxyPerProcess(): void
+    {
+        $this->app['env'] = 'production';
+        $primary = $this->twoDatabases()['primary'] + ['goldlapel' => ['shared' => false]];
+        $provider = $this->bootProvider(['pgsql' => $primary]);
+        $this->assertNotContains('--instance', $this->spawns()[0]);
+        $instance = $this->glConnections($provider)['pgsql'];
+
+        $this->app->terminate();
+        $this->assertFalse($instance->isRunning());
+    }
 }
